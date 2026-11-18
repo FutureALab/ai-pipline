@@ -5,8 +5,13 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { Pool } from "pg";
 import {
+  buildResourceSummary,
+  extractDescriptionFromMarkdown,
   listSkillsInDefaultDir,
+  parseSkillFrontmatter,
+  readSkillDirectoryFiles,
   resolveDefaultSkillsRoot,
+  saveSkillFilesToDefaultDir,
 } from "../repositories/skillStorage.js";
 import type { CatalogAppRow, CatalogRepoRow } from "../types/skill.js";
 
@@ -128,18 +133,35 @@ CREATE TABLE IF NOT EXISTS skills (
   status TEXT NOT NULL DEFAULT 'draft',
   selected_apps JSONB NOT NULL DEFAULT '[]'::jsonb,
   selected_repos JSONB NOT NULL DEFAULT '[]'::jsonb,
-  pipeline_runs JSONB NOT NULL DEFAULT '[]'::jsonb
+  pipeline_runs JSONB NOT NULL DEFAULT '[]'::jsonb,
+  frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
+  has_scripts BOOLEAN NOT NULL DEFAULT FALSE,
+  resource_summary JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS is_builtin BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS has_scripts BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS resource_summary JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS skill_files (
   skill_name TEXT NOT NULL REFERENCES skills(skill_name) ON DELETE CASCADE,
   file_path TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'other',
+  mime_type TEXT NOT NULL DEFAULT 'text/plain',
+  encoding TEXT NOT NULL DEFAULT 'utf-8',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  is_executable BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (skill_name, file_path)
 );
+
+ALTER TABLE skill_files ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'other';
+ALTER TABLE skill_files ADD COLUMN IF NOT EXISTS mime_type TEXT NOT NULL DEFAULT 'text/plain';
+ALTER TABLE skill_files ADD COLUMN IF NOT EXISTS encoding TEXT NOT NULL DEFAULT 'utf-8';
+ALTER TABLE skill_files ADD COLUMN IF NOT EXISTS size_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE skill_files ADD COLUMN IF NOT EXISTS is_executable BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS catalog_apps (
   id TEXT PRIMARY KEY,
@@ -206,13 +228,21 @@ CREATE TABLE IF NOT EXISTS skills (
   status TEXT NOT NULL DEFAULT 'draft',
   selected_apps TEXT NOT NULL DEFAULT '[]',
   selected_repos TEXT NOT NULL DEFAULT '[]',
-  pipeline_runs TEXT NOT NULL DEFAULT '[]'
+  pipeline_runs TEXT NOT NULL DEFAULT '[]',
+  frontmatter TEXT NOT NULL DEFAULT '{}',
+  has_scripts INTEGER NOT NULL DEFAULT 0,
+  resource_summary TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS skill_files (
   skill_name TEXT NOT NULL REFERENCES skills(skill_name) ON DELETE CASCADE,
   file_path TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'other',
+  mime_type TEXT NOT NULL DEFAULT 'text/plain',
+  encoding TEXT NOT NULL DEFAULT 'utf-8',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  is_executable INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (skill_name, file_path)
 );
@@ -324,17 +354,41 @@ async function seedCatalogData(): Promise<void> {
   }
 }
 
-function extractDescriptionFromMarkdown(content: string): string {
-  const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
-  if (!fmMatch) return "Built-in AI Skill";
-  const descMatch = fmMatch[1].match(/^description:\s*["']?(.+?)["']?\s*$/m);
-  return descMatch ? descMatch[1].trim() : "Built-in AI Skill";
+function ensureSqliteColumns(
+  db: BunSqliteDatabase,
+  tableName: string,
+  columns: Array<{ name: string; definition: string }>
+): void {
+  const existingRows = db
+    .query(`PRAGMA table_info(${tableName})`)
+    .all() as Array<{ name: string }>;
+  const existingNames = new Set(existingRows.map((r) => r.name));
+  for (const col of columns) {
+    if (!existingNames.has(col.name)) {
+      db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${col.name} ${col.definition}`);
+    }
+  }
+}
+
+function applySqliteMigrations(db: BunSqliteDatabase): void {
+  ensureSqliteColumns(db, "skills", [
+    { name: "frontmatter", definition: "TEXT NOT NULL DEFAULT '{}'" },
+    { name: "has_scripts", definition: "INTEGER NOT NULL DEFAULT 0" },
+    { name: "resource_summary", definition: "TEXT NOT NULL DEFAULT '{}'" },
+  ]);
+  ensureSqliteColumns(db, "skill_files", [
+    { name: "category", definition: "TEXT NOT NULL DEFAULT 'other'" },
+    { name: "mime_type", definition: "TEXT NOT NULL DEFAULT 'text/plain'" },
+    { name: "encoding", definition: "TEXT NOT NULL DEFAULT 'utf-8'" },
+    { name: "size_bytes", definition: "INTEGER NOT NULL DEFAULT 0" },
+    { name: "is_executable", definition: "INTEGER NOT NULL DEFAULT 0" },
+  ]);
 }
 
 /**
  * Seed high-star built-in skills from `resource/builtin-skills/` into:
- * 1. Database (`skills.is_builtin = true`, hidden from UI card list)
- * 2. OMP default skills directory (`~/.omp/agent/skills/<name>/SKILL.md`)
+ * 1. Database (`skills.is_builtin = true`, hidden from UI card list) with full directory resources
+ * 2. OMP default skills directory (`~/.omp/agent/skills/<name>/...`)
  */
 async function seedBuiltinSkills(): Promise<Set<string>> {
   const builtinNames = new Set<string>();
@@ -346,35 +400,75 @@ async function seedBuiltinSkills(): Promise<Set<string>> {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const skillName = entry.name;
-    const srcFile = path.join(builtinRoot, skillName, "SKILL.md");
-    const content = await fs.readFile(srcFile, "utf-8").catch(() => "");
-    if (!content) continue;
+    const srcDir = path.join(builtinRoot, skillName);
+    const files = await readSkillDirectoryFiles(srcDir);
+    const skillMd = files.find((f) => f.path === "SKILL.md");
+    if (!skillMd || !skillMd.content) continue;
 
     builtinNames.add(skillName);
 
-    // Ensure built-in skill is available in OMP default directory
-    const targetDir = path.join(resolveDefaultSkillsRoot("global"), skillName);
-    await fs.mkdir(targetDir, { recursive: true });
-    await fs.writeFile(path.join(targetDir, "SKILL.md"), content, "utf-8");
+    // Ensure complete built-in skill directory (SKILL.md + scripts/references/assets/agents/...) is available in OMP default directory
+    await saveSkillFilesToDefaultDir({
+      skillName,
+      files,
+      scope: "global",
+    });
 
-    const desc = extractDescriptionFromMarkdown(content);
+    const frontmatter = parseSkillFrontmatter(skillMd.content);
+    const desc = extractDescriptionFromMarkdown(skillMd.content);
+    const { summary, hasScripts } = buildResourceSummary(files);
+
     await queryDb(
       `INSERT INTO skills (
-         skill_name, description, creator, is_builtin, current_step, progress, status
+         skill_name, description, creator, is_builtin, current_step, progress, status,
+         frontmatter, has_scripts, resource_summary
        )
-       VALUES ($1, $2, 'Built-in', $3, 3, 100, 'published')
+       VALUES ($1, $2, 'Built-in', $3, 3, 100, 'published', $4::jsonb, $5, $6::jsonb)
        ON CONFLICT (skill_name)
-       DO UPDATE SET is_builtin = EXCLUDED.is_builtin`,
-      [skillName, desc, true]
+       DO UPDATE SET
+         description = EXCLUDED.description,
+         is_builtin = EXCLUDED.is_builtin,
+         frontmatter = EXCLUDED.frontmatter,
+         has_scripts = EXCLUDED.has_scripts,
+         resource_summary = EXCLUDED.resource_summary`,
+      [
+        skillName,
+        desc,
+        true,
+        JSON.stringify(frontmatter),
+        hasScripts,
+        JSON.stringify(summary),
+      ]
     );
 
-    await queryDb(
-      `INSERT INTO skill_files (skill_name, file_path, content)
-       VALUES ($1, 'SKILL.md', $2)
-       ON CONFLICT (skill_name, file_path)
-       DO UPDATE SET content = EXCLUDED.content`,
-      [skillName, content]
-    );
+    await queryDb(`DELETE FROM skill_files WHERE skill_name = $1`, [skillName]);
+    for (const file of files) {
+      await queryDb(
+        `INSERT INTO skill_files (
+           skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (skill_name, file_path)
+         DO UPDATE SET
+           content = EXCLUDED.content,
+           category = EXCLUDED.category,
+           mime_type = EXCLUDED.mime_type,
+           encoding = EXCLUDED.encoding,
+           size_bytes = EXCLUDED.size_bytes,
+           is_executable = EXCLUDED.is_executable,
+           updated_at = NOW()`,
+        [
+          skillName,
+          file.path,
+          file.content,
+          file.category,
+          file.mimeType,
+          file.encoding,
+          file.sizeBytes,
+          file.isExecutable,
+        ]
+      );
+    }
   }
 
   return builtinNames;
@@ -386,35 +480,59 @@ async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
     if (builtinNames.has(disk.skillName)) continue;
 
     const skillDir = path.join(resolveDefaultSkillsRoot("global"), disk.skillName);
-    const mdContent = await fs.readFile(disk.filePath, "utf-8").catch(() => "");
-    const desc = extractDescriptionFromMarkdown(mdContent);
+    const files = await readSkillDirectoryFiles(skillDir);
+    const skillMd = files.find((f) => f.path === "SKILL.md");
+    const mdContent = skillMd?.content ?? "";
+    const frontmatter = parseSkillFrontmatter(mdContent);
+    const desc = extractDescriptionFromMarkdown(mdContent, "System AI Skill");
+    const { summary, hasScripts } = buildResourceSummary(files);
 
     await queryDb(
-      `INSERT INTO skills (skill_name, description, creator, is_builtin, current_step, progress, status)
-       VALUES ($1, $2, 'System', $3, 1, 33, 'draft')
-       ON CONFLICT (skill_name) DO NOTHING`,
-      [disk.skillName, desc, false]
+      `INSERT INTO skills (
+         skill_name, description, creator, is_builtin, current_step, progress, status,
+         frontmatter, has_scripts, resource_summary
+       )
+       VALUES ($1, $2, 'System', $3, 1, 33, 'draft', $4::jsonb, $5, $6::jsonb)
+       ON CONFLICT (skill_name)
+       DO UPDATE SET
+         frontmatter = EXCLUDED.frontmatter,
+         has_scripts = EXCLUDED.has_scripts,
+         resource_summary = EXCLUDED.resource_summary`,
+      [
+        disk.skillName,
+        desc,
+        false,
+        JSON.stringify(frontmatter),
+        hasScripts,
+        JSON.stringify(summary),
+      ]
     );
 
-    const walk = async (dir: string, prefix: string): Promise<void> => {
-      const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
-      for (const entry of entries) {
-        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          await walk(full, rel);
-        } else if (entry.isFile()) {
-          const content = await fs.readFile(full, "utf-8").catch(() => "");
-          await queryDb(
-            `INSERT INTO skill_files (skill_name, file_path, content)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (skill_name, file_path) DO NOTHING`,
-            [disk.skillName, rel, content]
-          );
-        }
-      }
-    };
-    await walk(skillDir, "");
+    for (const file of files) {
+      await queryDb(
+        `INSERT INTO skill_files (
+           skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (skill_name, file_path)
+         DO UPDATE SET
+           category = EXCLUDED.category,
+           mime_type = EXCLUDED.mime_type,
+           encoding = EXCLUDED.encoding,
+           size_bytes = EXCLUDED.size_bytes,
+           is_executable = EXCLUDED.is_executable`,
+        [
+          disk.skillName,
+          file.path,
+          file.content,
+          file.category,
+          file.mimeType,
+          file.encoding,
+          file.sizeBytes,
+          file.isExecutable,
+        ]
+      );
+    }
   }
 }
 
@@ -461,6 +579,7 @@ export async function initDatabase(): Promise<DbDriver> {
     await fs.mkdir(path.dirname(sqlitePath), { recursive: true });
     sqliteDb = new BunSqliteDatabase(sqlitePath);
     sqliteDb.exec(SQLITE_SCHEMA_SQL);
+    applySqliteMigrations(sqliteDb);
     activeDriver = "sqlite";
     console.warn(
       `[DB] PostgreSQL unavailable; initialized SQLite database at ${sqlitePath}`

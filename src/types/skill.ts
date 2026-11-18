@@ -22,9 +22,34 @@ export interface SavedSkillInfo {
   scope: SkillScope;
 }
 
+export type SkillFileCategory =
+  | "skill_md"
+  | "script"
+  | "reference"
+  | "asset"
+  | "agent"
+  | "eval"
+  | "other";
+
+export type SkillFileEncoding = "utf-8" | "base64";
+
 export interface SkillFileEntry {
   path: string;
   content: string;
+  category?: SkillFileCategory;
+  mimeType?: string;
+  encoding?: SkillFileEncoding;
+  sizeBytes?: number;
+  isExecutable?: boolean;
+}
+
+export interface SkillResourceSummary {
+  totalFiles: number;
+  scripts: number;
+  references: number;
+  assets: number;
+  agents: number;
+  other: number;
 }
 
 export interface RepoPipelineRun {
@@ -48,6 +73,9 @@ export interface SkillCardRecord {
   selectedApps: string[];
   selectedRepos: string[];
   pipelineRuns: RepoPipelineRun[];
+  frontmatter?: Record<string, unknown>;
+  hasScripts?: boolean;
+  resourceSummary?: SkillResourceSummary;
 }
 
 export interface CatalogAppRow {

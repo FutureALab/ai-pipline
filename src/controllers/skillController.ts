@@ -1,10 +1,12 @@
 import type http from "node:http";
 import {
   buildSkillZipBuffer,
+  deleteSkillFile,
   getSkillCard,
   listSkillCards,
   listSkillFiles,
   readSkillMarkdown,
+  replaceSkillFiles,
   upsertSkillCard,
   writeSkillFile,
 } from "../repositories/skillRepository.js";
@@ -12,6 +14,7 @@ import { normalizeSkillName } from "../repositories/skillStorage.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import { generateSkillFromPrompt } from "../services/skillGenerator.js";
 import { runSkillInRepo } from "../services/skillRunner.js";
+import type { SkillFileEncoding, SkillFileEntry } from "../types/skill.js";
 
 export async function listSkillsHandler(res: http.ServerResponse): Promise<void> {
   const skills = await listSkillCards();
@@ -43,22 +46,45 @@ export async function updateSkillHandler(
     typeof body.filePath === "string" && body.filePath.trim()
       ? body.filePath.trim()
       : "SKILL.md";
+  const encoding: SkillFileEncoding =
+    body.encoding === "base64" ? "base64" : "utf-8";
   const filesPayload = Array.isArray(body.files)
-    ? (body.files as Array<{ path?: unknown; content?: unknown }>)
+    ? (body.files as Array<{ path?: unknown; content?: unknown; encoding?: unknown }>)
     : undefined;
+  const replaceFiles = body.replaceFiles === true;
+  const deleteFile =
+    typeof body.deleteFile === "string" && body.deleteFile.trim()
+      ? body.deleteFile.trim()
+      : undefined;
   const description =
     typeof body.description === "string" ? body.description : undefined;
   const creator = typeof body.creator === "string" ? body.creator : undefined;
   const submit = body.submit === true;
 
   if (filesPayload) {
+    const validFiles: SkillFileEntry[] = [];
     for (const item of filesPayload) {
       if (typeof item.path === "string" && typeof item.content === "string") {
-        await writeSkillFile(name, item.path, item.content);
+        validFiles.push({
+          path: item.path,
+          content: item.content,
+          encoding: item.encoding === "base64" ? "base64" : "utf-8",
+        });
+      }
+    }
+    if (replaceFiles) {
+      await replaceSkillFiles(name, validFiles);
+    } else {
+      for (const item of validFiles) {
+        await writeSkillFile(name, item.path, item.content, item.encoding);
       }
     }
   } else if (content !== undefined) {
-    await writeSkillFile(name, filePath, content);
+    await writeSkillFile(name, filePath, content, encoding);
+  }
+
+  if (deleteFile) {
+    await deleteSkillFile(name, deleteFile);
   }
 
   const card = await upsertSkillCard(name, {
@@ -118,12 +144,17 @@ export async function generateSkillSyncHandler(
     scope: "global",
   });
 
+  await replaceSkillFiles(result.saved.skillName, result.files);
+
   const card = await upsertSkillCard(result.saved.skillName, {
     description: description || prompt.slice(0, 120),
     creator,
     currentStep: 1,
     progress: 33,
     status: "draft",
+    frontmatter: result.frontmatter,
+    hasScripts: result.hasScripts,
+    resourceSummary: result.resourceSummary,
   });
 
   const files = await listSkillFiles(result.saved.skillName);

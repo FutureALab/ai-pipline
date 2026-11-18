@@ -794,6 +794,7 @@ async function handleSubmitStepOne() {
       description: form.description,
       creator: form.creator,
       files: skillFiles.value,
+      replaceFiles: true,
       submit: true,
     });
     skillFiles.value = res.files;

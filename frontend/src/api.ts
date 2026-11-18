@@ -15,6 +15,26 @@ export interface RepoPipelineRun {
   logs: string[];
 }
 
+export type SkillFileCategory =
+  | "skill_md"
+  | "script"
+  | "reference"
+  | "asset"
+  | "agent"
+  | "eval"
+  | "other";
+
+export type SkillFileEncoding = "utf-8" | "base64";
+
+export interface SkillResourceSummary {
+  totalFiles: number;
+  scripts: number;
+  references: number;
+  assets: number;
+  agents: number;
+  other: number;
+}
+
 export interface SkillCardRecord {
   skillName: string;
   description: string;
@@ -27,11 +47,19 @@ export interface SkillCardRecord {
   selectedApps: string[];
   selectedRepos: string[];
   pipelineRuns: RepoPipelineRun[];
+  frontmatter?: Record<string, unknown>;
+  hasScripts?: boolean;
+  resourceSummary?: SkillResourceSummary;
 }
 
 export interface SkillFileEntry {
   path: string;
   content: string;
+  category?: SkillFileCategory;
+  mimeType?: string;
+  encoding?: SkillFileEncoding;
+  sizeBytes?: number;
+  isExecutable?: boolean;
 }
 
 export type GenerationJobStatus =
@@ -122,6 +150,8 @@ export function updateSkill(
     creator?: string;
     content?: string;
     files?: SkillFileEntry[];
+    replaceFiles?: boolean;
+    deleteFile?: string;
     submit?: boolean;
   }
 ): Promise<{ card: SkillCardRecord; content: string; files: SkillFileEntry[] }> {

@@ -6,18 +6,27 @@ import type {
   CatalogRepoRow,
   RepoPipelineRun,
   SkillCardRecord,
+  SkillFileCategory,
+  SkillFileEncoding,
   SkillFileEntry,
   SkillLifecycleStatus,
+  SkillResourceSummary,
 } from "../types/skill.js";
 import {
+  buildResourceSummary,
+  enrichSkillFileEntry,
+  normalizeRelativeSkillPath,
   normalizeSkillName,
+  parseSkillFrontmatter,
+  readSkillDirectoryFiles,
   resolveDefaultSkillsRoot,
 } from "./skillStorage.js";
 
 function resolveSafeSkillFilePath(skillName: string, relativePath: string): string {
   const normalized = normalizeSkillName(skillName);
+  const relPath = normalizeRelativeSkillPath(relativePath);
   const skillDir = path.resolve(resolveDefaultSkillsRoot("global"), normalized);
-  const target = path.resolve(skillDir, relativePath);
+  const target = path.resolve(skillDir, relPath);
   if (target !== skillDir && !target.startsWith(skillDir + path.sep)) {
     throw new Error(`Invalid relative file path: "${relativePath}"`);
   }
@@ -45,67 +54,207 @@ export async function readSkillMarkdown(skillName: string): Promise<string> {
   }
 }
 
+export async function syncSkillMetadata(skillName: string): Promise<void> {
+  const normalized = normalizeSkillName(skillName);
+  const res = await queryDb<{
+    file_path: string;
+    content: string;
+    category: string;
+  }>(
+    `SELECT file_path, content, category FROM skill_files WHERE skill_name = $1`,
+    [normalized]
+  );
+
+  const files: SkillFileEntry[] = res.rows.map((r) => ({
+    path: r.file_path,
+    content: r.content,
+    category: r.category as SkillFileCategory,
+  }));
+
+  const { summary, hasScripts } = buildResourceSummary(files);
+  const skillMd = files.find((f) => f.path === "SKILL.md");
+  const frontmatter = skillMd ? parseSkillFrontmatter(skillMd.content) : null;
+
+  if (frontmatter) {
+    await queryDb(
+      `UPDATE skills
+       SET frontmatter = $2::jsonb,
+           has_scripts = $3,
+           resource_summary = $4::jsonb,
+           updated_at = NOW()
+       WHERE skill_name = $1`,
+      [
+        normalized,
+        JSON.stringify(frontmatter),
+        hasScripts,
+        JSON.stringify(summary),
+      ]
+    );
+  } else {
+    await queryDb(
+      `UPDATE skills
+       SET has_scripts = $2,
+           resource_summary = $3::jsonb,
+           updated_at = NOW()
+       WHERE skill_name = $1`,
+      [normalized, hasScripts, JSON.stringify(summary)]
+    );
+  }
+}
+
+async function upsertSkillFileRow(
+  normalizedSkillName: string,
+  entry: Required<SkillFileEntry>
+): Promise<void> {
+  await queryDb(
+    `INSERT INTO skill_files (
+       skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable, updated_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+     ON CONFLICT (skill_name, file_path)
+     DO UPDATE SET
+       content = EXCLUDED.content,
+       category = EXCLUDED.category,
+       mime_type = EXCLUDED.mime_type,
+       encoding = EXCLUDED.encoding,
+       size_bytes = EXCLUDED.size_bytes,
+       is_executable = EXCLUDED.is_executable,
+       updated_at = NOW()`,
+    [
+      normalizedSkillName,
+      entry.path,
+      entry.content,
+      entry.category,
+      entry.mimeType,
+      entry.encoding,
+      entry.sizeBytes,
+      entry.isExecutable,
+    ]
+  );
+}
+
 export async function writeSkillFile(
   skillName: string,
   relativePath: string,
-  content: string
+  content: string,
+  encoding?: SkillFileEncoding
 ): Promise<string> {
   const normalized = normalizeSkillName(skillName);
-  const filePath = resolveSafeSkillFilePath(normalized, relativePath);
+  const enriched = enrichSkillFileEntry({ path: relativePath, content, encoding });
+  const filePath = resolveSafeSkillFilePath(normalized, enriched.path);
+
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, content, "utf-8");
+  await fs.writeFile(filePath, Buffer.from(enriched.content, enriched.encoding));
+  if (enriched.isExecutable) {
+    await fs.chmod(filePath, 0o755).catch(() => {});
+  }
 
   await queryDb(
     `INSERT INTO skills (skill_name) VALUES ($1) ON CONFLICT (skill_name) DO NOTHING`,
     [normalized]
   );
-  await queryDb(
-    `INSERT INTO skill_files (skill_name, file_path, content, updated_at)
-     VALUES ($1, $2, $3, NOW())
-     ON CONFLICT (skill_name, file_path)
-     DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()`,
-    [normalized, relativePath, content]
-  );
+  await upsertSkillFileRow(normalized, enriched);
+  await syncSkillMetadata(normalized);
 
   return filePath;
+}
+
+export async function deleteSkillFile(
+  skillName: string,
+  relativePath: string
+): Promise<void> {
+  const normalized = normalizeSkillName(skillName);
+  const relPath = normalizeRelativeSkillPath(relativePath);
+  const filePath = resolveSafeSkillFilePath(normalized, relPath);
+
+  await fs.rm(filePath, { force: true }).catch(() => {});
+  await queryDb(
+    `DELETE FROM skill_files WHERE skill_name = $1 AND file_path = $2`,
+    [normalized, relPath]
+  );
+  await syncSkillMetadata(normalized);
+}
+
+export async function replaceSkillFiles(
+  skillName: string,
+  files: SkillFileEntry[]
+): Promise<void> {
+  const normalized = normalizeSkillName(skillName);
+  const enrichedFiles = files.map((f) => enrichSkillFileEntry(f));
+  const nextPaths = new Set(enrichedFiles.map((f) => f.path));
+
+  await queryDb(
+    `INSERT INTO skills (skill_name) VALUES ($1) ON CONFLICT (skill_name) DO NOTHING`,
+    [normalized]
+  );
+
+  // Remove stale files from disk and DB
+  const existingDb = await queryDb<{ file_path: string }>(
+    `SELECT file_path FROM skill_files WHERE skill_name = $1`,
+    [normalized]
+  );
+  for (const row of existingDb.rows) {
+    if (!nextPaths.has(row.file_path)) {
+      const target = resolveSafeSkillFilePath(normalized, row.file_path);
+      await fs.rm(target, { force: true }).catch(() => {});
+      await queryDb(
+        `DELETE FROM skill_files WHERE skill_name = $1 AND file_path = $2`,
+        [normalized, row.file_path]
+      );
+    }
+  }
+
+  for (const entry of enrichedFiles) {
+    const target = resolveSafeSkillFilePath(normalized, entry.path);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, Buffer.from(entry.content, entry.encoding));
+    if (entry.isExecutable) {
+      await fs.chmod(target, 0o755).catch(() => {});
+    }
+    await upsertSkillFileRow(normalized, entry);
+  }
+
+  await syncSkillMetadata(normalized);
 }
 
 export async function listSkillFiles(skillName: string): Promise<SkillFileEntry[]> {
   const normalized = normalizeSkillName(skillName);
   const skillDir = path.resolve(resolveDefaultSkillsRoot("global"), normalized);
-  const results: SkillFileEntry[] = [];
+  const results: SkillFileEntry[] = await readSkillDirectoryFiles(skillDir);
 
-  async function walk(currentDir: string, prefix: string): Promise<void> {
-    const entries = await fs.readdir(currentDir, { withFileTypes: true }).catch(() => []);
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      const full = path.join(currentDir, entry.name);
-      if (entry.isDirectory()) {
-        await walk(full, rel);
-      } else if (entry.isFile()) {
-        const content = await fs.readFile(full, "utf-8").catch(() => "");
-        results.push({ path: rel, content });
-      }
-    }
-  }
-
-  await walk(skillDir, "");
   if (results.length === 0) {
-    const dbFiles = await queryDb<{ file_path: string; content: string }>(
-      `SELECT file_path, content FROM skill_files WHERE skill_name = $1`,
+    const dbFiles = await queryDb<{
+      file_path: string;
+      content: string;
+      category: string;
+      mime_type: string;
+      encoding: string;
+      size_bytes: number;
+      is_executable: boolean | number;
+    }>(
+      `SELECT file_path, content, category, mime_type, encoding, size_bytes, is_executable
+       FROM skill_files
+       WHERE skill_name = $1`,
       [normalized]
     );
     for (const row of dbFiles.rows) {
-      results.push({ path: row.file_path, content: row.content });
+      results.push({
+        path: row.file_path,
+        content: row.content,
+        category: (row.category as SkillFileCategory) || undefined,
+        mimeType: row.mime_type || undefined,
+        encoding: (row.encoding as SkillFileEncoding) || "utf-8",
+        sizeBytes: row.size_bytes ?? undefined,
+        isExecutable: Boolean(row.is_executable),
+      });
     }
+    results.sort((a, b) => {
+      if (a.path === "SKILL.md") return -1;
+      if (b.path === "SKILL.md") return 1;
+      return a.path.localeCompare(b.path);
+    });
   }
 
-  results.sort((a, b) => {
-    if (a.path === "SKILL.md") return -1;
-    if (b.path === "SKILL.md") return 1;
-    return a.path.localeCompare(b.path);
-  });
   return results;
 }
 
@@ -128,7 +277,8 @@ export async function buildSkillZipBuffer(skillName: string): Promise<Buffer> {
 
   for (const file of files) {
     const nameBuf = Buffer.from(`${normalizeSkillName(skillName)}/${file.path}`, "utf-8");
-    const dataBuf = Buffer.from(file.content, "utf-8");
+    const encoding = file.encoding === "base64" ? "base64" : "utf-8";
+    const dataBuf = Buffer.from(file.content, encoding);
     const crc = crc32(dataBuf);
 
     const localHeader = Buffer.alloc(30);
@@ -196,6 +346,9 @@ type DbSkillRow = {
   selected_apps: string[] | string;
   selected_repos: string[] | string;
   pipeline_runs: RepoPipelineRun[] | string;
+  frontmatter: Record<string, unknown> | string | null;
+  has_scripts: boolean | number | null;
+  resource_summary: SkillResourceSummary | string | null;
 };
 
 function parseJsonArray<T>(val: T[] | string | null | undefined): T[] {
@@ -211,7 +364,38 @@ function parseJsonArray<T>(val: T[] | string | null | undefined): T[] {
   return [];
 }
 
+function parseJsonObject<T extends object>(
+  val: T | string | null | undefined,
+  fallback: T
+): T {
+  if (val && typeof val === "object" && !Array.isArray(val)) return val;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as T;
+      }
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+const DEFAULT_RESOURCE_SUMMARY: SkillResourceSummary = {
+  totalFiles: 0,
+  scripts: 0,
+  references: 0,
+  assets: 0,
+  agents: 0,
+  other: 0,
+};
+
 function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
+  const resourceSummary = parseJsonObject<SkillResourceSummary>(
+    row.resource_summary as SkillResourceSummary | string | null | undefined,
+    { ...DEFAULT_RESOURCE_SUMMARY }
+  );
   return {
     skillName: row.skill_name,
     description: row.description,
@@ -224,8 +408,17 @@ function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
     selectedApps: parseJsonArray<string>(row.selected_apps),
     selectedRepos: parseJsonArray<string>(row.selected_repos),
     pipelineRuns: parseJsonArray<RepoPipelineRun>(row.pipeline_runs),
+    frontmatter: parseJsonObject<Record<string, unknown>>(row.frontmatter, {}),
+    hasScripts: Boolean(row.has_scripts),
+    resourceSummary,
   };
 }
+
+const SKILL_SELECT_COLUMNS = `
+  skill_name, description, creator, is_builtin, created_at, updated_at,
+  current_step, progress, status, selected_apps, selected_repos, pipeline_runs,
+  frontmatter, has_scripts, resource_summary
+`;
 
 export async function listCatalogApps(): Promise<CatalogAppRow[]> {
   const res = await queryDb<CatalogAppRow & Record<string, unknown>>(
@@ -246,8 +439,7 @@ export async function listCatalogRepos(): Promise<CatalogRepoRow[]> {
  */
 export async function listSkillCards(): Promise<SkillCardRecord[]> {
   const res = await queryDb<DbSkillRow>(
-    `SELECT skill_name, description, creator, is_builtin, created_at, updated_at,
-            current_step, progress, status, selected_apps, selected_repos, pipeline_runs
+    `SELECT ${SKILL_SELECT_COLUMNS}
      FROM skills
      WHERE is_builtin = $1
      ORDER BY updated_at DESC`,
@@ -261,8 +453,7 @@ export async function getSkillCard(
 ): Promise<{ card: SkillCardRecord; content: string } | null> {
   const normalized = normalizeSkillName(skillName);
   const res = await queryDb<DbSkillRow>(
-    `SELECT skill_name, description, creator, is_builtin, created_at, updated_at,
-            current_step, progress, status, selected_apps, selected_repos, pipeline_runs
+    `SELECT ${SKILL_SELECT_COLUMNS}
      FROM skills WHERE skill_name = $1`,
     [normalized]
   );
@@ -280,8 +471,7 @@ export async function upsertSkillCard(
   const normalized = normalizeSkillName(skillName);
 
   const existingRes = await queryDb<DbSkillRow>(
-    `SELECT skill_name, description, creator, is_builtin, created_at, updated_at,
-            current_step, progress, status, selected_apps, selected_repos, pipeline_runs
+    `SELECT ${SKILL_SELECT_COLUMNS}
      FROM skills WHERE skill_name = $1`,
     [normalized]
   );
@@ -305,14 +495,19 @@ export async function upsertSkillCard(
     selectedApps: patch.selectedApps ?? existing?.selectedApps ?? [],
     selectedRepos: patch.selectedRepos ?? existing?.selectedRepos ?? [],
     pipelineRuns: patch.pipelineRuns ?? existing?.pipelineRuns ?? [],
+    frontmatter: patch.frontmatter ?? existing?.frontmatter ?? {},
+    hasScripts: patch.hasScripts ?? existing?.hasScripts ?? false,
+    resourceSummary:
+      patch.resourceSummary ?? existing?.resourceSummary ?? { ...DEFAULT_RESOURCE_SUMMARY },
   };
 
   await queryDb(
     `INSERT INTO skills (
        skill_name, description, creator, is_builtin, created_at, updated_at,
-       current_step, progress, status, selected_apps, selected_repos, pipeline_runs
+       current_step, progress, status, selected_apps, selected_repos, pipeline_runs,
+       frontmatter, has_scripts, resource_summary
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15::jsonb)
      ON CONFLICT (skill_name)
      DO UPDATE SET
        description = EXCLUDED.description,
@@ -324,7 +519,10 @@ export async function upsertSkillCard(
        status = EXCLUDED.status,
        selected_apps = EXCLUDED.selected_apps,
        selected_repos = EXCLUDED.selected_repos,
-       pipeline_runs = EXCLUDED.pipeline_runs`,
+       pipeline_runs = EXCLUDED.pipeline_runs,
+       frontmatter = EXCLUDED.frontmatter,
+       has_scripts = EXCLUDED.has_scripts,
+       resource_summary = EXCLUDED.resource_summary`,
     [
       next.skillName,
       next.description,
@@ -338,6 +536,9 @@ export async function upsertSkillCard(
       JSON.stringify(next.selectedApps),
       JSON.stringify(next.selectedRepos),
       JSON.stringify(next.pipelineRuns),
+      JSON.stringify(next.frontmatter ?? {}),
+      next.hasScripts ?? false,
+      JSON.stringify(next.resourceSummary ?? DEFAULT_RESOURCE_SUMMARY),
     ]
   );
 

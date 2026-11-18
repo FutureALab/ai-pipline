@@ -3,6 +3,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
 import { isDbConnected, queryDb } from "../db/database.js";
 import {
   listSkillFiles,
+  replaceSkillFiles,
   upsertSkillCard,
 } from "../repositories/skillRepository.js";
 import type {
@@ -164,12 +165,16 @@ export function startGenerationJob(
   })
     .then(async (res) => {
       if (job.timer) clearTimeout(job.timer);
+      await replaceSkillFiles(res.saved.skillName, res.files);
       const card = await upsertSkillCard(res.saved.skillName, {
         description: payload.description || payload.prompt.slice(0, 120),
         creator,
         currentStep: 1,
         progress: 33,
         status: "draft",
+        frontmatter: res.frontmatter,
+        hasScripts: res.hasScripts,
+        resourceSummary: res.resourceSummary,
       });
       const files = await listSkillFiles(res.saved.skillName);
 
