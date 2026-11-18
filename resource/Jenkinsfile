@@ -1,0 +1,98 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'REPO_URL', defaultValue: '', description: 'Target Git repository URL to clone and test')
+        string(name: 'REPO_BRANCH', defaultValue: 'main', description: 'Git branch to checkout')
+        string(name: 'SKILL_NAME', defaultValue: 'custom-skill', description: 'Skill name in OMP default directory (~/.omp/agent/skills)')
+        text(name: 'CUSTOM_SKILL_PROMPT', defaultValue: '', description: 'Optional: custom prompt to generate the skill before running')
+        text(name: 'TASK_PROMPT', defaultValue: 'Use the skill to inspect and execute the required workflow on this repository.', description: 'Task prompt executed by AI using the skill')
+        string(name: 'AI_PIPELINE_BIN', defaultValue: 'ai-pipeline', description: 'Path to pre-compiled ai-pipeline executable (no bun/npm install required)')
+    }
+
+    environment {
+        OMP_AGENT_DIR = "${env.HOME}/.omp/agent"
+    }
+
+    stages {
+        stage('Resolve Pre-compiled Binary') {
+            steps {
+                sh '''
+                    if [ -x "${WORKSPACE}/dist/bin/linux-x64/ai-pipeline" ]; then
+                        echo "Found bundled linux-x64 binary"
+                    elif [ -x "${WORKSPACE}/dist/bin/darwin-arm64/ai-pipeline" ]; then
+                        echo "Found bundled darwin-arm64 binary"
+                    elif command -v "${AI_PIPELINE_BIN}" >/dev/null 2>&1; then
+                        echo "Found ${AI_PIPELINE_BIN} in PATH"
+                    else
+                        echo "Pre-compiled ai-pipeline binary not found. Please build or mount it on the Jenkins agent."
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('Git Clone Target Repo') {
+            steps {
+                script {
+                    if (!params.REPO_URL?.trim()) {
+                        error('REPO_URL parameter is required')
+                    }
+                }
+                sh '''
+                    rm -rf target-repo
+                    git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_URL}" target-repo
+                '''
+            }
+        }
+
+        stage('Generate & Save Skill to Default Dir') {
+            when {
+                expression { return params.CUSTOM_SKILL_PROMPT?.trim() }
+            }
+            steps {
+                sh '''
+                    BIN="${AI_PIPELINE_BIN}"
+                    [ -x "${WORKSPACE}/dist/bin/linux-x64/ai-pipeline" ] && BIN="${WORKSPACE}/dist/bin/linux-x64/ai-pipeline"
+                    [ -x "${WORKSPACE}/dist/bin/darwin-arm64/ai-pipeline" ] && BIN="${WORKSPACE}/dist/bin/darwin-arm64/ai-pipeline"
+                    "${BIN}" generate \
+                      --name "${SKILL_NAME}" \
+                      --prompt "${CUSTOM_SKILL_PROMPT}" \
+                      --scope global
+                '''
+            }
+        }
+
+        stage('Verify Skill Exists') {
+            steps {
+                sh '''
+                    test -f "${OMP_AGENT_DIR}/skills/${SKILL_NAME}/SKILL.md" || {
+                        echo "Skill ${SKILL_NAME} not found in ${OMP_AGENT_DIR}/skills"
+                        exit 1
+                    }
+                '''
+            }
+        }
+
+        stage('Execute Skill in Cloned Repo') {
+            steps {
+                sh '''
+                    set -o pipefail
+                    BIN="${AI_PIPELINE_BIN}"
+                    [ -x "${WORKSPACE}/dist/bin/linux-x64/ai-pipeline" ] && BIN="${WORKSPACE}/dist/bin/linux-x64/ai-pipeline"
+                    [ -x "${WORKSPACE}/dist/bin/darwin-arm64/ai-pipeline" ] && BIN="${WORKSPACE}/dist/bin/darwin-arm64/ai-pipeline"
+                    "${BIN}" run \
+                      --skill "${SKILL_NAME}" \
+                      --cwd "${WORKSPACE}/target-repo" \
+                      --prompt "${TASK_PROMPT}" | tee skill-run.log
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'skill-run.log', allowEmptyArchive: true
+        }
+    }
+}

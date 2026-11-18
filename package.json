@@ -1,0 +1,29 @@
+{
+  "name": "ai-pipline2",
+  "version": "1.0.0",
+  "description": "AI Skill Generator & Jenkins Pipeline Runner powered by @oh-my-pi/pi-coding-agent SDK",
+  "type": "module",
+  "scripts": {
+    "generate": "bun run src/main.ts generate",
+    "run-skill": "bun run src/main.ts run",
+    "serve": "bun run src/main.ts serve",
+    "typecheck": "tsc --noEmit",
+    "build": "bun run scripts/build-binaries.ts darwin-arm64",
+    "build:linux": "bun run scripts/build-binaries.ts linux-x64",
+    "build:linux-arm64": "bun run scripts/build-binaries.ts linux-arm64",
+    "build:mac": "bun run scripts/build-binaries.ts darwin-arm64",
+    "build:mac-x64": "bun run scripts/build-binaries.ts darwin-x64",
+    "build:win": "bun run scripts/build-binaries.ts win32-x64",
+    "build:all": "bun run scripts/build-binaries.ts all"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.22.1",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.7.0"
+  }
+}
