@@ -25,6 +25,14 @@ export interface JenkinsExecutionRequest {
   parameters?: Record<string, string>;
   waitForCompletion?: boolean;
   timeoutMs?: number;
+  pollIntervalMs?: number;
+  onLogUpdate?: (info: {
+    jobName: string;
+    buildNumber?: number;
+    buildUrl?: string;
+    logs: string[];
+    building: boolean;
+  }) => void | Promise<void>;
 }
 
 export interface JenkinsExecutionResult {
@@ -372,19 +380,27 @@ export async function executeJenkinsJobWithXml(
   );
 
   const deadline = start + timeoutMs;
+  const pollIntervalMs = req.pollIntervalMs ?? 3000;
   let finalStatus: "success" | "failed" | "aborted" = "failed";
   let consoleText = "";
 
   while (Date.now() < deadline) {
     const build = await getJenkinsBuildStatus(req.jobName, buildNumber);
     consoleText = build.consoleText;
+    await req.onLogUpdate?.({
+      jobName: req.jobName,
+      buildNumber,
+      buildUrl: build.url || buildUrl,
+      logs: consoleText ? consoleText.split("\n") : [],
+      building: build.building,
+    });
     if (!build.building) {
       if (build.result === "SUCCESS") finalStatus = "success";
       else if (build.result === "ABORTED") finalStatus = "aborted";
       else finalStatus = "failed";
       break;
     }
-    await sleep(2000);
+    await sleep(pollIntervalMs);
   }
 
   return {

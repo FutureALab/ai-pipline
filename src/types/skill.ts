@@ -59,6 +59,21 @@ export interface RepoPipelineRun {
   status: "pending" | "running" | "success" | "failed";
   durationMs: number;
   logs: string[];
+  jenkinsJobName?: string;
+  jenkinsBuildNumber?: number;
+  jenkinsBuildUrl?: string;
+}
+
+export interface UserMcpServer {
+  id: string;
+  owner: string;
+  name: string;
+  transport: "streamable-http";
+  url: string;
+  headers: Record<string, string>;
+  description: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SkillCardRecord {
@@ -72,6 +87,7 @@ export interface SkillCardRecord {
   status: SkillLifecycleStatus;
   selectedApps: string[];
   selectedRepos: string[];
+  selectedMcps?: string[];
   pipelineRuns: RepoPipelineRun[];
   frontmatter?: Record<string, unknown>;
   hasScripts?: boolean;

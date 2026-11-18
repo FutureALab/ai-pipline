@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
+import type { OpenAIOverrideConfig } from "../config/envModel.js";
 import { isDbConnected, queryDb } from "../db/database.js";
+import { getMcpServersByIdsForOwner } from "../repositories/mcpRepository.js";
 import {
   listSkillFiles,
   replaceSkillFiles,
@@ -18,6 +20,8 @@ export interface StartGenerationPayload {
   skillName?: string;
   description?: string;
   creator?: string;
+  selectedMcps?: string[];
+  openaiConfig?: OpenAIOverrideConfig;
   timeoutMs?: number;
 }
 
@@ -38,6 +42,7 @@ export interface GenerationJobSnapshot {
   elapsedMs: number;
   timeoutMs: number;
   streamedContent: string;
+  progressLogs?: string[];
   errorMessage?: string;
   result?: GenerationJobResult;
 }
@@ -62,14 +67,27 @@ function toSnapshot(job: InternalJob): GenerationJobSnapshot {
     elapsedMs: (job.endedAt ?? Date.now()) - job.startedAt,
     timeoutMs: job.timeoutMs,
     streamedContent: job.streamedContent,
+    progressLogs: job.progressLogs ? [...job.progressLogs] : [],
     errorMessage: job.errorMessage,
     result: job.result,
+  };
+}
+
+function sanitizePayloadForDb(payload: StartGenerationPayload): StartGenerationPayload {
+  if (!payload.openaiConfig?.apiKey) return payload;
+  return {
+    ...payload,
+    openaiConfig: {
+      ...payload.openaiConfig,
+      apiKey: "***",
+    },
   };
 }
 
 function persistJobToDb(job: InternalJob): void {
   if (!isDbConnected()) return;
   const snap = toSnapshot(job);
+  const safePayload = sanitizePayloadForDb(job.payload);
   void queryDb(
     `INSERT INTO generation_jobs (
        job_id, skill_name, status, started_at, ended_at, elapsed_ms,
@@ -94,22 +112,25 @@ function persistJobToDb(job: InternalJob): void {
       snap.endedAt ?? null,
       snap.elapsedMs,
       snap.timeoutMs,
-      JSON.stringify(job.payload),
+      JSON.stringify(safePayload),
       snap.streamedContent,
       snap.errorMessage ?? null,
       snap.result ? JSON.stringify(snap.result) : null,
     ]
-  ).catch(() => {});
+  ).catch(() => { });
 }
 
 export function startGenerationJob(
   payload: StartGenerationPayload
 ): GenerationJobSnapshot {
   const jobId = crypto.randomUUID();
+  // timeoutMs === 0 disables timeout completely; >= 5000 sets custom timeout; otherwise default 120s
   const timeoutMs =
-    typeof payload.timeoutMs === "number" && payload.timeoutMs >= 5_000
-      ? payload.timeoutMs
-      : DEFAULT_TIMEOUT_MS;
+    payload.timeoutMs === 0
+      ? 0
+      : typeof payload.timeoutMs === "number" && payload.timeoutMs >= 5_000
+        ? payload.timeoutMs
+        : DEFAULT_TIMEOUT_MS;
 
   const abortController = new AbortController();
   const job: InternalJob = {
@@ -123,46 +144,74 @@ export function startGenerationJob(
     abortController,
   };
 
-  job.timer = setTimeout(() => {
-    if (job.status !== "running") return;
-    job.abortReason = "timeout";
-    job.errorMessage = `生成任务超过 ${Math.round(timeoutMs / 1000)} 秒未完成，已自动中断，可点击「重新启动」重试。`;
-    abortController.abort();
-    if (job.session) {
-      void job.session.abort({
-        goalReason: "interrupted",
-        reason: job.errorMessage,
-      });
-    }
-  }, timeoutMs);
+  if (timeoutMs > 0) {
+    job.timer = setTimeout(() => {
+      if (job.status !== "running") return;
+      job.abortReason = "timeout";
+      job.errorMessage = `生成任务超过 ${Math.round(timeoutMs / 1000)} 秒未完成，已自动中断，可点击「重新启动」重试。`;
+      abortController.abort();
+      if (job.session) {
+        void job.session.abort({
+          goalReason: "interrupted",
+          reason: job.errorMessage,
+        });
+      }
+    }, timeoutMs);
+  }
 
   jobs.set(jobId, job);
   persistJobToDb(job);
 
   const creator =
     payload.creator && payload.creator.trim() ? payload.creator.trim() : "Admin";
+  const selectedMcpIds = Array.isArray(payload.selectedMcps)
+    ? payload.selectedMcps
+    : [];
+  job.progressLogs = [];
+  let hasTextDelta = false;
 
-  void generateSkillFromPrompt({
-    userPrompt: payload.description
-      ? `Skill description: ${payload.description}\n\n${payload.prompt}`
-      : payload.prompt,
-    skillName: payload.skillName,
-    scope: "global",
-    jobId,
-    abortSignal: abortController.signal,
-    onSessionReady: (session) => {
-      job.session = session;
-      if (abortController.signal.aborted) {
-        void session.abort({
-          goalReason: "interrupted",
-          reason: job.errorMessage || "Generation interrupted",
-        });
-      }
-    },
-    onDelta: (chunk) => {
-      job.streamedContent += chunk;
-    },
-  })
+  void getMcpServersByIdsForOwner(selectedMcpIds, creator)
+    .then((mcpServers) =>
+      generateSkillFromPrompt({
+        userPrompt: payload.description
+          ? `Skill description: ${payload.description}\n\n${payload.prompt}`
+          : payload.prompt,
+        skillName: payload.skillName,
+        scope: "global",
+        jobId,
+        mcpServers,
+        openaiConfig: payload.openaiConfig,
+        abortSignal: abortController.signal,
+        onSessionReady: (session) => {
+          job.session = session;
+          if (abortController.signal.aborted) {
+            void session.abort({
+              goalReason: "interrupted",
+              reason: job.errorMessage || "Generation interrupted",
+            });
+          }
+        },
+        onProgress: (message) => {
+          const logs = job.progressLogs ?? [];
+          logs.push(message);
+          if (logs.length > 50) logs.shift();
+          job.progressLogs = logs;
+          if (!hasTextDelta) {
+            job.streamedContent =
+              `<!-- skill-creator 执行进度 -->\n` +
+              logs.map((line) => `- ${line}`).join("\n");
+          }
+        },
+        onDelta: (chunk) => {
+          if (!hasTextDelta) {
+            hasTextDelta = true;
+            job.streamedContent = chunk;
+          } else {
+            job.streamedContent += chunk;
+          }
+        },
+      })
+    )
     .then(async (res) => {
       if (job.timer) clearTimeout(job.timer);
       await replaceSkillFiles(res.saved.skillName, res.files);
@@ -172,6 +221,7 @@ export function startGenerationJob(
         currentStep: 1,
         progress: 33,
         status: "draft",
+        selectedMcps: selectedMcpIds,
         frontmatter: res.frontmatter,
         hasScripts: res.hasScripts,
         resourceSummary: res.resourceSummary,
@@ -243,7 +293,7 @@ export async function abortGenerationJob(
           goalReason: "interrupted",
           reason,
         })
-        .catch(() => {});
+        .catch(() => { });
     }
     persistJobToDb(job);
   }

@@ -57,7 +57,7 @@ export async function runSkillInRepo(
   const { session, modelFallbackMessage } = await createAgentSession({
     cwd: targetCwd,
     skills: discoveredSkills,
-    sessionManager: SessionManager.inMemory(),
+    sessionManager: SessionManager.inMemory(targetCwd),
     telemetry: buildSessionTelemetryConfig({
       operation: "skill_run",
       skillName,

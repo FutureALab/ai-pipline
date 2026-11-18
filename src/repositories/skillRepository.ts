@@ -35,6 +35,25 @@ function resolveSafeSkillFilePath(skillName: string, relativePath: string): stri
 
 export async function readSkillMarkdown(skillName: string): Promise<string> {
   const normalized = normalizeSkillName(skillName);
+
+  // 1. Database is the primary source of truth
+  const res = await queryDb<{ content: string }>(
+    `SELECT content FROM skill_files WHERE skill_name = $1 AND file_path = 'SKILL.md'`,
+    [normalized]
+  );
+  if (res.rows[0]?.content !== undefined) {
+    return res.rows[0].content;
+  }
+
+  const skillRow = await queryDb<{ skill_md: string }>(
+    `SELECT skill_md FROM skills WHERE skill_name = $1`,
+    [normalized]
+  );
+  if (skillRow.rows[0]?.skill_md) {
+    return skillRow.rows[0].skill_md;
+  }
+
+  // 2. Fallback to disk if not yet in DB
   const filePath = path.join(
     resolveDefaultSkillsRoot("global"),
     normalized,
@@ -43,13 +62,6 @@ export async function readSkillMarkdown(skillName: string): Promise<string> {
   try {
     return await fs.readFile(filePath, "utf-8");
   } catch {
-    const res = await queryDb<{ content: string }>(
-      `SELECT content FROM skill_files WHERE skill_name = $1 AND file_path = 'SKILL.md'`,
-      [normalized]
-    );
-    if (res.rows[0]?.content !== undefined) {
-      return res.rows[0].content;
-    }
     throw new Error(`SKILL.md not found for "${normalized}"`);
   }
 }
@@ -75,12 +87,13 @@ export async function syncSkillMetadata(skillName: string): Promise<void> {
   const skillMd = files.find((f) => f.path === "SKILL.md");
   const frontmatter = skillMd ? parseSkillFrontmatter(skillMd.content) : null;
 
-  if (frontmatter) {
+  if (skillMd && frontmatter) {
     await queryDb(
       `UPDATE skills
        SET frontmatter = $2::jsonb,
            has_scripts = $3,
            resource_summary = $4::jsonb,
+           skill_md = $5,
            updated_at = NOW()
        WHERE skill_name = $1`,
       [
@@ -88,6 +101,7 @@ export async function syncSkillMetadata(skillName: string): Promise<void> {
         JSON.stringify(frontmatter),
         hasScripts,
         JSON.stringify(summary),
+        skillMd.content,
       ]
     );
   } else {
@@ -219,43 +233,53 @@ export async function replaceSkillFiles(
 
 export async function listSkillFiles(skillName: string): Promise<SkillFileEntry[]> {
   const normalized = normalizeSkillName(skillName);
-  const skillDir = path.resolve(resolveDefaultSkillsRoot("global"), normalized);
-  const results: SkillFileEntry[] = await readSkillDirectoryFiles(skillDir);
 
-  if (results.length === 0) {
-    const dbFiles = await queryDb<{
-      file_path: string;
-      content: string;
-      category: string;
-      mime_type: string;
-      encoding: string;
-      size_bytes: number;
-      is_executable: boolean | number;
-    }>(
-      `SELECT file_path, content, category, mime_type, encoding, size_bytes, is_executable
-       FROM skill_files
-       WHERE skill_name = $1`,
-      [normalized]
-    );
-    for (const row of dbFiles.rows) {
-      results.push({
-        path: row.file_path,
-        content: row.content,
-        category: (row.category as SkillFileCategory) || undefined,
-        mimeType: row.mime_type || undefined,
-        encoding: (row.encoding as SkillFileEncoding) || "utf-8",
-        sizeBytes: row.size_bytes ?? undefined,
-        isExecutable: Boolean(row.is_executable),
-      });
-    }
+  // 1. Database is the primary source of truth
+  const dbFiles = await queryDb<{
+    file_path: string;
+    content: string;
+    category: string;
+    mime_type: string;
+    encoding: string;
+    size_bytes: number;
+    is_executable: boolean | number;
+  }>(
+    `SELECT file_path, content, category, mime_type, encoding, size_bytes, is_executable
+     FROM skill_files
+     WHERE skill_name = $1`,
+    [normalized]
+  );
+
+  if (dbFiles.rows.length > 0) {
+    const results: SkillFileEntry[] = dbFiles.rows.map((row) => ({
+      path: row.file_path,
+      content: row.content,
+      category: (row.category as SkillFileCategory) || undefined,
+      mimeType: row.mime_type || undefined,
+      encoding: (row.encoding as SkillFileEncoding) || "utf-8",
+      sizeBytes: row.size_bytes ?? undefined,
+      isExecutable: Boolean(row.is_executable),
+    }));
     results.sort((a, b) => {
       if (a.path === "SKILL.md") return -1;
       if (b.path === "SKILL.md") return 1;
       return a.path.localeCompare(b.path);
     });
+    return results;
   }
 
-  return results;
+  // 2. Fallback to skills.skill_md if skill_files has no rows yet
+  const skillRow = await queryDb<{ skill_md: string }>(
+    `SELECT skill_md FROM skills WHERE skill_name = $1`,
+    [normalized]
+  );
+  if (skillRow.rows[0]?.skill_md) {
+    return [enrichSkillFileEntry({ path: "SKILL.md", content: skillRow.rows[0].skill_md })];
+  }
+
+  // 3. Fallback to disk
+  const skillDir = path.resolve(resolveDefaultSkillsRoot("global"), normalized);
+  return await readSkillDirectoryFiles(skillDir);
 }
 
 function crc32(buf: Buffer): number {
@@ -345,6 +369,7 @@ type DbSkillRow = {
   status: SkillLifecycleStatus;
   selected_apps: string[] | string;
   selected_repos: string[] | string;
+  selected_mcps: string[] | string | null;
   pipeline_runs: RepoPipelineRun[] | string;
   frontmatter: Record<string, unknown> | string | null;
   has_scripts: boolean | number | null;
@@ -407,6 +432,7 @@ function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
     status: row.status ?? "draft",
     selectedApps: parseJsonArray<string>(row.selected_apps),
     selectedRepos: parseJsonArray<string>(row.selected_repos),
+    selectedMcps: parseJsonArray<string>(row.selected_mcps),
     pipelineRuns: parseJsonArray<RepoPipelineRun>(row.pipeline_runs),
     frontmatter: parseJsonObject<Record<string, unknown>>(row.frontmatter, {}),
     hasScripts: Boolean(row.has_scripts),
@@ -416,8 +442,8 @@ function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
 
 const SKILL_SELECT_COLUMNS = `
   skill_name, description, creator, is_builtin, created_at, updated_at,
-  current_step, progress, status, selected_apps, selected_repos, pipeline_runs,
-  frontmatter, has_scripts, resource_summary
+  current_step, progress, status, selected_apps, selected_repos, selected_mcps,
+  pipeline_runs, frontmatter, has_scripts, resource_summary
 `;
 
 export async function listCatalogApps(): Promise<CatalogAppRow[]> {
@@ -494,6 +520,7 @@ export async function upsertSkillCard(
     status: patch.status ?? existing?.status ?? "draft",
     selectedApps: patch.selectedApps ?? existing?.selectedApps ?? [],
     selectedRepos: patch.selectedRepos ?? existing?.selectedRepos ?? [],
+    selectedMcps: patch.selectedMcps ?? existing?.selectedMcps ?? [],
     pipelineRuns: patch.pipelineRuns ?? existing?.pipelineRuns ?? [],
     frontmatter: patch.frontmatter ?? existing?.frontmatter ?? {},
     hasScripts: patch.hasScripts ?? existing?.hasScripts ?? false,
@@ -504,10 +531,10 @@ export async function upsertSkillCard(
   await queryDb(
     `INSERT INTO skills (
        skill_name, description, creator, is_builtin, created_at, updated_at,
-       current_step, progress, status, selected_apps, selected_repos, pipeline_runs,
-       frontmatter, has_scripts, resource_summary
+       current_step, progress, status, selected_apps, selected_repos, selected_mcps,
+       pipeline_runs, frontmatter, has_scripts, resource_summary
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15::jsonb)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16::jsonb)
      ON CONFLICT (skill_name)
      DO UPDATE SET
        description = EXCLUDED.description,
@@ -519,6 +546,7 @@ export async function upsertSkillCard(
        status = EXCLUDED.status,
        selected_apps = EXCLUDED.selected_apps,
        selected_repos = EXCLUDED.selected_repos,
+       selected_mcps = EXCLUDED.selected_mcps,
        pipeline_runs = EXCLUDED.pipeline_runs,
        frontmatter = EXCLUDED.frontmatter,
        has_scripts = EXCLUDED.has_scripts,
@@ -535,6 +563,7 @@ export async function upsertSkillCard(
       next.status,
       JSON.stringify(next.selectedApps),
       JSON.stringify(next.selectedRepos),
+      JSON.stringify(next.selectedMcps ?? []),
       JSON.stringify(next.pipelineRuns),
       JSON.stringify(next.frontmatter ?? {}),
       next.hasScripts ?? false,

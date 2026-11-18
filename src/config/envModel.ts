@@ -5,6 +5,13 @@ import {
 
 export type OpenAIApiMode = "chat" | "responses";
 
+export interface OpenAIOverrideConfig {
+  apiKey?: string;
+  modelName?: string;
+  baseUrl?: string;
+  apiMode?: OpenAIApiMode;
+}
+
 export interface EnvSessionModelOptions {
   authStorage: Awaited<ReturnType<typeof discoverAuthStorage>>;
   modelRegistry: ModelRegistry;
@@ -19,11 +26,19 @@ function normalizeBaseUrl(url: string): string {
 }
 
 /**
- * Resolve OpenAI-compatible model configuration from environment variables (.env).
- * Supports both Chat Completions API (`openai-completions`) and Responses API (`openai-responses`).
+ * Resolve OpenAI-compatible model configuration from environment variables (.env)
+ * and/or per-request user overrides (custom API key, model, baseUrl, apiMode).
  */
-export async function resolveOpenAIEnvSessionOptions(): Promise<EnvSessionModelOptions | null> {
-  const rawMode = (process.env.OPENAI_API_MODE || "chat").trim().toLowerCase();
+export async function resolveOpenAIEnvSessionOptions(
+  override?: OpenAIOverrideConfig
+): Promise<EnvSessionModelOptions | null> {
+  const rawMode = (
+    override?.apiMode ||
+    process.env.OPENAI_API_MODE ||
+    "chat"
+  )
+    .trim()
+    .toLowerCase();
   const mode: OpenAIApiMode =
     rawMode === "responses" || rawMode === "openai-responses"
       ? "responses"
@@ -35,7 +50,11 @@ export async function resolveOpenAIEnvSessionOptions(): Promise<EnvSessionModelO
     mode === "responses"
       ? process.env.OPENAI_RESPONSES_API_KEY
       : process.env.OPENAI_CHAT_API_KEY;
-  const apiKey = modeKey?.trim() || process.env.OPENAI_API_KEY?.trim() || "";
+  const apiKey =
+    override?.apiKey?.trim() ||
+    modeKey?.trim() ||
+    process.env.OPENAI_API_KEY?.trim() ||
+    "";
 
   if (!apiKey || apiKey === PLACEHOLDER_KEY) {
     return null;
@@ -46,7 +65,8 @@ export async function resolveOpenAIEnvSessionOptions(): Promise<EnvSessionModelO
       ? process.env.OPENAI_RESPONSES_BASE_URL
       : process.env.OPENAI_CHAT_BASE_URL;
   const baseUrl = normalizeBaseUrl(
-    modeBaseUrl?.trim() ||
+    override?.baseUrl?.trim() ||
+      modeBaseUrl?.trim() ||
       process.env.OPENAI_BASE_URL?.trim() ||
       "https://api.openai.com/v1"
   );
@@ -56,6 +76,7 @@ export async function resolveOpenAIEnvSessionOptions(): Promise<EnvSessionModelO
       ? process.env.OPENAI_RESPONSES_MODEL_NAME
       : process.env.OPENAI_CHAT_MODEL_NAME;
   const modelName =
+    override?.modelName?.trim() ||
     modeModelName?.trim() ||
     process.env.OPENAI_MODEL_NAME?.trim() ||
     (mode === "responses" ? "gpt-4.1" : "gpt-4o");

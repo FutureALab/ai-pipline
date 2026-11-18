@@ -387,6 +387,65 @@ export function resolveDefaultSkillsRoot(
 }
 
 /**
+ * Resolve Pi agent skills directory (~/.pi/agent/skills or $PI_CODING_AGENT_DIR/skills).
+ */
+export function resolvePiSkillsRoot(): string {
+  const piDir =
+    process.env.PI_CODING_AGENT_DIR?.trim() || path.join(os.homedir(), ".pi", "agent");
+  return path.join(piDir, "skills");
+}
+
+/**
+ * Return all global agent skill roots to keep synchronized.
+ * When OMP_AGENT_DIR is explicitly overridden (e.g. in tests), only sync to that root
+ * unless PI_CODING_AGENT_DIR is also explicitly set.
+ */
+export function resolveAllGlobalSkillRoots(): string[] {
+  const ompRoot = path.resolve(resolveDefaultSkillsRoot("global"));
+  const roots = [ompRoot];
+
+  const hasCustomOmp = Boolean(process.env.OMP_AGENT_DIR?.trim());
+  const hasCustomPi = Boolean(process.env.PI_CODING_AGENT_DIR?.trim());
+  if (!hasCustomOmp || hasCustomPi) {
+    const piRoot = path.resolve(resolvePiSkillsRoot());
+    if (!roots.includes(piRoot)) {
+      roots.push(piRoot);
+    }
+  }
+
+  return roots;
+}
+
+/**
+ * Write a complete list of skill files into a specific skill directory.
+ */
+export async function saveSkillFilesToDir(
+  skillDir: string,
+  files: SkillFileEntry[]
+): Promise<void> {
+  const resolvedSkillDir = path.resolve(skillDir);
+  await fs.mkdir(resolvedSkillDir, { recursive: true });
+
+  for (const file of files) {
+    const relPath = normalizeRelativeSkillPath(file.path);
+    const target = path.resolve(resolvedSkillDir, relPath);
+    if (
+      target !== resolvedSkillDir &&
+      !target.startsWith(resolvedSkillDir + path.sep)
+    ) {
+      throw new Error(`Invalid relative file path: "${file.path}"`);
+    }
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const encoding = file.encoding === "base64" ? "base64" : "utf-8";
+    const buf = Buffer.from(file.content, encoding);
+    await fs.writeFile(target, buf);
+    if (file.isExecutable) {
+      await fs.chmod(target, 0o755).catch(() => {});
+    }
+  }
+}
+
+/**
  * Save a generated SKILL.md directly into OMP's default skills directory.
  */
 export async function saveSkillToDefaultDir(
@@ -421,20 +480,14 @@ export async function saveSkillFilesToDefaultDir(
   const skillsRoot = resolveDefaultSkillsRoot(scope, options.cwd);
   const skillDir = path.resolve(skillsRoot, skillName);
 
-  await fs.mkdir(skillDir, { recursive: true });
+  await saveSkillFilesToDir(skillDir, options.files);
 
-  for (const file of options.files) {
-    const relPath = normalizeRelativeSkillPath(file.path);
-    const target = path.resolve(skillDir, relPath);
-    if (target !== skillDir && !target.startsWith(skillDir + path.sep)) {
-      throw new Error(`Invalid relative file path: "${file.path}"`);
-    }
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    const encoding = file.encoding === "base64" ? "base64" : "utf-8";
-    const buf = Buffer.from(file.content, encoding);
-    await fs.writeFile(target, buf);
-    if (file.isExecutable) {
-      await fs.chmod(target, 0o755).catch(() => {});
+  if (scope === "global") {
+    for (const root of resolveAllGlobalSkillRoots()) {
+      const targetDir = path.resolve(root, skillName);
+      if (targetDir !== skillDir) {
+        await saveSkillFilesToDir(targetDir, options.files);
+      }
     }
   }
 

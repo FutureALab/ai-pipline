@@ -10,6 +10,11 @@ import {
   startGenerationJobHandler,
 } from "../controllers/jobController.js";
 import {
+  createMcpHandler,
+  deleteMcpHandler,
+  listMcpsHandler,
+} from "../controllers/mcpController.js";
+import {
   getCatalogHandler,
   publishSkillHandler,
   testPipelineHandler,
@@ -26,6 +31,15 @@ import {
   getTraceByIdHandler,
   listTracesHandler,
 } from "../controllers/traceController.js";
+import {
+  abortWorkbenchSessionHandler,
+  closeWorkbenchSessionHandler,
+  createWorkbenchSessionHandler,
+  getWorkbenchSessionHandler,
+  listWorkbenchSessionsHandler,
+  sendWorkbenchMessageHandler,
+  setWorkbenchThinkingHandler,
+} from "../controllers/workbenchController.js";
 import { getDbDriver, isDbConnected } from "../db/database.js";
 import { isRedisConnected } from "../db/redis.js";
 import { sendCorsPreflight, sendJson } from "./httpUtils.js";
@@ -63,6 +77,51 @@ export async function routeRequest(
 
     if (method === "GET" && url.pathname === "/api/catalog") {
       return await getCatalogHandler(res);
+    }
+
+    if (method === "GET" && url.pathname === "/api/mcps") {
+      return await listMcpsHandler(res, url);
+    }
+    if (method === "POST" && url.pathname === "/api/mcps") {
+      return await createMcpHandler(req, res);
+    }
+    const mcpDeleteMatch = url.pathname.match(/^\/api\/mcps\/([^/]+)$/);
+    if (method === "DELETE" && mcpDeleteMatch) {
+      return await deleteMcpHandler(res, mcpDeleteMatch[1], url);
+    }
+
+    if (method === "GET" && url.pathname === "/api/workbench/sessions") {
+      return await listWorkbenchSessionsHandler(res, url);
+    }
+    if (method === "POST" && url.pathname === "/api/workbench/sessions") {
+      return await createWorkbenchSessionHandler(req, res);
+    }
+    const wbMsgMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/messages$/
+    );
+    if (method === "POST" && wbMsgMatch) {
+      return await sendWorkbenchMessageHandler(req, res, wbMsgMatch[1]);
+    }
+    const wbAbortMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/abort$/
+    );
+    if (method === "POST" && wbAbortMatch) {
+      return await abortWorkbenchSessionHandler(res, wbAbortMatch[1]);
+    }
+    const wbThinkingMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/thinking$/
+    );
+    if (method === "POST" && wbThinkingMatch) {
+      return await setWorkbenchThinkingHandler(req, res, wbThinkingMatch[1]);
+    }
+    const wbSessionMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)$/
+    );
+    if (method === "GET" && wbSessionMatch) {
+      return await getWorkbenchSessionHandler(res, wbSessionMatch[1]);
+    }
+    if (method === "DELETE" && wbSessionMatch) {
+      return await closeWorkbenchSessionHandler(res, wbSessionMatch[1]);
     }
 
     if (method === "POST" && url.pathname === "/api/jenkins/execute") {

@@ -13,6 +13,9 @@ export interface RepoPipelineRun {
   status: "pending" | "running" | "success" | "failed";
   durationMs: number;
   logs: string[];
+  jenkinsJobName?: string;
+  jenkinsBuildNumber?: number;
+  jenkinsBuildUrl?: string;
 }
 
 export type SkillFileCategory =
@@ -35,6 +38,18 @@ export interface SkillResourceSummary {
   other: number;
 }
 
+export interface UserMcpServer {
+  id: string;
+  owner: string;
+  name: string;
+  transport: "streamable-http";
+  url: string;
+  headers: Record<string, string>;
+  description: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface SkillCardRecord {
   skillName: string;
   description: string;
@@ -46,6 +61,7 @@ export interface SkillCardRecord {
   status: SkillLifecycleStatus;
   selectedApps: string[];
   selectedRepos: string[];
+  selectedMcps?: string[];
   pipelineRuns: RepoPipelineRun[];
   frontmatter?: Record<string, unknown>;
   hasScripts?: boolean;
@@ -152,6 +168,7 @@ export function updateSkill(
     files?: SkillFileEntry[];
     replaceFiles?: boolean;
     deleteFile?: string;
+    selectedMcps?: string[];
     submit?: boolean;
   }
 ): Promise<{ card: SkillCardRecord; content: string; files: SkillFileEntry[] }> {
@@ -165,16 +182,194 @@ export function getSkillDownloadUrl(skillName: string): string {
   return `/api/skills/${encodeURIComponent(skillName)}/download`;
 }
 
+export interface OpenAIOverrideConfig {
+  apiKey?: string;
+  modelName?: string;
+  baseUrl?: string;
+  apiMode?: "chat" | "responses";
+}
+
 export function startGenerationJob(payload: {
   skillName?: string;
   description?: string;
   creator?: string;
+  selectedMcps?: string[];
+  openaiConfig?: OpenAIOverrideConfig;
   prompt: string;
   timeoutMs?: number;
 }): Promise<{ job: GenerationJobSnapshot }> {
   return request("/api/skills/generate/start", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export function fetchUserMcps(
+  owner: string
+): Promise<{ mcps: UserMcpServer[] }> {
+  return request(`/api/mcps?owner=${encodeURIComponent(owner)}`);
+}
+
+export function createUserMcp(payload: {
+  owner: string;
+  name: string;
+  url: string;
+  headers?: Record<string, string>;
+  description?: string;
+}): Promise<{ mcp: UserMcpServer }> {
+  return request("/api/mcps", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteUserMcp(
+  id: string,
+  owner: string
+): Promise<{ ok: boolean }> {
+  return request(
+    `/api/mcps/${encodeURIComponent(id)}?owner=${encodeURIComponent(owner)}`,
+    { method: "DELETE" }
+  );
+}
+
+export interface WorkbenchMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  thinking?: string;
+  toolLogs?: string[];
+  createdAt: number;
+}
+
+export interface WorkbenchSkillItem {
+  name: string;
+  description: string;
+  source: string;
+}
+
+export interface WorkbenchMcpStatusItem {
+  id: string;
+  name: string;
+  url: string;
+  status: "connected" | "connecting" | "disconnected";
+  tools: string[];
+}
+
+export interface WorkbenchSessionStats {
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
+  cost: number;
+  contextUsage: {
+    tokens: number | null;
+    contextWindow: number;
+    percent: number | null;
+  } | null;
+}
+
+export interface WorkbenchModelInfo {
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow: number;
+  reasoning: boolean;
+}
+
+export interface WorkbenchSessionSnapshot {
+  sessionId: string;
+  owner: string;
+  repoId?: string;
+  repoName?: string;
+  repoUrl?: string;
+  cwd: string;
+  selectedMcps: string[];
+  status: "idle" | "running" | "error";
+  messages: WorkbenchMessage[];
+  streamingText: string;
+  streamingThinking: string;
+  streamingLogs: string[];
+  errorMessage?: string;
+  model: WorkbenchModelInfo | null;
+  thinkingLevel: string;
+  availableThinkingLevels: string[];
+  stats: WorkbenchSessionStats;
+  skills: WorkbenchSkillItem[];
+  mcpServers: WorkbenchMcpStatusItem[];
+  updatedAt: number;
+}
+
+export function fetchWorkbenchSessions(
+  owner?: string
+): Promise<{ sessions: WorkbenchSessionSnapshot[] }> {
+  const qs = owner ? `?owner=${encodeURIComponent(owner)}` : "";
+  return request(`/api/workbench/sessions${qs}`);
+}
+
+export function createWorkbenchSession(payload: {
+  owner: string;
+  repoId?: string;
+  customCwd?: string;
+  selectedMcps?: string[];
+  openaiConfig?: OpenAIOverrideConfig;
+  thinkingLevel?: string;
+}): Promise<{ session: WorkbenchSessionSnapshot }> {
+  return request("/api/workbench/sessions", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function setWorkbenchThinking(
+  sessionId: string,
+  thinkingLevel: string
+): Promise<{ session: WorkbenchSessionSnapshot }> {
+  return request(
+    `/api/workbench/sessions/${encodeURIComponent(sessionId)}/thinking`,
+    {
+      method: "POST",
+      body: JSON.stringify({ thinkingLevel }),
+    }
+  );
+}
+
+export function fetchWorkbenchSession(
+  sessionId: string
+): Promise<{ session: WorkbenchSessionSnapshot }> {
+  return request(`/api/workbench/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export function sendWorkbenchMessage(
+  sessionId: string,
+  message: string
+): Promise<{ session: WorkbenchSessionSnapshot }> {
+  return request(
+    `/api/workbench/sessions/${encodeURIComponent(sessionId)}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    }
+  );
+}
+
+export function abortWorkbenchSession(
+  sessionId: string
+): Promise<{ session: WorkbenchSessionSnapshot }> {
+  return request(
+    `/api/workbench/sessions/${encodeURIComponent(sessionId)}/abort`,
+    { method: "POST" }
+  );
+}
+
+export function closeWorkbenchSession(
+  sessionId: string
+): Promise<{ ok: boolean }> {
+  return request(`/api/workbench/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
   });
 }
 

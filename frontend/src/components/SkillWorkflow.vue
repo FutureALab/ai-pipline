@@ -53,13 +53,42 @@
       </el-steps>
     </el-card>
 
-    <!-- 第一步：左右两栏（左侧基础信息与生成，右侧目录树 + VS Code 预览/编辑 + 下载） -->
+    <!-- 第一步：模式选择（Skill 模式 / 创造模式 pi-agent 工作台） -->
     <div v-if="activeStep === 0" class="step-one-container">
+      <div class="mode-switch-bar">
+        <el-radio-group v-model="stepOneMode" size="default">
+          <el-radio-button value="skill">Skill 模式（直接生成与编辑）</el-radio-button>
+          <el-radio-button value="creative">创造模式（pi-agent 对话工作台）</el-radio-button>
+        </el-radio-group>
+        <span class="mode-hint">
+          {{
+            stepOneMode === "skill"
+              ? "直接填写需求，使用 skill-creator 生成并编辑完整 Skill"
+              : "在版本库上下文中与 pi-agent 自由对话探索、操作仓库或挂载 MCP，随时沉淀为 Skill"
+          }}
+        </span>
+      </div>
+
+      <template v-if="stepOneMode === 'skill'">
       <el-row :gutter="20">
         <el-col :xs="24" :md="9">
           <el-card shadow="never" class="panel-card">
             <template #header>
-              <div class="panel-title">Skill 基本信息与 AI 生成</div>
+              <div class="panel-header-row">
+                <div class="panel-title">Skill 基本信息与 AI 生成</div>
+                <el-button
+                  size="small"
+                  :type="hasCustomOpenAI ? 'success' : 'default'"
+                  plain
+                  @click="openOpenaiDialog"
+                >
+                  {{
+                    openaiConfig.modelName
+                      ? `模型: ${openaiConfig.modelName}`
+                      : "配置 API Key / 模型"
+                  }}
+                </el-button>
+              </div>
             </template>
 
             <el-form label-position="top">
@@ -81,7 +110,62 @@
               </el-form-item>
 
               <el-form-item label="创建人">
-                <el-input v-model="form.creator" placeholder="例如：Admin" />
+                <el-input
+                  v-model="form.creator"
+                  placeholder="例如：Admin"
+                  @change="loadUserMcps"
+                />
+              </el-form-item>
+
+              <el-form-item>
+                <template #label>
+                  <div class="mcp-label-row">
+                    <span>MCP 服务（Streamable HTTP，仅当前创建人可见）</span>
+                    <el-button
+                      type="primary"
+                      link
+                      size="small"
+                      @click="openAddMcpDialog"
+                    >
+                      + 添加 MCP
+                    </el-button>
+                  </div>
+                </template>
+                <el-select
+                  v-model="selectedMcps"
+                  multiple
+                  filterable
+                  collapse-tags
+                  collapse-tags-tooltip
+                  :loading="loadingMcps"
+                  placeholder="选择已注册的 Streamable HTTP MCP（可多选）"
+                  style="width: 100%"
+                >
+                  <el-option
+                    v-for="mcp in userMcps"
+                    :key="mcp.id"
+                    :label="mcp.name"
+                    :value="mcp.id"
+                  >
+                    <div class="mcp-option-row">
+                      <span class="mcp-option-name">{{ mcp.name }}</span>
+                      <span class="mcp-option-url">{{ mcp.url }}</span>
+                      <el-button
+                        type="danger"
+                        link
+                        size="small"
+                        @click.stop="handleDeleteMcp(mcp)"
+                      >
+                        删除
+                      </el-button>
+                    </div>
+                  </el-option>
+                  <template #empty>
+                    <div class="mcp-empty-tip">
+                      暂无个人 MCP，请点击上方「+ 添加 MCP」创建
+                    </div>
+                  </template>
+                </el-select>
               </el-form-item>
 
               <el-form-item label="AI 生成提示词">
@@ -93,8 +177,21 @@
                 />
               </el-form-item>
 
-              <el-form-item label="长任务超时时间（秒，超时自动中断）">
+              <el-form-item>
+                <template #label>
+                  <div class="timeout-label-row">
+                    <span>长任务超时时间（秒，超时自动中断）</span>
+                    <el-switch
+                      v-model="enableTimeout"
+                      :disabled="generating"
+                      inline-prompt
+                      active-text="开启超时"
+                      inactive-text="关闭超时"
+                    />
+                  </div>
+                </template>
                 <el-input-number
+                  v-if="enableTimeout"
                   v-model="timeoutSeconds"
                   :min="10"
                   :max="600"
@@ -102,6 +199,9 @@
                   style="width: 100%"
                   :disabled="generating"
                 />
+                <div v-else class="timeout-disabled-tip">
+                  已关闭超时限制，任务将持续运行直到完成或手动中断
+                </div>
               </el-form-item>
 
               <div class="gen-actions">
@@ -141,7 +241,11 @@
                   </el-tag>
                   <span class="job-elapsed">
                     耗时：{{ (currentJob.elapsedMs / 1000).toFixed(1) }}s /
-                    {{ Math.round(currentJob.timeoutMs / 1000) }}s
+                    {{
+                      currentJob.timeoutMs > 0
+                        ? `${Math.round(currentJob.timeoutMs / 1000)}s`
+                        : "无超时限制"
+                    }}
                   </span>
                 </div>
                 <p v-if="currentJob.errorMessage" class="job-error-msg">
@@ -234,6 +338,439 @@
           提交并进入第三步
         </el-button>
       </div>
+      </template>
+
+      <!-- 创造模式：pi-agent 对话工作台 -->
+      <template v-else>
+        <el-row :gutter="20">
+          <el-col :xs="24" :md="8">
+            <el-card shadow="never" class="panel-card">
+              <template #header>
+                <div class="panel-header-row">
+                  <div class="panel-title">
+                    {{
+                      isCreatingWorkbenchSession || workbenchSessions.length === 0
+                        ? "新建工作台会话"
+                        : `工作台会话 (${workbenchSessions.length})`
+                    }}
+                  </div>
+                  <el-button
+                    size="small"
+                    :type="hasCustomOpenAI ? 'success' : 'default'"
+                    plain
+                    @click="openOpenaiDialog"
+                  >
+                    {{
+                      openaiConfig.modelName
+                        ? `模型: ${openaiConfig.modelName}`
+                        : "配置 API Key / 模型"
+                    }}
+                  </el-button>
+                </div>
+              </template>
+
+              <!-- 初始化 / 新建会话表单 -->
+              <el-form
+                v-if="isCreatingWorkbenchSession || workbenchSessions.length === 0"
+                label-position="top"
+              >
+                <el-form-item label="当前用户（创建人）">
+                  <el-input
+                    v-model="form.creator"
+                    placeholder="例如：Admin"
+                    @change="handleCreatorChange"
+                  />
+                </el-form-item>
+
+                <el-form-item label="选择权限内的 Git 版本库">
+                  <el-select
+                    v-model="workbenchRepoId"
+                    clearable
+                    filterable
+                    placeholder="选择一个版本库（可选）"
+                    style="width: 100%"
+                  >
+                    <el-option
+                      v-for="repo in catalogRepos"
+                      :key="repo.id"
+                      :label="`${repo.name} (${repo.branch})`"
+                      :value="repo.id"
+                    />
+                  </el-select>
+                </el-form-item>
+
+                <el-form-item label="或指定本地工作目录（可选）">
+                  <el-input
+                    v-model="workbenchCustomCwd"
+                    placeholder="留空则使用所选版本库或默认目录"
+                  />
+                </el-form-item>
+
+                <el-form-item>
+                  <template #label>
+                    <div class="mcp-label-row">
+                      <span>MCP 服务（Streamable HTTP，仅自己可见）</span>
+                      <el-button
+                        type="primary"
+                        link
+                        size="small"
+                        @click="openAddMcpDialog"
+                      >
+                        + 添加 MCP
+                      </el-button>
+                    </div>
+                  </template>
+                  <el-select
+                    v-model="selectedMcps"
+                    multiple
+                    filterable
+                    collapse-tags
+                    collapse-tags-tooltip
+                    :loading="loadingMcps"
+                    placeholder="选择要挂载的 Streamable HTTP MCP"
+                    style="width: 100%"
+                  >
+                    <el-option
+                      v-for="mcp in userMcps"
+                      :key="mcp.id"
+                      :label="mcp.name"
+                      :value="mcp.id"
+                    >
+                      <div class="mcp-option-row">
+                        <span class="mcp-option-name">{{ mcp.name }}</span>
+                        <span class="mcp-option-url">{{ mcp.url }}</span>
+                        <el-button
+                          type="danger"
+                          link
+                          size="small"
+                          @click.stop="handleDeleteMcp(mcp)"
+                        >
+                          删除
+                        </el-button>
+                      </div>
+                    </el-option>
+                    <template #empty>
+                      <div class="mcp-empty-tip">
+                        暂无个人 MCP，请点击上方「+ 添加 MCP」创建
+                      </div>
+                    </template>
+                  </el-select>
+                </el-form-item>
+
+                <div class="workbench-actions">
+                  <el-button
+                    type="primary"
+                    :loading="workbenchInitializing"
+                    style="flex: 1"
+                    @click="handleStartWorkbench"
+                  >
+                    启动工作台会话
+                  </el-button>
+                  <el-button
+                    v-if="workbenchSessions.length > 0"
+                    @click="isCreatingWorkbenchSession = false"
+                  >
+                    返回列表
+                  </el-button>
+                </div>
+              </el-form>
+
+              <!-- 收缩后的多会话文件夹卡片列表 -->
+              <div v-else class="wb-session-list-wrap">
+                <div class="wb-session-cards">
+                  <div
+                    v-for="sess in workbenchSessions"
+                    :key="sess.sessionId"
+                    :class="[
+                      'wb-session-card',
+                      { active: workbenchSession?.sessionId === sess.sessionId },
+                    ]"
+                    @click="selectWorkbenchSession(sess)"
+                  >
+                    <div class="wb-session-card-top">
+                      <div class="wb-session-folder-title">
+                        <el-icon><Folder /></el-icon>
+                        <span>{{ sess.repoName || folderBasename(sess.cwd) }}</span>
+                      </div>
+                      <div class="wb-session-card-right">
+                        <el-tag
+                          size="small"
+                          :type="
+                            sess.status === 'running'
+                              ? 'primary'
+                              : sess.status === 'error'
+                                ? 'danger'
+                                : 'success'
+                          "
+                        >
+                          {{
+                            sess.status === "running"
+                              ? "执行中"
+                              : sess.status === "error"
+                                ? "异常"
+                                : "就绪"
+                          }}
+                        </el-tag>
+                        <el-button
+                          type="danger"
+                          link
+                          size="small"
+                          @click.stop="handleCloseWorkbenchSession(sess.sessionId)"
+                        >
+                          关闭
+                        </el-button>
+                      </div>
+                    </div>
+                    <div class="wb-session-card-path" :title="sess.cwd">
+                      {{ sess.cwd }}
+                    </div>
+                    <div class="wb-session-card-meta">
+                      <span>对话 {{ sess.messages.length }} 条</span>
+                      <span v-if="sess.mcpServers.length > 0">
+                        · MCP {{ sess.mcpServers.length }} 个
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="workbench-actions" style="margin-top: 12px">
+                  <el-button
+                    type="primary"
+                    plain
+                    style="flex: 1"
+                    @click="handleOpenNewWorkbenchForm"
+                  >
+                    + 新建会话
+                  </el-button>
+                  <el-button
+                    v-if="workbenchSession && workbenchSession.messages.length > 0"
+                    type="success"
+                    plain
+                    @click="handleDistillToSkill"
+                  >
+                    沉淀为 Skill
+                  </el-button>
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+
+          <el-col :xs="24" :md="16">
+            <el-card shadow="never" class="panel-card workbench-chat-card">
+              <template #header>
+                <div class="workbench-header-wrap">
+                  <div class="panel-header-row">
+                    <div class="panel-title">
+                      pi-agent 实时对话与仓库操作
+                    </div>
+                    <div class="workbench-header-actions">
+                      <el-button
+                        v-if="workbenchSession"
+                        size="small"
+                        plain
+                        @click="workbenchSkillsDialogVisible = true"
+                      >
+                        Skills ({{ workbenchSession.skills.length }})
+                      </el-button>
+                      <el-button
+                        v-if="workbenchSession"
+                        size="small"
+                        plain
+                        @click="workbenchMcpDialogVisible = true"
+                      >
+                        MCP ({{ workbenchSession.mcpServers.length }})
+                      </el-button>
+                      <el-tag
+                        v-if="workbenchSession"
+                        :type="workbenchSession.status === 'running' ? 'primary' : workbenchSession.status === 'error' ? 'danger' : 'success'"
+                        size="small"
+                      >
+                        {{
+                          workbenchSession.status === "running"
+                            ? "Agent 执行中..."
+                            : workbenchSession.status === "error"
+                              ? "执行异常"
+                              : "会话就绪"
+                        }}
+                      </el-tag>
+                    </div>
+                  </div>
+                  <!-- Thinkrail 风格上下文与 Token 统计栏 -->
+                  <div v-if="workbenchSession" class="workbench-stats-bar">
+                    <span class="stats-pill" title="当前模型（点击修改）" @click="openOpenaiDialog">
+                      模型：{{
+                        workbenchSession.model
+                          ? `${workbenchSession.model.provider}/${workbenchSession.model.id}`
+                          : "默认模型"
+                      }}
+                    </span>
+                    <span class="stats-sep">·</span>
+                    <span v-if="workbenchSession.stats.tokens.input" class="stats-item">
+                      ↑{{ formatCompactTokens(workbenchSession.stats.tokens.input) }}
+                    </span>
+                    <span v-if="workbenchSession.stats.tokens.output" class="stats-item">
+                      ↓{{ formatCompactTokens(workbenchSession.stats.tokens.output) }}
+                    </span>
+                    <span v-if="workbenchSession.stats.tokens.cacheRead" class="stats-item">
+                      R{{ formatCompactTokens(workbenchSession.stats.tokens.cacheRead) }}
+                    </span>
+                    <span v-if="workbenchSession.stats.cost" class="stats-item">
+                      ${{ workbenchSession.stats.cost.toFixed(3) }}
+                    </span>
+                    <span
+                      v-if="workbenchSession.stats.contextUsage"
+                      class="stats-context"
+                      title="上下文窗口占用"
+                    >
+                      <span class="context-bar">{{
+                        contextBarText(workbenchSession.stats.contextUsage).bar
+                      }}</span>
+                      {{ contextBarText(workbenchSession.stats.contextUsage).text }}
+                    </span>
+                  </div>
+                </div>
+              </template>
+
+              <div class="workbench-chat-history">
+                <el-empty
+                  v-if="!workbenchSession"
+                  description="在左侧选择版本库和 MCP（可选），直接发送消息即可自动启动 pi-agent 对话"
+                />
+                <template v-else>
+                  <div
+                    v-if="workbenchSession.messages.length === 0 && workbenchSession.status !== 'running'"
+                    class="workbench-welcome"
+                  >
+                    工作台已就绪！你可以让 AI 检查仓库代码、运行命令、调用已挂载的 MCP 工具，或一起探讨如何设计 Skill。
+                  </div>
+
+                  <div
+                    v-for="msg in workbenchSession.messages"
+                    :key="msg.id"
+                    :class="['chat-bubble', msg.role]"
+                  >
+                    <div class="chat-role">
+                      {{ msg.role === "user" ? form.creator || "我" : "pi-agent" }}
+                    </div>
+                    <details v-if="msg.thinking" class="chat-thinking-box">
+                      <summary>思考过程</summary>
+                      <pre class="chat-thinking-body">{{ msg.thinking }}</pre>
+                    </details>
+                    <div v-if="msg.toolLogs && msg.toolLogs.length > 0" class="chat-tool-logs">
+                      <div v-for="(log, idx) in msg.toolLogs" :key="idx" class="chat-tool-item">
+                        {{ log }}
+                      </div>
+                    </div>
+                    <div
+                      v-if="msg.role === 'assistant'"
+                      class="chat-markdown"
+                      v-html="renderMarkdownText(msg.content)"
+                    />
+                    <div v-else class="chat-plain">{{ msg.content }}</div>
+                  </div>
+
+                  <div
+                    v-if="workbenchSession.status === 'running'"
+                    class="chat-bubble assistant streaming"
+                  >
+                    <div class="chat-role">pi-agent（思考与执行中...）</div>
+                    <details v-if="workbenchSession.streamingThinking" open class="chat-thinking-box">
+                      <summary>正在思考...</summary>
+                      <pre class="chat-thinking-body">{{ workbenchSession.streamingThinking }}</pre>
+                    </details>
+                    <div
+                      v-if="workbenchSession.streamingLogs.length > 0"
+                      class="chat-tool-logs"
+                    >
+                      <div
+                        v-for="(log, idx) in workbenchSession.streamingLogs"
+                        :key="idx"
+                        class="chat-tool-item"
+                      >
+                        {{ log }}
+                      </div>
+                    </div>
+                    <div
+                      v-if="workbenchSession.streamingText"
+                      class="chat-markdown"
+                      v-html="renderMarkdownText(workbenchSession.streamingText)"
+                    />
+                  </div>
+                </template>
+              </div>
+
+              <!-- Thinkrail 风格 Composer 控制栏：模型、思考等级、Skills、MCP -->
+              <div class="workbench-composer-toolbar">
+                <div class="composer-left-controls">
+                  <el-button size="small" plain @click="openOpenaiDialog">
+                    模型：{{
+                      workbenchSession?.model?.id ||
+                      openaiConfig.modelName ||
+                      "默认"
+                    }}
+                  </el-button>
+                  <el-select
+                    v-model="workbenchThinkingLevel"
+                    size="small"
+                    style="width: 130px"
+                    placeholder="思考等级"
+                    @change="handleThinkingLevelChange"
+                  >
+                    <el-option
+                      v-for="lvl in workbenchSession?.availableThinkingLevels || [
+                        'off',
+                        'minimal',
+                        'low',
+                        'medium',
+                        'high',
+                      ]"
+                      :key="lvl"
+                      :label="`思考: ${lvl}`"
+                      :value="lvl"
+                    />
+                  </el-select>
+                  <el-button
+                    v-if="workbenchSession"
+                    size="small"
+                    plain
+                    @click="workbenchSkillsDialogVisible = true"
+                  >
+                    /skill ({{ workbenchSession.skills.length }})
+                  </el-button>
+                </div>
+              </div>
+
+              <div class="workbench-input-bar">
+                <el-input
+                  v-model="workbenchInput"
+                  type="textarea"
+                  :rows="3"
+                  placeholder="向 pi-agent 提问或下达操作版本库/MCP 的指令（Ctrl+Enter / Cmd+Enter 发送）..."
+                  @keydown.ctrl.enter.prevent="handleSendWorkbenchMessage"
+                  @keydown.meta.enter.prevent="handleSendWorkbenchMessage"
+                />
+                <div class="workbench-send-col">
+                  <el-button
+                    type="primary"
+                    :loading="workbenchSending || workbenchSession?.status === 'running'"
+                    @click="handleSendWorkbenchMessage"
+                  >
+                    发送
+                  </el-button>
+                  <el-button
+                    v-if="workbenchSession?.status === 'running'"
+                    type="danger"
+                    plain
+                    @click="handleAbortWorkbench"
+                  >
+                    中断
+                  </el-button>
+                </div>
+              </div>
+            </el-card>
+          </el-col>
+        </el-row>
+      </template>
     </div>
 
     <!-- 第三步：左侧栏表单（应用下拉 + 10 个版本库下拉），右侧栏测试流水线与日志 -->
@@ -395,6 +932,187 @@
         </el-button>
       </div>
     </div>
+
+    <el-dialog
+      v-model="mcpDialogVisible"
+      title="添加 Streamable HTTP MCP"
+      width="480px"
+      destroy-on-close
+    >
+      <el-form label-position="top">
+        <el-form-item label="归属创建人">
+          <el-input :model-value="form.creator || 'Admin'" disabled />
+        </el-form-item>
+        <el-form-item label="MCP 名称" required>
+          <el-input
+            v-model="mcpForm.name"
+            placeholder="例如：jira-mcp、gitlab-tools"
+          />
+        </el-form-item>
+        <el-form-item label="Streamable HTTP URL" required>
+          <el-input
+            v-model="mcpForm.url"
+            placeholder="例如：https://mcp.example.com/mcp"
+          />
+        </el-form-item>
+        <el-form-item label="请求头 Headers（JSON 对象，可选）">
+          <el-input
+            v-model="mcpForm.headersText"
+            type="textarea"
+            :rows="3"
+            placeholder='例如：{"Authorization": "Bearer your-token"}'
+          />
+        </el-form-item>
+        <el-form-item label="描述（可选）">
+          <el-input
+            v-model="mcpForm.description"
+            placeholder="简述该 MCP 提供的能力"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="mcpDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="savingMcp"
+          @click="handleCreateMcp"
+        >
+          保存并添加到列表
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="openaiDialogVisible"
+      title="OpenAI API Key 与模型设置"
+      width="480px"
+    >
+      <el-form label-position="top">
+        <el-form-item label="OpenAI API Key">
+          <el-input
+            v-model="openaiDraft.apiKey"
+            type="password"
+            show-password
+            placeholder="sk-...（留空则使用后端默认 .env 配置）"
+          />
+        </el-form-item>
+        <el-form-item label="模型名称（Model）">
+          <el-input
+            v-model="openaiDraft.modelName"
+            placeholder="例如：gpt-4o、gpt-4.1、o3-mini、deepseek-chat"
+          />
+          <div class="model-quick-picks">
+            <span class="quick-label">常用：</span>
+            <el-tag
+              v-for="m in ['gpt-4o', 'gpt-4.1', 'o3-mini', 'deepseek-chat']"
+              :key="m"
+              size="small"
+              class="quick-tag"
+              @click="openaiDraft.modelName = m"
+            >
+              {{ m }}
+            </el-tag>
+          </div>
+        </el-form-item>
+        <el-form-item label="Base URL（可选，兼容 OpenAI 接口地址）">
+          <el-input
+            v-model="openaiDraft.baseUrl"
+            placeholder="例如：https://api.openai.com/v1（留空使用默认）"
+          />
+        </el-form-item>
+        <el-form-item label="API 模式">
+          <el-radio-group v-model="openaiDraft.apiMode" size="small">
+            <el-radio-button value="chat">Chat Completions</el-radio-button>
+            <el-radio-button value="responses">Responses API</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="resetOpenaiConfig">恢复默认</el-button>
+        <el-button @click="openaiDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveOpenaiConfig">保存配置</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 工作台 Skills 列表弹窗 -->
+    <el-dialog
+      v-model="workbenchSkillsDialogVisible"
+      title="当前会话可用 Skills"
+      width="560px"
+    >
+      <el-input
+        v-model="skillSearchQuery"
+        placeholder="搜索 Skill 名称或描述..."
+        clearable
+        style="margin-bottom: 12px"
+      />
+      <div class="wb-dialog-list">
+        <div
+          v-for="sk in filteredWorkbenchSkills"
+          :key="sk.name"
+          class="wb-dialog-item"
+        >
+          <div class="wb-dialog-item-head">
+            <strong>{{ sk.name }}</strong>
+            <div style="display: flex; align-items: center; gap: 6px">
+              <el-tag size="small" type="info">{{ sk.source }}</el-tag>
+              <el-button
+                size="small"
+                type="primary"
+                plain
+                @click="insertSkillToken(sk.name)"
+              >
+                插入 /skill:{{ sk.name }}
+              </el-button>
+            </div>
+          </div>
+          <div class="wb-dialog-item-desc">{{ sk.description || "暂无描述" }}</div>
+        </div>
+        <el-empty v-if="filteredWorkbenchSkills.length === 0" description="没有匹配的 Skill" />
+      </div>
+    </el-dialog>
+
+    <!-- 工作台 MCP 状态与工具弹窗 -->
+    <el-dialog
+      v-model="workbenchMcpDialogVisible"
+      title="已挂载 MCP 服务与工具"
+      width="560px"
+    >
+      <div class="wb-dialog-list">
+        <div
+          v-for="srv in workbenchSession?.mcpServers || []"
+          :key="srv.id"
+          class="wb-dialog-item"
+        >
+          <div class="wb-dialog-item-head">
+            <strong>{{ srv.name }}</strong>
+            <el-tag
+              size="small"
+              :type="
+                srv.status === 'connected'
+                  ? 'success'
+                  : srv.status === 'connecting'
+                    ? 'warning'
+                    : 'danger'
+              "
+            >
+              {{ srv.status }}
+            </el-tag>
+          </div>
+          <div class="wb-dialog-item-desc">{{ srv.url }}</div>
+          <div v-if="srv.tools.length > 0" class="wb-mcp-tools">
+            <el-tag v-for="t in srv.tools" :key="t" size="small" effect="plain">
+              {{ t }}
+            </el-tag>
+          </div>
+          <div v-else class="wb-dialog-item-desc">暂无已加载工具</div>
+        </div>
+        <el-empty
+          v-if="!workbenchSession || workbenchSession.mcpServers.length === 0"
+          description="当前会话未挂载任何 Streamable HTTP MCP"
+        />
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -405,21 +1123,34 @@ import { Marked } from "marked";
 import hljs from "highlight.js";
 import {
   abortGenerationJob,
+  abortWorkbenchSession,
+  closeWorkbenchSession,
+  createUserMcp,
+  createWorkbenchSession,
+  deleteUserMcp,
   fetchCatalog,
   fetchGenerationJob,
   fetchSkillDetail,
+  fetchUserMcps,
+  fetchWorkbenchSession,
+  fetchWorkbenchSessions,
   getSkillDownloadUrl,
   publishSkill,
   restartGenerationJob,
   runTestPipeline,
+  sendWorkbenchMessage,
+  setWorkbenchThinking,
   startGenerationJob,
   updateSkill,
   type AppCatalogItem,
   type GenerationJobSnapshot,
   type GenerationJobStatus,
+  type OpenAIOverrideConfig,
   type RepoCatalogItem,
   type RepoPipelineRun,
   type SkillFileEntry,
+  type UserMcpServer,
+  type WorkbenchSessionSnapshot,
 } from "../api";
 
 interface TreeNode {
@@ -450,6 +1181,7 @@ const marked = new Marked({
 
 const activeStep = ref<0 | 2>(0);
 const maxReachedStep = ref<0 | 2>(0);
+const stepOneMode = ref<"skill" | "creative">("skill");
 const isNewSkill = ref(!props.initialSkillName);
 const editorMode = ref<"preview" | "edit">("preview");
 
@@ -457,9 +1189,36 @@ const generating = ref(false);
 const submitting = ref(false);
 const testing = ref(false);
 const publishing = ref(false);
+const enableTimeout = ref(false);
 const timeoutSeconds = ref(120);
 const currentJob = ref<GenerationJobSnapshot | null>(null);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let jenkinsLogTimer: ReturnType<typeof setInterval> | null = null;
+let workbenchTimer: ReturnType<typeof setInterval> | null = null;
+
+const workbenchRepoId = ref<string>("");
+const workbenchCustomCwd = ref<string>("");
+const workbenchSessions = ref<WorkbenchSessionSnapshot[]>([]);
+const workbenchSession = ref<WorkbenchSessionSnapshot | null>(null);
+const isCreatingWorkbenchSession = ref<boolean>(true);
+const workbenchInput = ref<string>("");
+const workbenchInitializing = ref(false);
+const workbenchSending = ref(false);
+const workbenchThinkingLevel = ref<string>("medium");
+const workbenchSkillsDialogVisible = ref(false);
+const workbenchMcpDialogVisible = ref(false);
+const skillSearchQuery = ref<string>("");
+
+const filteredWorkbenchSkills = computed(() => {
+  const list = workbenchSession.value?.skills ?? [];
+  const q = skillSearchQuery.value.trim().toLowerCase();
+  if (!q) return list;
+  return list.filter(
+    (s) =>
+      s.name.toLowerCase().includes(q) ||
+      s.description.toLowerCase().includes(q)
+  );
+});
 
 const form = reactive({
   skillName: props.initialSkillName ?? "",
@@ -475,6 +1234,38 @@ const catalogApps = ref<AppCatalogItem[]>([]);
 const catalogRepos = ref<RepoCatalogItem[]>([]);
 const selectedApps = ref<string[]>([]);
 const selectedRepos = ref<string[]>([]);
+const userMcps = ref<UserMcpServer[]>([]);
+const selectedMcps = ref<string[]>([]);
+const loadingMcps = ref(false);
+const mcpDialogVisible = ref(false);
+const savingMcp = ref(false);
+const mcpForm = reactive({
+  name: "",
+  url: "",
+  headersText: "",
+  description: "",
+});
+const OPENAI_STORAGE_KEY = "ai_pipeline_openai_config";
+const openaiDialogVisible = ref(false);
+const openaiConfig = reactive<OpenAIOverrideConfig>({
+  apiKey: "",
+  modelName: "",
+  baseUrl: "",
+  apiMode: "chat",
+});
+const openaiDraft = reactive<OpenAIOverrideConfig>({
+  apiKey: "",
+  modelName: "",
+  baseUrl: "",
+  apiMode: "chat",
+});
+const hasCustomOpenAI = computed(() =>
+  Boolean(
+    openaiConfig.apiKey?.trim() ||
+      openaiConfig.modelName?.trim() ||
+      openaiConfig.baseUrl?.trim()
+  )
+);
 const pipelineMode = ref<"simulate" | "real" | "jenkins">("simulate");
 const pipelineRuns = ref<RepoPipelineRun[]>([]);
 const activeLogRepoId = ref<string>("");
@@ -604,7 +1395,377 @@ function handleDownloadSkill() {
   document.body.removeChild(link);
 }
 
+async function loadUserMcps() {
+  const owner = form.creator.trim() || "Admin";
+  loadingMcps.value = true;
+  try {
+    const res = await fetchUserMcps(owner);
+    userMcps.value = Array.isArray(res.mcps) ? res.mcps : [];
+    const validIds = new Set(userMcps.value.map((m) => m.id));
+    selectedMcps.value = selectedMcps.value.filter((id) => validIds.has(id));
+  } catch {
+    // 找不到 MCP 或未配置时不报错，安静置空且不默认选中
+    userMcps.value = [];
+    selectedMcps.value = [];
+  } finally {
+    loadingMcps.value = false;
+  }
+}
+
+function renderMarkdownText(raw: string): string {
+  return marked.parse(raw || "") as string;
+}
+
+function formatCompactTokens(count: number): string {
+  if (count < 1_000) return String(count);
+  if (count < 9_950) return `${(count / 1_000).toFixed(1)}k`;
+  if (count < 999_500) return `${Math.round(count / 1_000)}k`;
+  return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
+function contextBarText(usage: {
+  tokens: number | null;
+  contextWindow: number;
+  percent: number | null;
+}): { bar: string; text: string } {
+  const filled =
+    usage.percent === null
+      ? 0
+      : Math.round(Math.min(100, Math.max(0, usage.percent)) / 20);
+  const cw = formatCompactTokens(usage.contextWindow);
+  return {
+    bar: `${"▰".repeat(filled)}${"▱".repeat(5 - filled)}`,
+    text:
+      usage.percent === null
+        ? `?/${cw}`
+        : `${usage.percent.toFixed(1)}%/${cw}`,
+  };
+}
+
+async function handleThinkingLevelChange(level: string) {
+  if (!workbenchSession.value) return;
+  try {
+    const { session } = await setWorkbenchThinking(
+      workbenchSession.value.sessionId,
+      level
+    );
+    workbenchSession.value = session;
+    ElMessage.success(`思考等级已切换为 ${level}`);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "切换思考等级失败");
+  }
+}
+
+function insertSkillToken(name: string) {
+  const token = `/skill:${name} `;
+  workbenchInput.value = workbenchInput.value
+    ? `${workbenchInput.value.trimEnd()} ${token}`
+    : token;
+  workbenchSkillsDialogVisible.value = false;
+}
+
+function stopWorkbenchPolling() {
+  if (workbenchTimer !== null) {
+    clearInterval(workbenchTimer);
+    workbenchTimer = null;
+  }
+}
+
+function folderBasename(dirPath: string): string {
+  const parts = dirPath.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts[parts.length - 1] || dirPath || "workspace";
+}
+
+function upsertWorkbenchSessionInList(session: WorkbenchSessionSnapshot) {
+  const idx = workbenchSessions.value.findIndex(
+    (s) => s.sessionId === session.sessionId
+  );
+  if (idx >= 0) {
+    workbenchSessions.value[idx] = session;
+  } else {
+    workbenchSessions.value.unshift(session);
+  }
+}
+
+async function loadWorkbenchSessions() {
+  const owner = form.creator.trim() || "Admin";
+  try {
+    const res = await fetchWorkbenchSessions(owner);
+    workbenchSessions.value = Array.isArray(res.sessions) ? res.sessions : [];
+    if (workbenchSessions.value.length > 0) {
+      isCreatingWorkbenchSession.value = false;
+      const currentExists =
+        workbenchSession.value &&
+        workbenchSessions.value.some(
+          (s) => s.sessionId === workbenchSession.value!.sessionId
+        );
+      if (!currentExists) {
+        workbenchSession.value = workbenchSessions.value[0];
+        workbenchThinkingLevel.value =
+          workbenchSession.value.thinkingLevel || "medium";
+      }
+    } else {
+      workbenchSession.value = null;
+      isCreatingWorkbenchSession.value = true;
+    }
+  } catch {
+    workbenchSessions.value = [];
+  }
+}
+
+async function handleCreatorChange() {
+  await Promise.all([loadUserMcps(), loadWorkbenchSessions()]);
+}
+
+function selectWorkbenchSession(sess: WorkbenchSessionSnapshot) {
+  workbenchSession.value = sess;
+  workbenchThinkingLevel.value = sess.thinkingLevel || "medium";
+  if (sess.status === "running") {
+    beginWorkbenchPolling(sess.sessionId);
+  } else {
+    stopWorkbenchPolling();
+  }
+}
+
+function handleOpenNewWorkbenchForm() {
+  workbenchRepoId.value = "";
+  workbenchCustomCwd.value = "";
+  isCreatingWorkbenchSession.value = true;
+}
+
+async function handleCloseWorkbenchSession(sessionId: string) {
+  try {
+    await closeWorkbenchSession(sessionId);
+    workbenchSessions.value = workbenchSessions.value.filter(
+      (s) => s.sessionId !== sessionId
+    );
+    if (workbenchSession.value?.sessionId === sessionId) {
+      stopWorkbenchPolling();
+      workbenchSession.value = workbenchSessions.value[0] ?? null;
+    }
+    if (workbenchSessions.value.length === 0) {
+      isCreatingWorkbenchSession.value = true;
+    }
+    ElMessage.success("已关闭工作台会话");
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "关闭会话失败");
+  }
+}
+
+function beginWorkbenchPolling(sessionId: string) {
+  stopWorkbenchPolling();
+  workbenchTimer = setInterval(async () => {
+    try {
+      const { session } = await fetchWorkbenchSession(sessionId);
+      workbenchSession.value = session;
+      upsertWorkbenchSessionInList(session);
+      if (session.status !== "running") {
+        stopWorkbenchPolling();
+      }
+    } catch {
+      stopWorkbenchPolling();
+    }
+  }, 800);
+}
+
+function getCustomOpenaiPayload(): OpenAIOverrideConfig | undefined {
+  if (!hasCustomOpenAI.value) return undefined;
+  return {
+    ...(openaiConfig.apiKey?.trim() ? { apiKey: openaiConfig.apiKey.trim() } : {}),
+    ...(openaiConfig.modelName?.trim()
+      ? { modelName: openaiConfig.modelName.trim() }
+      : {}),
+    ...(openaiConfig.baseUrl?.trim() ? { baseUrl: openaiConfig.baseUrl.trim() } : {}),
+    ...(openaiConfig.apiMode ? { apiMode: openaiConfig.apiMode } : {}),
+  };
+}
+
+async function handleStartWorkbench(): Promise<WorkbenchSessionSnapshot | null> {
+  workbenchInitializing.value = true;
+  stopWorkbenchPolling();
+  try {
+    const { session } = await createWorkbenchSession({
+      owner: form.creator.trim() || "Admin",
+      repoId: workbenchRepoId.value || undefined,
+      customCwd: workbenchCustomCwd.value.trim() || undefined,
+      selectedMcps: selectedMcps.value,
+      openaiConfig: getCustomOpenaiPayload(),
+      thinkingLevel: workbenchThinkingLevel.value,
+    });
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+    isCreatingWorkbenchSession.value = false;
+    workbenchThinkingLevel.value = session.thinkingLevel || "medium";
+    ElMessage.success("pi-agent 工作台会话已启动");
+    return session;
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "启动工作台失败");
+    return null;
+  } finally {
+    workbenchInitializing.value = false;
+  }
+}
+
+async function handleSendWorkbenchMessage() {
+  const msg = workbenchInput.value.trim();
+  if (!msg) return;
+
+  workbenchSending.value = true;
+  try {
+    if (!workbenchSession.value) {
+      const created = await handleStartWorkbench();
+      if (!created) return;
+    }
+    if (!workbenchSession.value) return;
+    const { session } = await sendWorkbenchMessage(
+      workbenchSession.value.sessionId,
+      msg
+    );
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+    workbenchInput.value = "";
+    beginWorkbenchPolling(session.sessionId);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "发送消息失败");
+  } finally {
+    workbenchSending.value = false;
+  }
+}
+
+async function handleAbortWorkbench() {
+  if (!workbenchSession.value) return;
+  try {
+    const { session } = await abortWorkbenchSession(
+      workbenchSession.value.sessionId
+    );
+    workbenchSession.value = session;
+    stopWorkbenchPolling();
+    ElMessage.warning("已中断当前对话轮次");
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "中断失败");
+  }
+}
+
+function handleDistillToSkill() {
+  if (!workbenchSession.value) return;
+  const transcript = workbenchSession.value.messages
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
+    .join("\n\n");
+  form.prompt = `基于以下在 pi-agent 工作台中的探索与对话，整理并生成完整的 Skill：\n\n${transcript.slice(0, 6000)}`;
+  stepOneMode.value = "skill";
+  ElMessage.success("已将对话思路带入 Skill 生成提示词，可直接生成 Skill");
+}
+
+function openAddMcpDialog() {
+  mcpForm.name = "";
+  mcpForm.url = "";
+  mcpForm.headersText = "";
+  mcpForm.description = "";
+  mcpDialogVisible.value = true;
+}
+
+async function handleCreateMcp() {
+  const owner = form.creator.trim() || "Admin";
+  if (!mcpForm.name.trim() || !mcpForm.url.trim()) {
+    ElMessage.warning("请填写 MCP 名称和 Streamable HTTP URL");
+    return;
+  }
+  let headers: Record<string, string> | undefined;
+  if (mcpForm.headersText.trim()) {
+    try {
+      const parsed = JSON.parse(mcpForm.headersText);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        ElMessage.warning("请求头 Headers 必须是 JSON 对象");
+        return;
+      }
+      headers = parsed as Record<string, string>;
+    } catch {
+      ElMessage.warning("请求头 Headers JSON 格式不正确");
+      return;
+    }
+  }
+  savingMcp.value = true;
+  try {
+    const { mcp } = await createUserMcp({
+      owner,
+      name: mcpForm.name.trim(),
+      url: mcpForm.url.trim(),
+      headers,
+      description: mcpForm.description.trim(),
+    });
+    await loadUserMcps();
+    if (!selectedMcps.value.includes(mcp.id)) {
+      selectedMcps.value.push(mcp.id);
+    }
+    mcpDialogVisible.value = false;
+    ElMessage.success(`MCP "${mcp.name}" 已保存并勾选`);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "保存 MCP 失败");
+  } finally {
+    savingMcp.value = false;
+  }
+}
+
+async function handleDeleteMcp(mcp: UserMcpServer) {
+  const owner = form.creator.trim() || "Admin";
+  try {
+    await deleteUserMcp(mcp.id, owner);
+    selectedMcps.value = selectedMcps.value.filter((id) => id !== mcp.id);
+    await loadUserMcps();
+    ElMessage.success(`已删除 MCP "${mcp.name}"`);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "删除 MCP 失败");
+  }
+}
+
+function loadSavedOpenaiConfig() {
+  try {
+    const raw = localStorage.getItem(OPENAI_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as OpenAIOverrideConfig;
+    openaiConfig.apiKey = parsed.apiKey || "";
+    openaiConfig.modelName = parsed.modelName || "";
+    openaiConfig.baseUrl = parsed.baseUrl || "";
+    openaiConfig.apiMode = parsed.apiMode === "responses" ? "responses" : "chat";
+  } catch {
+    // Ignore invalid stored config
+  }
+}
+
+function openOpenaiDialog() {
+  openaiDraft.apiKey = openaiConfig.apiKey || "";
+  openaiDraft.modelName = openaiConfig.modelName || "";
+  openaiDraft.baseUrl = openaiConfig.baseUrl || "";
+  openaiDraft.apiMode = openaiConfig.apiMode || "chat";
+  openaiDialogVisible.value = true;
+}
+
+function saveOpenaiConfig() {
+  openaiConfig.apiKey = openaiDraft.apiKey?.trim() || "";
+  openaiConfig.modelName = openaiDraft.modelName?.trim() || "";
+  openaiConfig.baseUrl = openaiDraft.baseUrl?.trim() || "";
+  openaiConfig.apiMode = openaiDraft.apiMode === "responses" ? "responses" : "chat";
+  localStorage.setItem(OPENAI_STORAGE_KEY, JSON.stringify(openaiConfig));
+  openaiDialogVisible.value = false;
+  ElMessage.success("OpenAI API Key 与模型配置已保存");
+}
+
+function resetOpenaiConfig() {
+  openaiDraft.apiKey = "";
+  openaiDraft.modelName = "";
+  openaiDraft.baseUrl = "";
+  openaiDraft.apiMode = "chat";
+  openaiConfig.apiKey = "";
+  openaiConfig.modelName = "";
+  openaiConfig.baseUrl = "";
+  openaiConfig.apiMode = "chat";
+  localStorage.removeItem(OPENAI_STORAGE_KEY);
+  openaiDialogVisible.value = false;
+  ElMessage.info("已恢复使用后端默认 OpenAI 配置");
+}
+
 onMounted(async () => {
+  loadSavedOpenaiConfig();
   try {
     const catalog = await fetchCatalog();
     catalogApps.value = catalog.apps;
@@ -626,6 +1787,7 @@ onMounted(async () => {
       activeFilePath.value = skillFiles.value[0]?.path || "SKILL.md";
       selectedApps.value = detail.card.selectedApps;
       selectedRepos.value = detail.card.selectedRepos;
+      selectedMcps.value = detail.card.selectedMcps ?? [];
       pipelineRuns.value = detail.card.pipelineRuns;
       if (detail.card.pipelineRuns.length > 0) {
         activeLogRepoId.value = detail.card.pipelineRuns[0].repoId;
@@ -633,12 +1795,17 @@ onMounted(async () => {
       if (detail.card.currentStep >= 2) {
         maxReachedStep.value = 2;
       }
+      if (detail.card.status === "testing") {
+        startJenkinsLogSync();
+      }
       // 点击卡片默认进入第一步
       activeStep.value = 0;
     } catch (err) {
       ElMessage.error(err instanceof Error ? err.message : "加载 Skill 详情失败");
     }
   }
+
+  await Promise.all([loadUserMcps(), loadWorkbenchSessions()]);
 });
 
 function stopPolling() {
@@ -650,6 +1817,8 @@ function stopPolling() {
 
 onUnmounted(() => {
   stopPolling();
+  stopJenkinsLogSync();
+  stopWorkbenchPolling();
 });
 
 function jobStatusLabel(status: GenerationJobStatus): string {
@@ -737,12 +1906,23 @@ async function handleGenerate() {
   }
   generating.value = true;
   try {
+    const customOpenai = hasCustomOpenAI.value
+      ? {
+          ...(openaiConfig.apiKey?.trim() ? { apiKey: openaiConfig.apiKey.trim() } : {}),
+          ...(openaiConfig.modelName?.trim() ? { modelName: openaiConfig.modelName.trim() } : {}),
+          ...(openaiConfig.baseUrl?.trim() ? { baseUrl: openaiConfig.baseUrl.trim() } : {}),
+          ...(openaiConfig.apiMode ? { apiMode: openaiConfig.apiMode } : {}),
+        }
+      : undefined;
+
     const { job } = await startGenerationJob({
       skillName: form.skillName || undefined,
       description: form.description || undefined,
       creator: form.creator || "Admin",
+      selectedMcps: selectedMcps.value,
+      openaiConfig: customOpenai,
       prompt: form.prompt,
-      timeoutMs: timeoutSeconds.value * 1000,
+      timeoutMs: enableTimeout.value ? timeoutSeconds.value * 1000 : 0,
     });
     currentJob.value = job;
     beginJobPolling(job.jobId);
@@ -773,7 +1953,7 @@ async function handleRestartGeneration() {
   try {
     const { job } = await restartGenerationJob(currentJob.value.jobId, {
       prompt: form.prompt,
-      timeoutMs: timeoutSeconds.value * 1000,
+      timeoutMs: enableTimeout.value ? timeoutSeconds.value * 1000 : 0,
     });
     currentJob.value = job;
     beginJobPolling(job.jobId);
@@ -795,6 +1975,7 @@ async function handleSubmitStepOne() {
       creator: form.creator,
       files: skillFiles.value,
       replaceFiles: true,
+      selectedMcps: selectedMcps.value,
       submit: true,
     });
     skillFiles.value = res.files;
@@ -813,6 +1994,34 @@ function selectTenRepos() {
   selectedRepos.value = catalogRepos.value.slice(0, 10).map((r) => r.id);
 }
 
+function stopJenkinsLogSync() {
+  if (jenkinsLogTimer !== null) {
+    clearInterval(jenkinsLogTimer);
+    jenkinsLogTimer = null;
+  }
+}
+
+function startJenkinsLogSync() {
+  stopJenkinsLogSync();
+  if (!form.skillName.trim()) return;
+  jenkinsLogTimer = setInterval(async () => {
+    try {
+      const detail = await fetchSkillDetail(form.skillName);
+      if (detail.card.pipelineRuns && detail.card.pipelineRuns.length > 0) {
+        pipelineRuns.value = detail.card.pipelineRuns;
+        if (!activeLogRepoId.value) {
+          activeLogRepoId.value = detail.card.pipelineRuns[0].repoId;
+        }
+      }
+      if (!testing.value && detail.card.status !== "testing") {
+        stopJenkinsLogSync();
+      }
+    } catch {
+      // Ignore transient polling errors
+    }
+  }, 3000);
+}
+
 async function handleRunPipeline() {
   if (selectedApps.value.length === 0) {
     ElMessage.warning("请至少选择 1 个相关应用");
@@ -824,6 +2033,7 @@ async function handleRunPipeline() {
   }
 
   testing.value = true;
+  startJenkinsLogSync();
   try {
     const res = await runTestPipeline(form.skillName, {
       apps: selectedApps.value,
@@ -843,6 +2053,7 @@ async function handleRunPipeline() {
     ElMessage.error(err instanceof Error ? err.message : "流水线执行失败");
   } finally {
     testing.value = false;
+    stopJenkinsLogSync();
   }
 }
 
@@ -1194,5 +2405,394 @@ async function handlePublish() {
   max-height: 260px;
   overflow-y: auto;
   white-space: pre-wrap;
+}
+
+.mcp-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+}
+
+.mcp-option-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.mcp-option-name {
+  font-weight: 500;
+  color: #1f2937;
+}
+
+.mcp-option-url {
+  flex: 1;
+  font-size: 12px;
+  color: #6b7280;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-empty-tip {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: #6b7280;
+  text-align: center;
+}
+
+.panel-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.model-quick-picks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.quick-label {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.quick-tag {
+  cursor: pointer;
+}
+
+.timeout-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+}
+
+.timeout-disabled-tip {
+  width: 100%;
+  padding: 6px 12px;
+  border-radius: 4px;
+  background: #f3f4f6;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.mode-switch-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.mode-hint {
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.workbench-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.workbench-session-meta {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #4b5563;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.workbench-chat-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.workbench-chat-history {
+  min-height: 360px;
+  max-height: 520px;
+  overflow-y: auto;
+  padding: 12px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.workbench-welcome {
+  color: #4b5563;
+  font-size: 13px;
+  padding: 12px;
+  background: #eff6ff;
+  border-radius: 6px;
+}
+
+.chat-bubble {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+}
+
+.chat-bubble.user {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.chat-bubble.streaming {
+  border-style: dashed;
+  border-color: #60a5fa;
+}
+
+.chat-role {
+  font-size: 12px;
+  font-weight: 600;
+  color: #374151;
+  margin-bottom: 6px;
+}
+
+.chat-plain {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.chat-markdown {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.chat-tool-logs {
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background: #1e1e1e;
+  color: #9cdcfe;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.chat-tool-item {
+  line-height: 1.5;
+}
+
+.workbench-input-bar {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.workbench-send-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.workbench-header-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workbench-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workbench-stats-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.stats-pill {
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.stats-pill:hover {
+  background: #e5e7eb;
+}
+
+.stats-context {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.context-bar {
+  color: #409eff;
+  letter-spacing: 1px;
+}
+
+.workbench-composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  gap: 8px;
+}
+
+.composer-left-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chat-thinking-box {
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background: #f3f4f6;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #4b5563;
+}
+
+.chat-thinking-box summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.chat-thinking-body {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.wb-dialog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.wb-dialog-item {
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+}
+
+.wb-dialog-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.wb-dialog-item-desc {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.wb-mcp-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.wb-session-list-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.wb-session-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.wb-session-card {
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.wb-session-card:hover {
+  border-color: #93c5fd;
+  background: #f8fafc;
+}
+
+.wb-session-card.active {
+  border-color: #409eff;
+  background: #eff6ff;
+}
+
+.wb-session-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.wb-session-folder-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: #1f2937;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-session-card-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.wb-session-card-path {
+  font-size: 12px;
+  color: #6b7280;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 4px;
+}
+
+.wb-session-card-meta {
+  font-size: 11px;
+  color: #9ca3af;
 }
 </style>

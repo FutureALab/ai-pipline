@@ -150,7 +150,7 @@ export function ensureTelemetryInitialized(): void {
 }
 
 export function buildSessionTelemetryConfig(context: {
-  operation: "skill_generate" | "skill_run";
+  operation: "skill_generate" | "skill_run" | "workbench_chat";
   skillName?: string;
   jobId?: string;
   extraAttributes?: Attributes;

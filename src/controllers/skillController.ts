@@ -1,4 +1,5 @@
 import type http from "node:http";
+import { getMcpServersByIdsForOwner } from "../repositories/mcpRepository.js";
 import {
   buildSkillZipBuffer,
   deleteSkillFile,
@@ -59,6 +60,9 @@ export async function updateSkillHandler(
   const description =
     typeof body.description === "string" ? body.description : undefined;
   const creator = typeof body.creator === "string" ? body.creator : undefined;
+  const selectedMcps = Array.isArray(body.selectedMcps)
+    ? body.selectedMcps.filter((item): item is string => typeof item === "string")
+    : undefined;
   const submit = body.submit === true;
 
   if (filesPayload) {
@@ -90,6 +94,7 @@ export async function updateSkillHandler(
   const card = await upsertSkillCard(name, {
     ...(description !== undefined ? { description } : {}),
     ...(creator !== undefined ? { creator } : {}),
+    ...(selectedMcps !== undefined ? { selectedMcps } : {}),
     ...(submit ? { currentStep: 3, progress: 66, status: "submitted" } : {}),
   });
 
@@ -131,10 +136,35 @@ export async function generateSkillSyncHandler(
     typeof body.creator === "string" && body.creator.trim()
       ? body.creator.trim()
       : "Admin";
+  const selectedMcps = Array.isArray(body.selectedMcps)
+    ? body.selectedMcps.filter((item): item is string => typeof item === "string")
+    : [];
+  const rawOpenai =
+    body.openaiConfig && typeof body.openaiConfig === "object"
+      ? (body.openaiConfig as Record<string, unknown>)
+      : undefined;
+  const openaiConfig = rawOpenai
+    ? {
+      ...(typeof rawOpenai.apiKey === "string" && rawOpenai.apiKey.trim()
+        ? { apiKey: rawOpenai.apiKey.trim() }
+        : {}),
+      ...(typeof rawOpenai.modelName === "string" && rawOpenai.modelName.trim()
+        ? { modelName: rawOpenai.modelName.trim() }
+        : {}),
+      ...(typeof rawOpenai.baseUrl === "string" && rawOpenai.baseUrl.trim()
+        ? { baseUrl: rawOpenai.baseUrl.trim() }
+        : {}),
+      ...(rawOpenai.apiMode === "chat" || rawOpenai.apiMode === "responses"
+        ? { apiMode: rawOpenai.apiMode as "chat" | "responses" }
+        : {}),
+    }
+    : undefined;
 
   if (!prompt.trim()) {
     return sendJson(res, 400, { error: "`prompt` is required" });
   }
+
+  const mcpServers = await getMcpServersByIdsForOwner(selectedMcps, creator);
 
   const result = await generateSkillFromPrompt({
     userPrompt: description
@@ -142,6 +172,8 @@ export async function generateSkillSyncHandler(
       : prompt,
     skillName,
     scope: "global",
+    mcpServers,
+    openaiConfig,
   });
 
   await replaceSkillFiles(result.saved.skillName, result.files);
@@ -149,6 +181,7 @@ export async function generateSkillSyncHandler(
   const card = await upsertSkillCard(result.saved.skillName, {
     description: description || prompt.slice(0, 120),
     creator,
+    selectedMcps,
     currentStep: 1,
     progress: 33,
     status: "draft",

@@ -6,14 +6,22 @@ import { promisify } from "node:util";
 import { Pool } from "pg";
 import {
   buildResourceSummary,
+  enrichSkillFileEntry,
   extractDescriptionFromMarkdown,
   listSkillsInDefaultDir,
   parseSkillFrontmatter,
   readSkillDirectoryFiles,
+  resolveAllGlobalSkillRoots,
   resolveDefaultSkillsRoot,
-  saveSkillFilesToDefaultDir,
+  saveSkillFilesToDir,
 } from "../repositories/skillStorage.js";
-import type { CatalogAppRow, CatalogRepoRow } from "../types/skill.js";
+import type {
+  CatalogAppRow,
+  CatalogRepoRow,
+  SkillFileCategory,
+  SkillFileEncoding,
+  SkillFileEntry,
+} from "../types/skill.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -133,16 +141,35 @@ CREATE TABLE IF NOT EXISTS skills (
   status TEXT NOT NULL DEFAULT 'draft',
   selected_apps JSONB NOT NULL DEFAULT '[]'::jsonb,
   selected_repos JSONB NOT NULL DEFAULT '[]'::jsonb,
+  selected_mcps JSONB NOT NULL DEFAULT '[]'::jsonb,
   pipeline_runs JSONB NOT NULL DEFAULT '[]'::jsonb,
   frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
   has_scripts BOOLEAN NOT NULL DEFAULT FALSE,
-  resource_summary JSONB NOT NULL DEFAULT '{}'::jsonb
+  resource_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+  skill_md TEXT NOT NULL DEFAULT ''
 );
 
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS is_builtin BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS selected_mcps JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS has_scripts BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS resource_summary JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS skill_md TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  name TEXT NOT NULL,
+  transport TEXT NOT NULL DEFAULT 'streamable-http',
+  url TEXT NOT NULL,
+  headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (owner, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_owner ON mcp_servers (owner);
 
 CREATE TABLE IF NOT EXISTS skill_files (
   skill_name TEXT NOT NULL REFERENCES skills(skill_name) ON DELETE CASCADE,
@@ -228,11 +255,28 @@ CREATE TABLE IF NOT EXISTS skills (
   status TEXT NOT NULL DEFAULT 'draft',
   selected_apps TEXT NOT NULL DEFAULT '[]',
   selected_repos TEXT NOT NULL DEFAULT '[]',
+  selected_mcps TEXT NOT NULL DEFAULT '[]',
   pipeline_runs TEXT NOT NULL DEFAULT '[]',
   frontmatter TEXT NOT NULL DEFAULT '{}',
   has_scripts INTEGER NOT NULL DEFAULT 0,
-  resource_summary TEXT NOT NULL DEFAULT '{}'
+  resource_summary TEXT NOT NULL DEFAULT '{}',
+  skill_md TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  name TEXT NOT NULL,
+  transport TEXT NOT NULL DEFAULT 'streamable-http',
+  url TEXT NOT NULL,
+  headers TEXT NOT NULL DEFAULT '{}',
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (owner, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_owner ON mcp_servers (owner);
 
 CREATE TABLE IF NOT EXISTS skill_files (
   skill_name TEXT NOT NULL REFERENCES skills(skill_name) ON DELETE CASCADE,
@@ -372,9 +416,11 @@ function ensureSqliteColumns(
 
 function applySqliteMigrations(db: BunSqliteDatabase): void {
   ensureSqliteColumns(db, "skills", [
+    { name: "selected_mcps", definition: "TEXT NOT NULL DEFAULT '[]'" },
     { name: "frontmatter", definition: "TEXT NOT NULL DEFAULT '{}'" },
     { name: "has_scripts", definition: "INTEGER NOT NULL DEFAULT 0" },
     { name: "resource_summary", definition: "TEXT NOT NULL DEFAULT '{}'" },
+    { name: "skill_md", definition: "TEXT NOT NULL DEFAULT ''" },
   ]);
   ensureSqliteColumns(db, "skill_files", [
     { name: "category", definition: "TEXT NOT NULL DEFAULT 'other'" },
@@ -386,11 +432,12 @@ function applySqliteMigrations(db: BunSqliteDatabase): void {
 }
 
 /**
- * Seed high-star built-in skills from `resource/builtin-skills/` into:
- * 1. Database (`skills.is_builtin = true`, hidden from UI card list) with full directory resources
- * 2. OMP default skills directory (`~/.omp/agent/skills/<name>/...`)
+ * Step 1 of startup skill sync:
+ * Load built-in skills from `resource/builtin-skills/` into the database
+ * (`skills` + `skill_files`), preserving complete directory resources.
+ * If `resource/builtin-skills/` is missing or empty, existing DB records are kept intact.
  */
-async function seedBuiltinSkills(): Promise<Set<string>> {
+async function ingestBuiltinSkillsToDb(): Promise<Set<string>> {
   const builtinNames = new Set<string>();
   const builtinRoot = path.resolve(process.cwd(), "resource", "builtin-skills");
   const entries = await fs
@@ -407,13 +454,6 @@ async function seedBuiltinSkills(): Promise<Set<string>> {
 
     builtinNames.add(skillName);
 
-    // Ensure complete built-in skill directory (SKILL.md + scripts/references/assets/agents/...) is available in OMP default directory
-    await saveSkillFilesToDefaultDir({
-      skillName,
-      files,
-      scope: "global",
-    });
-
     const frontmatter = parseSkillFrontmatter(skillMd.content);
     const desc = extractDescriptionFromMarkdown(skillMd.content);
     const { summary, hasScripts } = buildResourceSummary(files);
@@ -421,16 +461,17 @@ async function seedBuiltinSkills(): Promise<Set<string>> {
     await queryDb(
       `INSERT INTO skills (
          skill_name, description, creator, is_builtin, current_step, progress, status,
-         frontmatter, has_scripts, resource_summary
+         frontmatter, has_scripts, resource_summary, skill_md
        )
-       VALUES ($1, $2, 'Built-in', $3, 3, 100, 'published', $4::jsonb, $5, $6::jsonb)
+       VALUES ($1, $2, 'Built-in', $3, 3, 100, 'published', $4::jsonb, $5, $6::jsonb, $7)
        ON CONFLICT (skill_name)
        DO UPDATE SET
          description = EXCLUDED.description,
          is_builtin = EXCLUDED.is_builtin,
          frontmatter = EXCLUDED.frontmatter,
          has_scripts = EXCLUDED.has_scripts,
-         resource_summary = EXCLUDED.resource_summary`,
+         resource_summary = EXCLUDED.resource_summary,
+         skill_md = EXCLUDED.skill_md`,
       [
         skillName,
         desc,
@@ -438,6 +479,7 @@ async function seedBuiltinSkills(): Promise<Set<string>> {
         JSON.stringify(frontmatter),
         hasScripts,
         JSON.stringify(summary),
+        skillMd.content,
       ]
     );
 
@@ -474,10 +516,23 @@ async function seedBuiltinSkills(): Promise<Set<string>> {
   return builtinNames;
 }
 
+/**
+ * Step 2 of startup skill sync:
+ * Import any disk-only skills that are not yet in the database.
+ * Uses ON CONFLICT DO NOTHING so the database always remains the source of truth.
+ */
 async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
   const diskSkills = await listSkillsInDefaultDir("global");
   for (const disk of diskSkills) {
     if (builtinNames.has(disk.skillName)) continue;
+
+    const existing = await queryDb<{ skill_name: string }>(
+      `SELECT skill_name FROM skills WHERE skill_name = $1`,
+      [disk.skillName]
+    );
+    if (existing.rows.length > 0) {
+      continue;
+    }
 
     const skillDir = path.join(resolveDefaultSkillsRoot("global"), disk.skillName);
     const files = await readSkillDirectoryFiles(skillDir);
@@ -490,14 +545,10 @@ async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
     await queryDb(
       `INSERT INTO skills (
          skill_name, description, creator, is_builtin, current_step, progress, status,
-         frontmatter, has_scripts, resource_summary
+         frontmatter, has_scripts, resource_summary, skill_md
        )
-       VALUES ($1, $2, 'System', $3, 1, 33, 'draft', $4::jsonb, $5, $6::jsonb)
-       ON CONFLICT (skill_name)
-       DO UPDATE SET
-         frontmatter = EXCLUDED.frontmatter,
-         has_scripts = EXCLUDED.has_scripts,
-         resource_summary = EXCLUDED.resource_summary`,
+       VALUES ($1, $2, 'System', $3, 1, 33, 'draft', $4::jsonb, $5, $6::jsonb, $7)
+       ON CONFLICT (skill_name) DO NOTHING`,
       [
         disk.skillName,
         desc,
@@ -505,6 +556,7 @@ async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
         JSON.stringify(frontmatter),
         hasScripts,
         JSON.stringify(summary),
+        mdContent,
       ]
     );
 
@@ -514,13 +566,7 @@ async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
            skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable
          )
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (skill_name, file_path)
-         DO UPDATE SET
-           category = EXCLUDED.category,
-           mime_type = EXCLUDED.mime_type,
-           encoding = EXCLUDED.encoding,
-           size_bytes = EXCLUDED.size_bytes,
-           is_executable = EXCLUDED.is_executable`,
+         ON CONFLICT (skill_name, file_path) DO NOTHING`,
         [
           disk.skillName,
           file.path,
@@ -534,6 +580,70 @@ async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
       );
     }
   }
+}
+
+/**
+ * Step 3 of startup skill sync:
+ * Restore all skills (built-in + user-created) from the database to the agent
+ * skill directories (~/.omp/agent/skills and ~/.pi/agent/skills), so skills
+ * remain available even if `resource/builtin-skills/` is deleted.
+ */
+export async function restoreSkillsFromDbToAgentDirs(): Promise<number> {
+  const skillRows = await queryDb<{ skill_name: string; skill_md: string }>(
+    `SELECT skill_name, skill_md FROM skills ORDER BY skill_name ASC`
+  );
+  if (skillRows.rows.length === 0) return 0;
+
+  const fileRows = await queryDb<{
+    skill_name: string;
+    file_path: string;
+    content: string;
+    category: string;
+    mime_type: string;
+    encoding: string;
+    size_bytes: number;
+    is_executable: boolean | number;
+  }>(
+    `SELECT skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable
+     FROM skill_files
+     ORDER BY skill_name ASC, file_path ASC`
+  );
+
+  const filesBySkill = new Map<string, SkillFileEntry[]>();
+  for (const row of fileRows.rows) {
+    const list = filesBySkill.get(row.skill_name) ?? [];
+    list.push({
+      path: row.file_path,
+      content: row.content,
+      category: (row.category as SkillFileCategory) || undefined,
+      mimeType: row.mime_type || undefined,
+      encoding: (row.encoding as SkillFileEncoding) || "utf-8",
+      sizeBytes: row.size_bytes ?? undefined,
+      isExecutable: Boolean(row.is_executable),
+    });
+    filesBySkill.set(row.skill_name, list);
+  }
+
+  const targetRoots = resolveAllGlobalSkillRoots();
+  let restoredCount = 0;
+
+  for (const skill of skillRows.rows) {
+    let files = filesBySkill.get(skill.skill_name) ?? [];
+    if (files.length === 0 && skill.skill_md) {
+      files = [enrichSkillFileEntry({ path: "SKILL.md", content: skill.skill_md })];
+    }
+    if (files.length === 0) continue;
+
+    for (const root of targetRoots) {
+      await saveSkillFilesToDir(path.join(root, skill.skill_name), files);
+    }
+    restoredCount += 1;
+  }
+
+  console.log(
+    `[DB] Restored ${restoredCount} skill(s) from database to agent directories: ${targetRoots.join(", ")}`
+  );
+  return restoredCount;
 }
 
 async function connectPostgres(): Promise<Pool | null> {
@@ -589,8 +699,9 @@ export async function initDatabase(): Promise<DbDriver> {
   if (process.env.DB_INIT_SEED !== "false") {
     await seedCatalogData();
   }
-  const builtinNames = await seedBuiltinSkills();
+  const builtinNames = await ingestBuiltinSkillsToDb();
   await syncDiskSkillsToDb(builtinNames);
+  await restoreSkillsFromDbToAgentDirs();
 
   return activeDriver;
 }

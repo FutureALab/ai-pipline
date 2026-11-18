@@ -21,8 +21,35 @@ export async function startGenerationJobHandler(
     typeof body.creator === "string" && body.creator.trim()
       ? body.creator.trim()
       : "Admin";
+  const selectedMcps = Array.isArray(body.selectedMcps)
+    ? body.selectedMcps.filter((item): item is string => typeof item === "string")
+    : undefined;
+  const rawOpenai =
+    body.openaiConfig && typeof body.openaiConfig === "object"
+      ? (body.openaiConfig as Record<string, unknown>)
+      : undefined;
+  const openaiConfig = rawOpenai
+    ? {
+      ...(typeof rawOpenai.apiKey === "string" && rawOpenai.apiKey.trim()
+        ? { apiKey: rawOpenai.apiKey.trim() }
+        : {}),
+      ...(typeof rawOpenai.modelName === "string" && rawOpenai.modelName.trim()
+        ? { modelName: rawOpenai.modelName.trim() }
+        : {}),
+      ...(typeof rawOpenai.baseUrl === "string" && rawOpenai.baseUrl.trim()
+        ? { baseUrl: rawOpenai.baseUrl.trim() }
+        : {}),
+      ...(rawOpenai.apiMode === "chat" || rawOpenai.apiMode === "responses"
+        ? { apiMode: rawOpenai.apiMode as "chat" | "responses" }
+        : {}),
+    }
+    : undefined;
   const timeoutMs =
-    typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
+    typeof body.timeoutMs === "number"
+      ? body.timeoutMs
+      : body.timeoutMs === null
+        ? 0
+        : undefined;
 
   if (!prompt.trim()) {
     return sendJson(res, 400, { error: "`prompt` is required" });
@@ -33,6 +60,8 @@ export async function startGenerationJobHandler(
     skillName,
     description,
     creator,
+    selectedMcps,
+    openaiConfig,
     timeoutMs,
   });
   sendJson(res, 202, { job });
@@ -80,11 +109,15 @@ export async function restartGenerationJobHandler(
       ? body.prompt
       : undefined;
   const timeoutMs =
-    typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
+    typeof body.timeoutMs === "number"
+      ? body.timeoutMs
+      : body.timeoutMs === null
+        ? 0
+        : undefined;
 
   const job = await restartGenerationJob(jobId, {
     ...(prompt ? { prompt } : {}),
-    ...(timeoutMs ? { timeoutMs } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   });
   if (!job) {
     return sendJson(res, 404, { error: `Job "${jobId}" not found` });

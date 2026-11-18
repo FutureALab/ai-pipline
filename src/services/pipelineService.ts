@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import {
   listCatalogRepos,
+  listSkillCards,
   readSkillMarkdown,
   upsertSkillCard,
 } from "../repositories/skillRepository.js";
@@ -13,7 +14,10 @@ import type {
   RepoPipelineRun,
   SkillCardRecord,
 } from "../types/skill.js";
-import { executeJenkinsJobWithXml } from "./jenkinsClient.js";
+import {
+  executeJenkinsJobWithXml,
+  getJenkinsBuildStatus,
+} from "./jenkinsClient.js";
 import { runSkillInRepo } from "./skillRunner.js";
 
 const execFileAsync = promisify(execFile);
@@ -24,7 +28,8 @@ async function runSingleRepoPipeline(
   skillName: string,
   repo: CatalogRepoRow,
   apps: string[],
-  mode: PipelineExecutionMode
+  mode: PipelineExecutionMode,
+  onRunUpdate?: (run: RepoPipelineRun) => Promise<void>
 ): Promise<RepoPipelineRun> {
   const start = Date.now();
   const logs: string[] = [
@@ -45,6 +50,24 @@ async function runSingleRepoPipeline(
         skillContent,
         taskPrompt: `Apply skill ${skillName} for apps [${apps.join(", ")}] on repository ${repo.name}.`,
         waitForCompletion: true,
+        pollIntervalMs: 3000,
+        onLogUpdate: async (info) => {
+          await onRunUpdate?.({
+            repoId: repo.id,
+            repoName: repo.name,
+            repoUrl: repo.url,
+            status: info.building ? "running" : "running",
+            durationMs: Date.now() - start,
+            jenkinsJobName: info.jobName,
+            jenkinsBuildNumber: info.buildNumber,
+            jenkinsBuildUrl: info.buildUrl,
+            logs: [
+              `[Jenkins] Job: ${info.jobName} (#${info.buildNumber ?? "-"})`,
+              ...(info.buildUrl ? [`[Jenkins] Build URL: ${info.buildUrl}`] : []),
+              ...info.logs,
+            ],
+          });
+        },
       });
 
       return {
@@ -53,6 +76,9 @@ async function runSingleRepoPipeline(
         repoUrl: repo.url,
         status: result.status === "success" ? "success" : "failed",
         durationMs: result.durationMs,
+        jenkinsJobName: result.jobName,
+        jenkinsBuildNumber: result.buildNumber,
+        jenkinsBuildUrl: result.buildUrl,
         logs: [
           `[Jenkins] Job: ${result.jobName} (#${result.buildNumber ?? "-"})`,
           ...(result.buildUrl ? [`[Jenkins] Build URL: ${result.buildUrl}`] : []),
@@ -151,15 +177,66 @@ export async function executeBatchPipelineTest(params: {
       }
   );
 
-  const pipelineRuns: RepoPipelineRun[] = [];
-  for (const repo of selectedRepos) {
+  const pipelineRuns: RepoPipelineRun[] = selectedRepos.map((repo) => ({
+    repoId: repo.id,
+    repoName: repo.name,
+    repoUrl: repo.url,
+    status: "pending",
+    durationMs: 0,
+    logs: [`[Jenkins] Queued pipeline for repo "${repo.name}"`],
+  }));
+
+  await upsertSkillCard(params.skillName, {
+    selectedApps: params.apps,
+    selectedRepos: params.repoIds,
+    pipelineRuns,
+    currentStep: 3,
+    progress: 66,
+    status: "testing",
+  });
+
+  for (let i = 0; i < selectedRepos.length; i++) {
+    const repo = selectedRepos[i];
+    pipelineRuns[i] = {
+      ...pipelineRuns[i],
+      status: "running",
+      logs: [`[Jenkins] Starting pipeline for repo "${repo.name}"...`],
+    };
+    await upsertSkillCard(params.skillName, {
+      selectedApps: params.apps,
+      selectedRepos: params.repoIds,
+      pipelineRuns: [...pipelineRuns],
+      currentStep: 3,
+      progress: 66,
+      status: "testing",
+    });
+
     const run = await runSingleRepoPipeline(
       params.skillName,
       repo,
       params.apps,
-      params.mode
+      params.mode,
+      async (partialRun) => {
+        pipelineRuns[i] = partialRun;
+        await upsertSkillCard(params.skillName, {
+          selectedApps: params.apps,
+          selectedRepos: params.repoIds,
+          pipelineRuns: [...pipelineRuns],
+          currentStep: 3,
+          progress: 66,
+          status: "testing",
+        }).catch(() => {});
+      }
     );
-    pipelineRuns.push(run);
+    pipelineRuns[i] = run;
+    await upsertSkillCard(params.skillName, {
+      selectedApps: params.apps,
+      selectedRepos: params.repoIds,
+      pipelineRuns: [...pipelineRuns],
+      currentStep: 3,
+      progress: 66,
+      status: "testing",
+    });
   }
 
   const allPassed = pipelineRuns.every((r) => r.status === "success");
@@ -177,4 +254,87 @@ export async function executeBatchPipelineTest(params: {
     allPassed,
     pipelineRuns,
   };
+}
+
+let jenkinsSyncTimer: ReturnType<typeof setInterval> | null = null;
+let jenkinsSyncInFlight = false;
+
+/**
+ * Sync active Jenkins build console logs into `skills.pipeline_runs` every 3 seconds.
+ */
+export async function syncRunningJenkinsLogsOnce(): Promise<void> {
+  if (jenkinsSyncInFlight) return;
+  jenkinsSyncInFlight = true;
+  try {
+    const cards = await listSkillCards();
+    const testingCards = cards.filter((c) => c.status === "testing");
+
+    for (const card of testingCards) {
+      let changed = false;
+      const updatedRuns = await Promise.all(
+        card.pipelineRuns.map(async (run) => {
+          if (
+            run.status !== "running" ||
+            !run.jenkinsJobName ||
+            !run.jenkinsBuildNumber
+          ) {
+            return run;
+          }
+          try {
+            const build = await getJenkinsBuildStatus(
+              run.jenkinsJobName,
+              run.jenkinsBuildNumber
+            );
+            const nextLogs = [
+              `[Jenkins] Job: ${run.jenkinsJobName} (#${run.jenkinsBuildNumber})`,
+              ...(build.url || run.jenkinsBuildUrl
+                ? [`[Jenkins] Build URL: ${build.url || run.jenkinsBuildUrl}`]
+                : []),
+              ...(build.consoleText ? build.consoleText.split("\n") : []),
+            ];
+            const nextStatus: RepoPipelineRun["status"] = build.building
+              ? "running"
+              : build.result === "SUCCESS"
+                ? "success"
+                : "failed";
+            changed = true;
+            return {
+              ...run,
+              status: nextStatus,
+              durationMs: build.duration || run.durationMs,
+              jenkinsBuildUrl: build.url || run.jenkinsBuildUrl,
+              logs: nextLogs,
+            };
+          } catch {
+            return run;
+          }
+        })
+      );
+
+      if (changed) {
+        await upsertSkillCard(card.skillName, {
+          pipelineRuns: updatedRuns,
+        }).catch(() => {});
+      }
+    }
+  } catch {
+    // Ignore transient DB/Jenkins polling errors
+  } finally {
+    jenkinsSyncInFlight = false;
+  }
+}
+
+export function startJenkinsLogSyncScheduler(intervalMs = 3000): void {
+  if (jenkinsSyncTimer) return;
+  jenkinsSyncTimer = setInterval(() => {
+    void syncRunningJenkinsLogsOnce();
+  }, intervalMs);
+  jenkinsSyncTimer.unref?.();
+}
+
+export function stopJenkinsLogSyncScheduler(): void {
+  if (jenkinsSyncTimer) {
+    clearInterval(jenkinsSyncTimer);
+    jenkinsSyncTimer = null;
+  }
 }
