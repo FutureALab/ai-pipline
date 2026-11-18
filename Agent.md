@@ -4,6 +4,7 @@
 
 ## 1. 技术栈总览
 
+- **离线参考文档**：`docs/pi-doc/`（收录 134 篇 OMP 官方文档，内网开发直接查阅 `docs/pi-doc/INDEX.md`、`docs/pi-doc/sdk.md`、`docs/pi-doc/skills.md`）
 - **运行时与包管理**：Bun (`bun >= 1.3`) + Node.js ESM (`"type": "module"`, TypeScript `ES2022` / `bundler`)
 - **AI Agent SDK**：`@oh-my-pi/pi-coding-agent`（固定版本 `18.22.1`，以匹配 macOS ARM64 原生模块 `@oh-my-pi/pi-natives-darwin-arm64@18.22.1`）
 - **后端 HTTP**：Node 原生 `node:http` 无框架分层架构（`routes` -> `controllers` -> `services` -> `repositories` -> `db`）

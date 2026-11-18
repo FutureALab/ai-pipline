@@ -12,7 +12,7 @@ import {
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
-import { isDbConnected, queryDb } from "../db/postgres.js";
+import { isDbConnected, queryDb } from "../db/database.js";
 
 export type AgentTelemetryConfig = NonNullable<
   CreateAgentSessionOptions["telemetry"]
@@ -185,7 +185,7 @@ export function buildSessionTelemetryConfig(context: {
   };
 }
 
-interface DbSpanRow {
+type DbSpanRow = {
   trace_id: string;
   span_id: string;
   parent_span_id: string | null;
@@ -194,12 +194,27 @@ interface DbSpanRow {
   start_time_ms: number;
   end_time_ms: number;
   duration_ms: number;
-  status: RecordedSpan["status"];
-  attributes: Record<string, unknown>;
-  events: RecordedSpan["events"];
+  status: RecordedSpan["status"] | string;
+  attributes: Record<string, unknown> | string;
+  events: RecordedSpan["events"] | string;
+};
+
+function parseJsonValue<T>(val: T | string | null | undefined, fallback: T): T {
+  if (val === null || val === undefined) return fallback;
+  if (typeof val === "string") {
+    try {
+      return JSON.parse(val) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return val;
 }
 
 function mapDbSpanRow(row: DbSpanRow): RecordedSpan {
+  const status = parseJsonValue<RecordedSpan["status"]>(row.status, { code: 0 });
+  const attributes = parseJsonValue<Record<string, unknown>>(row.attributes, {});
+  const events = parseJsonValue<RecordedSpan["events"]>(row.events, []);
   return {
     traceId: row.trace_id,
     spanId: row.span_id,
@@ -209,9 +224,9 @@ function mapDbSpanRow(row: DbSpanRow): RecordedSpan {
     startTimeMs: row.start_time_ms,
     endTimeMs: row.end_time_ms,
     durationMs: row.duration_ms,
-    status: row.status,
-    attributes: row.attributes ?? {},
-    events: Array.isArray(row.events) ? row.events : [],
+    status,
+    attributes,
+    events: Array.isArray(events) ? events : [],
   };
 }
 

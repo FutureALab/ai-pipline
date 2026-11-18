@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
-import { isDbConnected, queryDb } from "../db/postgres.js";
+import { isDbConnected, queryDb } from "../db/database.js";
 import {
   listSkillFiles,
   upsertSkillCard,

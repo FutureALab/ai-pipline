@@ -26,7 +26,7 @@ import {
   getTraceByIdHandler,
   listTracesHandler,
 } from "../controllers/traceController.js";
-import { isDbConnected } from "../db/postgres.js";
+import { getDbDriver, isDbConnected } from "../db/database.js";
 import { isRedisConnected } from "../db/redis.js";
 import { sendCorsPreflight, sendJson } from "./httpUtils.js";
 
@@ -47,6 +47,7 @@ export async function routeRequest(
       return sendJson(res, 200, {
         ok: true,
         dbConnected: isDbConnected(),
+        dbDriver: getDbDriver(),
         redisConnected: isRedisConnected(),
       });
     }

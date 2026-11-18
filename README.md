@@ -25,7 +25,9 @@
 
 ```text
 .
-├── docker-compose.yml            # PostgreSQL、Jaeger、Jenkins 周边中间件编排
+├── docker-compose.yml            # PostgreSQL、Redis、Jaeger、Jenkins 周边中间件编排
+├── docs/
+│   └── pi-doc/                   # OMP 官方离线文档镜像（共 134 篇，索引见 INDEX.md）
 ├── resource/
 │   └── Jenkinsfile               # Jenkins 声明式流水线模板
 ├── .env / .env.example           # 模型、数据库、遥测与 Jenkins 环境配置

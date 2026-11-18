@@ -1,6 +1,6 @@
 import http from "node:http";
 import { ensureTelemetryInitialized } from "./config/telemetry.js";
-import { initDatabase } from "./db/postgres.js";
+import { initDatabase } from "./db/database.js";
 import { initRedis } from "./db/redis.js";
 import { routeRequest } from "./routes/router.js";
 
