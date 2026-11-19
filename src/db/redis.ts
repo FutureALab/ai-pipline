@@ -1,4 +1,7 @@
 import Redis from "ioredis";
+import { createLogger } from "../config/logger.js";
+
+const log = createLogger("redis");
 
 let redisClient: Redis | null = null;
 let redisReady = false;
@@ -21,6 +24,7 @@ export async function initRedis(): Promise<boolean> {
   if (redisReady && redisClient) return true;
 
   if (process.env.REDIS_ENABLED === "false") {
+    log.info("Redis disabled via REDIS_ENABLED=false");
     return false;
   }
 
@@ -43,7 +47,7 @@ export async function initRedis(): Promise<boolean> {
 
   client.on("error", (err: Error) => {
     if (redisReady) {
-      console.warn(`[Redis] Connection warning: ${err.message}`);
+      log.warn({ err }, "Redis connection warning");
     }
   });
 
@@ -52,7 +56,7 @@ export async function initRedis(): Promise<boolean> {
     await client.ping();
     redisClient = client;
     redisReady = true;
-    console.log("[Redis] Connected and ready.");
+    log.info("Connected and ready");
     return true;
   } catch (err) {
     await client.quit().catch(() => client.disconnect());
@@ -61,10 +65,11 @@ export async function initRedis(): Promise<boolean> {
     const msg = err instanceof Error ? err.message : String(err);
 
     if (process.env.REDIS_ALLOW_FALLBACK !== "false") {
-      console.warn(`[Redis] Unavailable (${msg}); continuing without Redis.`);
+      log.warn({ reason: msg }, "Redis unavailable; continuing without Redis");
       return false;
     }
 
+    log.error({ err }, "Redis connection failed");
     throw new Error(`Redis connection failed: ${msg}`);
   }
 }
@@ -74,4 +79,5 @@ export async function closeRedis(): Promise<void> {
   await redisClient.quit().catch(() => redisClient?.disconnect());
   redisClient = null;
   redisReady = false;
+  log.info("Redis connection closed");
 }

@@ -11,6 +11,7 @@ export type ToolCardKind =
   | "edit"
   | "mcp"
   | "visualize"
+  | "save-skill"
   | "ask-user-question"
   | "next-steps"
   | "todo"
@@ -95,6 +96,15 @@ registerWebToolPrefix("mcp__", {
 });
 
 // Paired web extensions (matching backend src/workbench/extensions/registry.ts)
+registerWebTool({
+  name: "save_skill",
+  extensionId: "skill-distiller",
+  cardKind: "save-skill",
+  prominence: "primary",
+  label: "沉淀 Skill",
+  summarize: (c) => strArg(c.args, "skillName") || "生成并保存 Skill",
+});
+
 registerWebTool({
   name: "visualize",
   extensionId: "visualize",

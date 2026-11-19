@@ -3,7 +3,8 @@ export type WorkbenchExtensionId =
   | "next-steps"
   | "todos"
   | "visualize"
-  | "background-commands";
+  | "background-commands"
+  | "skill-distiller";
 
 export type ToolProminence = "routine" | "primary" | "interactive";
 

@@ -132,19 +132,35 @@
         </div>
       </details>
 
-      <!-- Primary 工具卡片：visualize -->
+      <!-- Primary 工具卡片：save_skill / visualize -->
       <div
         v-else-if="block.kind === 'primary'"
         class="wb-primary-card"
-        :class="{ 'is-error': block.call.isError }"
+        :class="{ 'is-error': block.call.isError, 'is-skill': cardKind(block.call) === 'save-skill' }"
       >
         <div class="wb-primary-head">
           <div class="wb-primary-title-row">
-            <el-tag size="small" type="primary" effect="light">
-              {{ block.call.details?.type === "comparison" ? "方案对比" : block.call.details?.type === "file" ? "文件预览" : "可视化图表" }}
+            <el-tag
+              size="small"
+              :type="cardKind(block.call) === 'save-skill' ? 'success' : 'primary'"
+              effect="light"
+            >
+              {{
+                cardKind(block.call) === "save-skill"
+                  ? "已生成 Skill"
+                  : block.call.details?.type === "comparison"
+                    ? "方案对比"
+                    : block.call.details?.type === "file"
+                      ? "文件预览"
+                      : "可视化图表"
+              }}
             </el-tag>
             <span class="wb-primary-title">
-              {{ String(block.call.details?.title || summarizeCall(block.call)) }}
+              {{
+                cardKind(block.call) === "save-skill"
+                  ? String(block.call.details?.skillName || summarizeCall(block.call))
+                  : String(block.call.details?.title || summarizeCall(block.call))
+              }}
             </span>
           </div>
           <span v-if="block.call.durationMs !== undefined" class="wb-tool-dur">
@@ -153,7 +169,51 @@
         </div>
 
         <div v-if="block.call.isError" class="wb-primary-error">
-          {{ block.call.resultText || "可视化渲染失败" }}
+          {{ block.call.resultText || "工具执行失败" }}
+        </div>
+
+        <!-- save_skill 专属卡片 -->
+        <div
+          v-else-if="cardKind(block.call) === 'save-skill'"
+          class="wb-skill-saved-body"
+        >
+          <div v-if="block.call.details?.description" class="wb-skill-saved-desc">
+            {{ String(block.call.details.description) }}
+          </div>
+          <div
+            v-if="Array.isArray(block.call.details?.files) && block.call.details.files.length > 0"
+            class="wb-skill-saved-files"
+          >
+            <span class="wb-skill-files-label">已生成文件：</span>
+            <code
+              v-for="f in block.call.details.files"
+              :key="String(f)"
+              class="wb-skill-file-chip"
+            >
+              {{ String(f) }}
+            </code>
+          </div>
+          <div
+            v-if="block.call.details?.skillName"
+            class="wb-skill-saved-actions"
+          >
+            <el-button
+              size="small"
+              type="primary"
+              plain
+              @click="emit('open-skill', String(block.call.details.skillName))"
+            >
+              立即跳转查看 Skill
+            </el-button>
+            <a
+              class="wb-skill-download-link"
+              :href="`/api/skills/${encodeURIComponent(String(block.call.details.skillName))}/download`"
+              target="_blank"
+              rel="noopener"
+            >
+              下载 Skill ZIP 包
+            </a>
+          </div>
         </div>
 
         <!-- Mermaid 图表 -->
@@ -280,6 +340,10 @@ import {
 
 const props = defineProps<{
   toolCalls: WorkbenchToolCall[];
+}>();
+
+const emit = defineEmits<{
+  (e: "open-skill", skillName: string): void;
 }>();
 
 const expandedIds = reactive<Record<string, boolean>>({});
@@ -636,6 +700,56 @@ async function copyText(text: string) {
 }
 .wb-primary-card.is-error {
   border-color: #fde2e2;
+}
+.wb-primary-card.is-skill {
+  border-color: #b3e19d;
+}
+.wb-primary-card.is-skill .wb-primary-head {
+  background: #f0f9eb;
+  border-bottom-color: #e1f3d8;
+}
+.wb-skill-saved-body {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wb-skill-saved-desc {
+  font-size: 12px;
+  color: #606266;
+  line-height: 1.5;
+}
+.wb-skill-saved-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.wb-skill-files-label {
+  font-size: 12px;
+  color: #909399;
+}
+.wb-skill-file-chip {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #f5f7fa;
+  border: 1px solid #dcdfe6;
+  color: #303133;
+}
+.wb-skill-saved-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.wb-skill-download-link {
+  font-size: 12px;
+  color: #409eff;
+  text-decoration: none;
+  font-weight: 500;
+}
+.wb-skill-download-link:hover {
+  text-decoration: underline;
 }
 .wb-primary-head {
   display: flex;

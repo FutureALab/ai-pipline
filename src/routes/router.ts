@@ -1,4 +1,7 @@
 import type http from "node:http";
+import { createLogger } from "../config/logger.js";
+
+const routerLog = createLogger("router");
 import {
   executeJenkinsXmlHandler,
   getJenkinsBuildHandler,
@@ -250,6 +253,10 @@ export async function routeRequest(
     return sendJson(res, 404, { error: "Not Found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    routerLog.error(
+      { err: error, method, path: url.pathname },
+      "Unhandled route error"
+    );
     return sendJson(res, 500, { error: message });
   }
 }

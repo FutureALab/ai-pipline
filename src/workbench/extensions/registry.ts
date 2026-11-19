@@ -6,6 +6,7 @@ import type {
 import { askUserQuestionExtension } from "./askUserQuestion.js";
 import { backgroundCommandsExtension } from "./backgroundCommands.js";
 import { nextStepsExtension } from "./nextSteps.js";
+import { skillDistillerExtension } from "./skillDistiller.js";
 import { todosExtension } from "./todos.js";
 import type {
   WorkbenchExtensionRuntimeContext,
@@ -14,6 +15,7 @@ import type {
 import { visualizeExtension } from "./visualize.js";
 
 export const WORKBENCH_SERVER_EXTENSIONS: readonly WorkbenchServerExtension[] = [
+  skillDistillerExtension,
   askUserQuestionExtension,
   nextStepsExtension,
   todosExtension,

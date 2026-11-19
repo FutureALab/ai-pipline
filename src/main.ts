@@ -1,8 +1,21 @@
+import { createLogger, getLogConfigSummary } from "./config/logger.js";
 import { listSkillsInDefaultDir } from "./repositories/skillStorage.js";
 import { startServer } from "./server.js";
 import { generateSkillFromPrompt } from "./services/skillGenerator.js";
 import { runSkillInRepo } from "./services/skillRunner.js";
 import type { SkillScope } from "./types/skill.js";
+
+const log = createLogger("main");
+
+process.on("uncaughtException", (err) => {
+  log.fatal({ err }, "Uncaught exception, process exiting");
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  log.error({ err }, "Unhandled promise rejection");
+});
 
 function getArg(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
@@ -11,15 +24,31 @@ function getArg(args: string[], flag: string): string | undefined {
 }
 
 function printUsage(): void {
-  console.log(`Usage:
+  process.stdout.write(`Usage:
   bun run src/main.ts generate --prompt "<prompt>" [--name <skill-name>] [--scope global|project] [--cwd <dir>] [--model <provider/model>]
   bun run src/main.ts run --skill <skill-name> --cwd <repo-dir> [--prompt "<task>"] [--model <provider/model>]
   bun run src/main.ts list [--scope global|project] [--cwd <dir>]
-  bun run src/main.ts serve [--port 3000]`);
+  bun run src/main.ts serve [--port 3000]
+`);
 }
 
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv;
+  const startedAt = Date.now();
+
+  if (!command || command === "-h" || command === "--help") {
+    printUsage();
+    process.exit(0);
+  }
+
+  log.info(
+    {
+      command,
+      cwd: process.cwd(),
+      log: getLogConfigSummary(),
+    },
+    "CLI command started"
+  );
 
   switch (command) {
     case "generate": {
@@ -30,10 +59,15 @@ async function main(): Promise<void> {
       const modelPattern = getArg(args, "--model");
 
       if (!prompt) {
-        console.error("Error: --prompt is required");
+        log.error("Missing required argument: --prompt");
         printUsage();
         process.exit(1);
       }
+
+      log.info(
+        { skillName: skillName || "(auto)", scope, cwd, modelPattern },
+        "Generating skill from prompt"
+      );
 
       const result = await generateSkillFromPrompt({
         userPrompt: prompt,
@@ -42,10 +76,18 @@ async function main(): Promise<void> {
         cwd,
         modelPattern,
         onDelta: (chunk) => process.stdout.write(chunk),
+        onProgress: (msg) => log.info({ progress: msg }, "Skill generation progress"),
       });
 
-      console.log(
-        `\n\n[OK] Skill "${result.saved.skillName}" saved to ${result.saved.filePath}`
+      process.stdout.write("\n");
+      log.info(
+        {
+          skillName: result.saved.skillName,
+          filePath: result.saved.filePath,
+          fileCount: result.files.length,
+          durationMs: Date.now() - startedAt,
+        },
+        "Skill generated and saved"
       );
       break;
     }
@@ -57,10 +99,12 @@ async function main(): Promise<void> {
       const modelPattern = getArg(args, "--model");
 
       if (!skillName) {
-        console.error("Error: --skill is required");
+        log.error("Missing required argument: --skill");
         printUsage();
         process.exit(1);
       }
+
+      log.info({ skillName, cwd, modelPattern }, "Running skill in repository");
 
       const result = await runSkillInRepo({
         skillName,
@@ -70,8 +114,14 @@ async function main(): Promise<void> {
         onDelta: (chunk) => process.stdout.write(chunk),
       });
 
-      console.log(
-        `\n\n[OK] Skill "${result.skillName}" finished in ${result.durationMs}ms (cwd: ${result.cwd})`
+      process.stdout.write("\n");
+      log.info(
+        {
+          skillName: result.skillName,
+          cwd: result.cwd,
+          durationMs: result.durationMs,
+        },
+        "Skill execution completed"
       );
       break;
     }
@@ -81,11 +131,12 @@ async function main(): Promise<void> {
       const cwd = getArg(args, "--cwd") || process.cwd();
       const skills = await listSkillsInDefaultDir(scope, cwd);
 
+      log.info({ scope, cwd, count: skills.length }, "Listed skills");
       if (skills.length === 0) {
-        console.log(`No skills found in ${scope} default directory.`);
+        process.stdout.write(`No skills found in ${scope} default directory.\n`);
       } else {
         for (const s of skills) {
-          console.log(`- ${s.skillName} (${s.filePath})`);
+          process.stdout.write(`- ${s.skillName} (${s.filePath})\n`);
         }
       }
       break;
@@ -98,12 +149,13 @@ async function main(): Promise<void> {
     }
 
     default:
+      log.error({ command }, "Unknown CLI command");
       printUsage();
-      process.exit(command ? 1 : 0);
+      process.exit(1);
   }
 }
 
 main().catch((err) => {
-  console.error("[ERROR]", err instanceof Error ? err.message : err);
+  log.fatal({ err }, "Command failed with fatal error");
   process.exit(1);
 });

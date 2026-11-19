@@ -4,6 +4,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Pool } from "pg";
+import { createLogger } from "../config/logger.js";
+
+const dbLog = createLogger("db");
 import {
   buildResourceSummary,
   enrichSkillFileEntry,
@@ -360,14 +363,14 @@ async function tryAutoStartLocalPostgres(): Promise<boolean> {
 
     if (match) {
       const containerName = match.split("\t")[0];
-      console.log(`[DB] Attempting to start local PostgreSQL container: ${containerName}`);
+      dbLog.info({ containerName }, "Attempting to start local PostgreSQL container");
       await execFileAsync("docker", ["start", containerName], { timeout: 10_000 });
       await new Promise((r) => setTimeout(r, 2500));
       return true;
     }
 
     // 2. Fallback: try docker compose up -d postgres
-    console.log("[DB] Attempting `docker compose up -d postgres`...");
+    dbLog.info("Attempting `docker compose up -d postgres`...");
     await execFileAsync("docker", ["compose", "up", "-d", "postgres"], {
       timeout: 15_000,
     });
@@ -640,8 +643,9 @@ export async function restoreSkillsFromDbToAgentDirs(): Promise<number> {
     restoredCount += 1;
   }
 
-  console.log(
-    `[DB] Restored ${restoredCount} skill(s) from database to agent directories: ${targetRoots.join(", ")}`
+  dbLog.info(
+    { restoredCount, targetRoots },
+    "Restored skills from database to agent directories"
   );
   return restoredCount;
 }
@@ -679,7 +683,7 @@ export async function initDatabase(): Promise<DbDriver> {
     pgPool = connectedPool;
     activeDriver = "postgres";
     await pgPool.query(PG_SCHEMA_SQL);
-    console.log("[DB] PostgreSQL connected and schema initialized.");
+    dbLog.info("PostgreSQL connected and schema initialized");
   } else {
     // 3. Fallback to SQLite (bun:sqlite)
     const sqlitePath = path.resolve(
@@ -691,8 +695,9 @@ export async function initDatabase(): Promise<DbDriver> {
     sqliteDb.exec(SQLITE_SCHEMA_SQL);
     applySqliteMigrations(sqliteDb);
     activeDriver = "sqlite";
-    console.warn(
-      `[DB] PostgreSQL unavailable; initialized SQLite database at ${sqlitePath}`
+    dbLog.warn(
+      { sqlitePath },
+      "PostgreSQL unavailable; initialized SQLite fallback database"
     );
   }
 

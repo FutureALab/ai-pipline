@@ -546,6 +546,7 @@
                     v-if="workbenchSession && workbenchSession.messages.length > 0"
                     type="success"
                     plain
+                    :disabled="workbenchSession.status === 'running' || workbenchSending"
                     @click="handleDistillToSkill"
                   >
                     沉淀为 Skill
@@ -683,6 +684,7 @@
                     <ToolCallsView
                       v-if="msg.toolCalls && msg.toolCalls.length > 0"
                       :tool-calls="msg.toolCalls"
+                      @open-skill="(name) => emit('open-skill', name)"
                     />
                     <div v-else-if="msg.toolLogs && msg.toolLogs.length > 0" class="chat-tool-logs">
                       <div v-for="(log, idx) in msg.toolLogs" :key="idx" class="chat-tool-item">
@@ -709,6 +711,7 @@
                     <ToolCallsView
                       v-if="workbenchSession.streamingToolCalls && workbenchSession.streamingToolCalls.length > 0"
                       :tool-calls="workbenchSession.streamingToolCalls"
+                      @open-skill="(name) => emit('open-skill', name)"
                     />
                     <div
                       v-else-if="workbenchSession.streamingLogs.length > 0"
@@ -1194,8 +1197,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
-import { ElMessage } from "element-plus";
+import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
+import { ElButton, ElMessage, ElNotification } from "element-plus";
 import { Marked } from "marked";
 import hljs from "highlight.js";
 import BackgroundCommandsPanel from "./workbench/BackgroundCommandsPanel.vue";
@@ -1257,6 +1260,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "back"): void;
   (e: "published"): void;
+  (e: "open-skill", skillName: string): void;
 }>();
 
 const marked = new Marked({
@@ -1642,6 +1646,67 @@ async function handleCloseWorkbenchSession(sessionId: string) {
   }
 }
 
+const notifiedSavedSkillCallIds = new Set<string>();
+
+function notifySkillDistilled(skillName: string) {
+  const handle = ElNotification({
+    title: "Skill 沉淀完成",
+    type: "success",
+    duration: 3000,
+    message: h(
+      "div",
+      { style: "display: flex; flex-direction: column; gap: 8px;" },
+      [
+        h(
+          "div",
+          { style: "font-size: 13px; color: #303133; line-height: 1.5;" },
+          `新 Skill「${skillName}」已生成并出现在卡片页面中。`
+        ),
+        h("div", { style: "display: flex; justify-content: flex-end;" }, [
+          h(
+            ElButton,
+            {
+              type: "primary",
+              size: "small",
+              onClick: () => {
+                handle.close();
+                emit("open-skill", skillName);
+              },
+            },
+            () => "立即跳转"
+          ),
+        ]),
+      ]
+    ),
+  });
+}
+
+function checkAndNotifySavedSkills(session: WorkbenchSessionSnapshot) {
+  const candidates = [
+    ...(session.streamingToolCalls ?? []),
+    ...(session.messages[session.messages.length - 1]?.toolCalls ?? []),
+  ];
+  for (const tc of candidates) {
+    if (
+      tc.toolName === "save_skill" &&
+      tc.status === "completed" &&
+      !tc.isError &&
+      !notifiedSavedSkillCallIds.has(tc.toolCallId)
+    ) {
+      notifiedSavedSkillCallIds.add(tc.toolCallId);
+      const skillName =
+        typeof tc.details?.skillName === "string" && tc.details.skillName.trim()
+          ? tc.details.skillName.trim()
+          : typeof tc.args?.skillName === "string"
+            ? tc.args.skillName.trim()
+            : "";
+      if (skillName) {
+        notifySkillDistilled(skillName);
+      }
+    }
+  }
+}
+
 function beginWorkbenchPolling(sessionId: string) {
   stopWorkbenchPolling();
   workbenchTimer = setInterval(async () => {
@@ -1649,6 +1714,7 @@ function beginWorkbenchPolling(sessionId: string) {
       const { session } = await fetchWorkbenchSession(sessionId);
       workbenchSession.value = session;
       upsertWorkbenchSessionInList(session);
+      checkAndNotifySavedSkills(session);
       if (session.status !== "running") {
         stopWorkbenchPolling();
       }
@@ -1850,14 +1916,39 @@ async function handleAbortWorkbench() {
   }
 }
 
-function handleDistillToSkill() {
+async function handleDistillToSkill() {
   if (!workbenchSession.value) return;
-  const transcript = workbenchSession.value.messages
-    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
-    .join("\n\n");
-  form.prompt = `基于以下在 pi-agent 工作台中的探索与对话，整理并生成完整的 Skill：\n\n${transcript.slice(0, 6000)}`;
-  stepOneMode.value = "skill";
-  ElMessage.success("已将对话思路带入 Skill 生成提示词，可直接生成 Skill");
+  if (workbenchSession.value.status === "running" || workbenchSending.value) {
+    ElMessage.warning("当前会话正在执行中，请等待本轮完成后再沉淀为 Skill");
+    return;
+  }
+  if (
+    workbenchSession.value.disabledExtensions?.includes("skill-distiller")
+  ) {
+    ElMessage.warning(
+      "当前会话已禁用「直接沉淀 Skill (save_skill)」扩展，请在扩展开关中启用后新建会话"
+    );
+    return;
+  }
+
+  const distillPrompt =
+    "请总结我们在当前会话中的探索过程、验证过的命令/脚本以及最佳实践，直接调用 `save_skill` 工具生成并保存一个完整、可复用的 Skill（包含规范的 kebab-case 名称、清晰描述、带 YAML frontmatter 的完整 SKILL.md，以及所需的 scripts/references/assets 附属文件）。如果还有关键边界或命名需要确认，可先调用 `ask_user_question` 询问我。";
+
+  workbenchSending.value = true;
+  try {
+    const { session } = await sendWorkbenchMessage(
+      workbenchSession.value.sessionId,
+      distillPrompt
+    );
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+    beginWorkbenchPolling(session.sessionId);
+    ElMessage.success("已指令 pi-agent 直接调用 save_skill 工具生成 Skill");
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "触发沉淀 Skill 失败");
+  } finally {
+    workbenchSending.value = false;
+  }
 }
 
 function openAddMcpDialog() {

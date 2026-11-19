@@ -10,9 +10,11 @@
 
     <SkillWorkflow
       v-else
+      :key="activeSkillName || '__new__'"
       :initial-skill-name="activeSkillName"
       @back="backToGrid"
       @published="backToGrid"
+      @open-skill="openSkillByName"
     />
   </div>
 </template>
@@ -46,6 +48,12 @@ async function loadSkills() {
 function openSkill(skill: SkillCardRecord) {
   activeSkillName.value = skill.skillName;
   viewMode.value = "workflow";
+}
+
+function openSkillByName(skillName: string) {
+  activeSkillName.value = skillName;
+  viewMode.value = "workflow";
+  void loadSkills();
 }
 
 function createNewSkill() {

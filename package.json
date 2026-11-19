@@ -23,7 +23,9 @@
   "dependencies": {
     "@oh-my-pi/pi-coding-agent": "18.22.1",
     "ioredis": "^6.0.0",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

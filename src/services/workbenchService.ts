@@ -15,6 +15,7 @@ import {
   resolveOpenAIEnvSessionOptions,
   type OpenAIOverrideConfig,
 } from "../config/envModel.js";
+import { createLogger } from "../config/logger.js";
 import { buildSessionTelemetryConfig } from "../config/telemetry.js";
 import { getMcpServersByIdsForOwner } from "../repositories/mcpRepository.js";
 import { listCatalogRepos } from "../repositories/skillRepository.js";
@@ -36,6 +37,7 @@ import type {
 } from "../workbench/types.js";
 
 const execFileAsync = promisify(execFile);
+const wbLog = createLogger("workbench");
 
 const MAX_TOOL_RESULT_CHARS = 18_000;
 
@@ -467,7 +469,9 @@ export async function createWorkbenchSession(params: {
 
   const extBundle = buildWorkbenchExtensions(disabledExtensions, {
     sessionId,
+    owner,
     cwd: repoInfo.cwd,
+    selectedMcps,
     todoStore,
     bgCommandManager,
     setNextSteps(steps) {
@@ -475,6 +479,16 @@ export async function createWorkbenchSession(params: {
         sessionRef.nextSteps = steps;
         sessionRef.updatedAt = Date.now();
       }
+    },
+    onSkillSaved(skill) {
+      if (!sessionRef) return;
+      const idx = sessionRef.skills.findIndex((s) => s.name === skill.name);
+      if (idx >= 0) {
+        sessionRef.skills[idx] = skill;
+      } else {
+        sessionRef.skills.unshift(skill);
+      }
+      sessionRef.updatedAt = Date.now();
     },
     askUserQuestion(question, signal) {
       return new Promise<UserQuestionSubmission>((resolve) => {
@@ -615,6 +629,19 @@ export async function createWorkbenchSession(params: {
   sessionRef = internal;
 
   sessions.set(sessionId, internal);
+  wbLog.info(
+    {
+      sessionId,
+      owner,
+      cwd: repoInfo.cwd,
+      model: agentSession.model
+        ? `${agentSession.model.provider}/${agentSession.model.id}`
+        : undefined,
+      enabledExtensions: extBundle.enabledIds,
+      mcpCount: configuredMcps.length,
+    },
+    "Workbench session created"
+  );
   return toSnapshot(internal);
 }
 
@@ -800,6 +827,16 @@ export function sendWorkbenchMessage(
           isError,
         });
       }
+      wbLog.info(
+        {
+          sessionId,
+          toolName: event.toolName,
+          toolCallId: event.toolCallId,
+          durationMs: target?.durationMs ?? 0,
+          isError,
+        },
+        isError ? "Workbench tool failed" : "Workbench tool finished"
+      );
       s.updatedAt = Date.now();
     } else if (
       event.type === "message_end" &&
@@ -864,6 +901,10 @@ export function sendWorkbenchMessage(
       s.streamingLogs = [];
       s.streamingToolCalls = [];
       s.updatedAt = Date.now();
+      wbLog.error(
+        { sessionId, err },
+        "Workbench message turn failed"
+      );
     });
 
   return toSnapshot(s);
@@ -912,5 +953,6 @@ export async function closeWorkbenchSession(sessionId: string): Promise<boolean>
   if (s.isTempDir) {
     await fs.rm(s.cwd, { recursive: true, force: true }).catch(() => {});
   }
+  wbLog.info({ sessionId }, "Workbench session closed");
   return true;
 }
