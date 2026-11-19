@@ -1,4 +1,5 @@
 import { createLogger, getLogConfigSummary } from "./config/logger.js";
+import { getEmbeddedSkills } from "./repositories/embeddedSkills.js";
 import { listSkillsInDefaultDir } from "./repositories/skillStorage.js";
 import { startServer } from "./server.js";
 import { generateSkillFromPrompt } from "./services/skillGenerator.js";
@@ -129,14 +130,36 @@ async function main(): Promise<void> {
     case "list": {
       const scope = (getArg(args, "--scope") as SkillScope) || "global";
       const cwd = getArg(args, "--cwd") || process.cwd();
-      const skills = await listSkillsInDefaultDir(scope, cwd);
+      const embedded = getEmbeddedSkills();
+      const diskSkills = await listSkillsInDefaultDir(scope, cwd);
 
-      log.info({ scope, cwd, count: skills.length }, "Listed skills");
-      if (skills.length === 0) {
-        process.stdout.write(`No skills found in ${scope} default directory.\n`);
+      log.info(
+        {
+          scope,
+          cwd,
+          embeddedCount: embedded.length,
+          diskCount: diskSkills.length,
+        },
+        "Listed skills"
+      );
+
+      if (embedded.length > 0) {
+        process.stdout.write(`Embedded in binary (${embedded.length}):\n`);
+        for (const s of embedded) {
+          process.stdout.write(
+            `  - ${s.skillName} [embedded:${s.source}] (${s.files.length} file(s))\n`
+          );
+        }
+      }
+
+      if (diskSkills.length === 0) {
+        if (embedded.length === 0) {
+          process.stdout.write(`No skills found in ${scope} default directory.\n`);
+        }
       } else {
-        for (const s of skills) {
-          process.stdout.write(`- ${s.skillName} (${s.filePath})\n`);
+        process.stdout.write(`Disk (${scope}, ${diskSkills.length}):\n`);
+        for (const s of diskSkills) {
+          process.stdout.write(`  - ${s.skillName} (${s.filePath})\n`);
         }
       }
       break;

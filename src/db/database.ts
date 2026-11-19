@@ -710,3 +710,19 @@ export async function initDatabase(): Promise<DbDriver> {
 
   return activeDriver;
 }
+
+export async function closeDatabase(): Promise<void> {
+  if (pgPool) {
+    await pgPool.end().catch(() => {});
+    pgPool = null;
+  }
+  if (sqliteDb) {
+    try {
+      sqliteDb.close();
+    } catch {
+      // Ignore close error
+    }
+    sqliteDb = null;
+  }
+  activeDriver = null;
+}

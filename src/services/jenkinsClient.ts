@@ -74,8 +74,9 @@ function escapeXml(value: string): string {
 /**
  * Build a standard Jenkins Pipeline `config.xml` (<flow-definition>) that:
  * 1. Clones the target git repository
- * 2. Places the Skill SKILL.md into ~/.omp/agent/skills/<skillName>/SKILL.md
- * 3. Executes the Skill in the cloned repository using pi-agent (`omp` / `@oh-my-pi/pi-coding-agent`)
+ * 2. Executes the Skill directly using the pre-compiled `ai-pipeline` binary
+ *    (which embeds built-in skills + the DB-bundled skill with all scripts/references/assets)
+ *    so Jenkins results match Creative Mode & local pipeline tests identically.
  */
 export function buildJenkinsPipelineXml(
   options: JenkinsPipelineXmlOptions
@@ -83,8 +84,9 @@ export function buildJenkinsPipelineXml(
   const branch = options.repoBranch || "main";
   const taskPrompt =
     options.taskPrompt ||
-    `Use skill ${options.skillName} to inspect and execute the workflow on this repository.`;
+    `Apply skill ${options.skillName} on repository.`;
   const skillB64 = options.skillContentB64 || "";
+  const escapedPrompt = taskPrompt.replace(/'/g, "'\\''");
 
   const groovyScript = `pipeline {
     agent any
@@ -97,27 +99,32 @@ export function buildJenkinsPipelineXml(
                 '''
             }
         }
-        stage('Prepare Skill') {
+        stage('Prepare Skill Fallback') {
             steps {
                 sh '''
-                    mkdir -p "\${HOME}/.omp/agent/skills/${options.skillName}"
-                    if [ -n "${skillB64}" ]; then
-                        echo "${skillB64}" | base64 -d > "\${HOME}/.omp/agent/skills/${options.skillName}/SKILL.md"
+                    # If the compiled ai-pipeline binary embeds the skill, it will materialize
+                    # the full skill package (SKILL.md + scripts + references + assets) automatically.
+                    # Only write fallback SKILL.md when no directory exists yet.
+                    SKILL_DIR="\${HOME}/.omp/agent/skills/${options.skillName}"
+                    if [ ! -f "\${SKILL_DIR}/SKILL.md" ] && [ -n "${skillB64}" ]; then
+                        mkdir -p "\${SKILL_DIR}"
+                        echo "${skillB64}" | base64 -d > "\${SKILL_DIR}/SKILL.md"
                     fi
                 '''
             }
         }
-        stage('Run pi-agent With Skill') {
+        stage('Run Bundled ai-pipeline Binary') {
             steps {
                 dir('target-repo') {
                     sh '''
                         AI_BIN="\${AI_PIPELINE_BIN:-ai-pipeline}"
-                        if command -v "\${AI_BIN}" >/dev/null 2>&1; then
-                            "\${AI_BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt "${taskPrompt.replace(/'/g, "'\\''")}"
-                        elif command -v omp >/dev/null 2>&1; then
-                            omp --print "/skill:${options.skillName} ${taskPrompt.replace(/'/g, "'\\''")}"
+                        if [ -x "\${AI_BIN}" ]; then
+                            "\${AI_BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
+                        elif command -v "\${AI_BIN}" >/dev/null 2>&1; then
+                            "\${AI_BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
                         else
-                            echo "Error: pre-compiled ai-pipeline binary or omp CLI not found on Jenkins agent"
+                            echo "Error: compiled ai-pipeline binary (\${AI_BIN}) not found on Jenkins agent."
+                            echo "Please build with: bun run scripts/build-binaries.ts linux-x64 --skill ${options.skillName}"
                             exit 1
                         fi
                     '''
