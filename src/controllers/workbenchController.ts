@@ -2,13 +2,26 @@ import type http from "node:http";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import {
   abortWorkbenchSession,
+  addWorkbenchUserTodo,
   closeWorkbenchSession,
   createWorkbenchSession,
   getWorkbenchSession,
+  listWorkbenchExtensions,
   listWorkbenchSessions,
+  removeWorkbenchTodo,
   sendWorkbenchMessage,
   setWorkbenchThinkingLevel,
+  stopWorkbenchBackgroundCommand,
+  submitWorkbenchQuestionAnswer,
 } from "../services/workbenchService.js";
+import type { UserQuestionAnswerItem } from "../workbench/types.js";
+
+export async function listWorkbenchExtensionsHandler(
+  res: http.ServerResponse
+): Promise<void> {
+  const extensions = listWorkbenchExtensions();
+  sendJson(res, 200, { extensions });
+}
 
 export async function listWorkbenchSessionsHandler(
   res: http.ServerResponse,
@@ -33,6 +46,11 @@ export async function createWorkbenchSessionHandler(
     typeof body.customCwd === "string" ? body.customCwd.trim() : undefined;
   const selectedMcps = Array.isArray(body.selectedMcps)
     ? body.selectedMcps.filter((item): item is string => typeof item === "string")
+    : undefined;
+  const disabledExtensions = Array.isArray(body.disabledExtensions)
+    ? body.disabledExtensions.filter(
+        (item): item is string => typeof item === "string"
+      )
     : undefined;
   const thinkingLevel =
     typeof body.thinkingLevel === "string" ? body.thinkingLevel.trim() : undefined;
@@ -63,6 +81,7 @@ export async function createWorkbenchSessionHandler(
     repoId,
     customCwd,
     selectedMcps,
+    disabledExtensions,
     openaiConfig,
     thinkingLevel,
   });
@@ -133,6 +152,94 @@ export async function setWorkbenchThinkingHandler(
   const session = setWorkbenchThinkingLevel(
     decodeURIComponent(rawId),
     thinkingLevel
+  );
+  if (!session) {
+    return sendJson(res, 404, { error: "Workbench session not found" });
+  }
+  sendJson(res, 200, { session });
+}
+
+export async function submitWorkbenchQuestionAnswerHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  rawId: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const toolCallId =
+    typeof body.toolCallId === "string" ? body.toolCallId.trim() : "";
+  const rawAnswers = Array.isArray(body.answers) ? body.answers : [];
+  const answers: UserQuestionAnswerItem[] = rawAnswers
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+    .map((item) => ({
+      questionId: String(item.questionId ?? "").trim(),
+      selectedLabels: Array.isArray(item.selectedLabels)
+        ? item.selectedLabels.filter((s): s is string => typeof s === "string")
+        : [],
+      ...(typeof item.otherText === "string" && item.otherText.trim()
+        ? { otherText: item.otherText.trim() }
+        : {}),
+      ...(item.discussFirst ? { discussFirst: true } : {}),
+      ...(typeof item.discussNote === "string" && item.discussNote.trim()
+        ? { discussNote: item.discussNote.trim() }
+        : {}),
+    }));
+
+  const session = submitWorkbenchQuestionAnswer(decodeURIComponent(rawId), {
+    toolCallId,
+    answers,
+    cancelled: Boolean(body.cancelled),
+    chatInstead: Boolean(body.chatInstead),
+  });
+  if (!session) {
+    return sendJson(res, 404, { error: "Workbench session not found" });
+  }
+  sendJson(res, 200, { session });
+}
+
+export async function addWorkbenchTodoHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  rawId: string
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  if (!title) {
+    return sendJson(res, 400, { error: "`title` is required" });
+  }
+  const group =
+    typeof body.group === "string" && body.group.trim()
+      ? body.group.trim()
+      : undefined;
+  const session = addWorkbenchUserTodo(decodeURIComponent(rawId), title, group);
+  if (!session) {
+    return sendJson(res, 404, { error: "Workbench session not found" });
+  }
+  sendJson(res, 201, { session });
+}
+
+export async function removeWorkbenchTodoHandler(
+  res: http.ServerResponse,
+  rawId: string,
+  rawItemId: string
+): Promise<void> {
+  const session = removeWorkbenchTodo(
+    decodeURIComponent(rawId),
+    decodeURIComponent(rawItemId)
+  );
+  if (!session) {
+    return sendJson(res, 404, { error: "Workbench session not found" });
+  }
+  sendJson(res, 200, { session });
+}
+
+export async function stopWorkbenchBgCommandHandler(
+  res: http.ServerResponse,
+  rawId: string,
+  rawCmdId: string
+): Promise<void> {
+  const session = stopWorkbenchBackgroundCommand(
+    decodeURIComponent(rawId),
+    decodeURIComponent(rawCmdId)
   );
   if (!session) {
     return sendJson(res, 404, { error: "Workbench session not found" });

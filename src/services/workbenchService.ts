@@ -18,8 +18,26 @@ import {
 import { buildSessionTelemetryConfig } from "../config/telemetry.js";
 import { getMcpServersByIdsForOwner } from "../repositories/mcpRepository.js";
 import { listCatalogRepos } from "../repositories/skillRepository.js";
+import { BackgroundCommandManager } from "../workbench/extensions/backgroundCommands.js";
+import {
+  buildWorkbenchExtensions,
+  getWorkbenchExtensionCatalog,
+} from "../workbench/extensions/registry.js";
+import { TodoSessionStore } from "../workbench/extensions/todos.js";
+import type {
+  PendingUserQuestion,
+  UserQuestionSubmission,
+  WorkbenchBackgroundCommandSnapshot,
+  WorkbenchExtensionDescriptor,
+  WorkbenchExtensionId,
+  WorkbenchNextStep,
+  WorkbenchTodoState,
+  WorkbenchToolCall,
+} from "../workbench/types.js";
 
 const execFileAsync = promisify(execFile);
+
+const MAX_TOOL_RESULT_CHARS = 18_000;
 
 export interface WorkbenchMessage {
   id: string;
@@ -27,6 +45,7 @@ export interface WorkbenchMessage {
   content: string;
   thinking?: string;
   toolLogs?: string[];
+  toolCalls?: WorkbenchToolCall[];
   createdAt: number;
 }
 
@@ -76,11 +95,18 @@ export interface WorkbenchSessionSnapshot {
   repoUrl?: string;
   cwd: string;
   selectedMcps: string[];
+  enabledExtensions: WorkbenchExtensionId[];
+  disabledExtensions: string[];
   status: "idle" | "running" | "error";
   messages: WorkbenchMessage[];
   streamingText: string;
   streamingThinking: string;
   streamingLogs: string[];
+  streamingToolCalls: WorkbenchToolCall[];
+  pendingQuestion: PendingUserQuestion | null;
+  nextSteps: WorkbenchNextStep[];
+  todos: WorkbenchTodoState;
+  backgroundCommands: WorkbenchBackgroundCommandSnapshot[];
   errorMessage?: string;
   model: WorkbenchModelInfo | null;
   thinkingLevel: string;
@@ -91,6 +117,11 @@ export interface WorkbenchSessionSnapshot {
   updatedAt: number;
 }
 
+interface PendingQuestionWaiter {
+  question: PendingUserQuestion;
+  resolve: (submission: UserQuestionSubmission) => void;
+}
+
 interface InternalWorkbenchSession {
   sessionId: string;
   owner: string;
@@ -99,11 +130,18 @@ interface InternalWorkbenchSession {
   repoUrl?: string;
   cwd: string;
   selectedMcps: string[];
+  enabledExtensions: WorkbenchExtensionId[];
+  disabledExtensions: string[];
   status: "idle" | "running" | "error";
   messages: WorkbenchMessage[];
   streamingText: string;
   streamingThinking: string;
   streamingLogs: string[];
+  streamingToolCalls: WorkbenchToolCall[];
+  pendingQuestionWaiter: PendingQuestionWaiter | null;
+  nextSteps: WorkbenchNextStep[];
+  todoStore: TodoSessionStore;
+  bgCommandManager: BackgroundCommandManager;
   errorMessage?: string;
   updatedAt: number;
   isTempDir: boolean;
@@ -114,6 +152,56 @@ interface InternalWorkbenchSession {
 }
 
 const sessions = new Map<string, InternalWorkbenchSession>();
+
+export function listWorkbenchExtensions(): WorkbenchExtensionDescriptor[] {
+  return getWorkbenchExtensionCatalog();
+}
+
+function extractToolResultText(result: unknown): string {
+  if (!result) return "";
+  if (typeof result === "string") {
+    return result.slice(0, MAX_TOOL_RESULT_CHARS);
+  }
+  const obj = result as Record<string, unknown>;
+  if (Array.isArray(obj.content)) {
+    const parts: string[] = [];
+    for (const block of obj.content) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as Record<string, unknown>;
+      if (b.type === "text" && typeof b.text === "string") {
+        parts.push(b.text);
+      } else if (b.type === "image") {
+        parts.push("[image]");
+      }
+    }
+    const joined = parts.join("\n");
+    return joined.length > MAX_TOOL_RESULT_CHARS
+      ? `${joined.slice(0, MAX_TOOL_RESULT_CHARS)}\n...(truncated)`
+      : joined;
+  }
+  if (typeof obj.text === "string") {
+    return obj.text.slice(0, MAX_TOOL_RESULT_CHARS);
+  }
+  try {
+    const serialized = JSON.stringify(result, null, 2);
+    return serialized.length > MAX_TOOL_RESULT_CHARS
+      ? `${serialized.slice(0, MAX_TOOL_RESULT_CHARS)}\n...(truncated)`
+      : serialized;
+  } catch {
+    return String(result).slice(0, MAX_TOOL_RESULT_CHARS);
+  }
+}
+
+function extractToolDetails(
+  result: unknown
+): Record<string, unknown> | undefined {
+  if (!result || typeof result !== "object") return undefined;
+  const details = (result as Record<string, unknown>).details;
+  if (details && typeof details === "object" && !Array.isArray(details)) {
+    return details as Record<string, unknown>;
+  }
+  return undefined;
+}
 
 function buildStatsSnapshot(agentSession: AgentSession): WorkbenchSessionStats {
   let tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
@@ -177,6 +265,14 @@ function buildMcpStatusList(
   });
 }
 
+function cloneToolCall(tc: WorkbenchToolCall): WorkbenchToolCall {
+  return {
+    ...tc,
+    args: { ...tc.args },
+    ...(tc.details ? { details: tc.details } : {}),
+  };
+}
+
 function toSnapshot(s: InternalWorkbenchSession): WorkbenchSessionSnapshot {
   const m = s.agentSession.model;
   const model: WorkbenchModelInfo | null = m
@@ -207,11 +303,26 @@ function toSnapshot(s: InternalWorkbenchSession): WorkbenchSessionSnapshot {
     repoUrl: s.repoUrl,
     cwd: s.cwd,
     selectedMcps: [...s.selectedMcps],
+    enabledExtensions: [...s.enabledExtensions],
+    disabledExtensions: [...s.disabledExtensions],
     status: s.status,
-    messages: s.messages.map((msg) => ({ ...msg })),
+    messages: s.messages.map((msg) => ({
+      ...msg,
+      ...(msg.toolLogs ? { toolLogs: [...msg.toolLogs] } : {}),
+      ...(msg.toolCalls
+        ? { toolCalls: msg.toolCalls.map(cloneToolCall) }
+        : {}),
+    })),
     streamingText: s.streamingText,
     streamingThinking: s.streamingThinking,
     streamingLogs: [...s.streamingLogs],
+    streamingToolCalls: s.streamingToolCalls.map(cloneToolCall),
+    pendingQuestion: s.pendingQuestionWaiter
+      ? { ...s.pendingQuestionWaiter.question }
+      : null,
+    nextSteps: s.nextSteps.map((step) => ({ ...step })),
+    todos: s.todoStore.getSnapshot(),
+    backgroundCommands: s.bgCommandManager.list(),
     errorMessage: s.errorMessage,
     model,
     thinkingLevel: s.agentSession.thinkingLevel ?? "off",
@@ -260,7 +371,6 @@ async function resolveWorkbenchRepoDir(params: {
           { timeout: 15_000 }
         );
       } catch {
-        // Fallback workspace when demo repo URL is unreachable
         await fs.writeFile(
           path.join(tmpDir, "REPO_CONTEXT.md"),
           `# ${repo.name}\n\n- Repo ID: ${repo.id}\n- URL: ${repo.url}\n- Branch: ${repo.branch}\n`,
@@ -288,6 +398,7 @@ export async function createWorkbenchSession(params: {
   repoId?: string;
   customCwd?: string;
   selectedMcps?: string[];
+  disabledExtensions?: string[];
   openaiConfig?: OpenAIOverrideConfig;
   thinkingLevel?: string;
 }): Promise<WorkbenchSessionSnapshot> {
@@ -295,6 +406,11 @@ export async function createWorkbenchSession(params: {
   const owner = params.owner.trim() || "Admin";
   const selectedMcps = Array.isArray(params.selectedMcps)
     ? params.selectedMcps
+    : [];
+  const disabledExtensions = Array.isArray(params.disabledExtensions)
+    ? params.disabledExtensions.filter(
+        (id): id is string => typeof id === "string" && Boolean(id.trim())
+      )
     : [];
 
   const repoInfo = await resolveWorkbenchRepoDir({
@@ -335,6 +451,93 @@ export async function createWorkbenchSession(params: {
     await mcpManager.connectServers(configs, sources as never).catch(() => {});
   }
 
+  // Late-bound reference to the internal session once constructed
+  let sessionRef: InternalWorkbenchSession | null = null;
+  const touchSession = () => {
+    if (sessionRef) {
+      sessionRef.updatedAt = Date.now();
+    }
+  };
+
+  const todoStore = new TodoSessionStore();
+  const bgCommandManager = new BackgroundCommandManager(
+    repoInfo.cwd,
+    touchSession
+  );
+
+  const extBundle = buildWorkbenchExtensions(disabledExtensions, {
+    sessionId,
+    cwd: repoInfo.cwd,
+    todoStore,
+    bgCommandManager,
+    setNextSteps(steps) {
+      if (sessionRef) {
+        sessionRef.nextSteps = steps;
+        sessionRef.updatedAt = Date.now();
+      }
+    },
+    askUserQuestion(question, signal) {
+      return new Promise<UserQuestionSubmission>((resolve) => {
+        if (!sessionRef) {
+          resolve({
+            toolCallId: question.toolCallId,
+            answers: [],
+            cancelled: true,
+          });
+          return;
+        }
+        const targetCall = sessionRef.streamingToolCalls.find(
+          (tc) => tc.toolCallId === question.toolCallId
+        );
+        if (targetCall) {
+          targetCall.status = "waiting_input";
+        }
+
+        const finish = (submission: UserQuestionSubmission) => {
+          if (
+            sessionRef?.pendingQuestionWaiter?.question.toolCallId ===
+            question.toolCallId
+          ) {
+            sessionRef.pendingQuestionWaiter = null;
+          }
+          if (targetCall && targetCall.status === "waiting_input") {
+            targetCall.status = "running";
+          }
+          touchSession();
+          resolve(submission);
+        };
+
+        if (signal?.aborted) {
+          finish({
+            toolCallId: question.toolCallId,
+            answers: [],
+            cancelled: true,
+          });
+          return;
+        }
+
+        const onAbort = () => {
+          finish({
+            toolCallId: question.toolCallId,
+            answers: [],
+            cancelled: true,
+          });
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+
+        sessionRef.pendingQuestionWaiter = {
+          question,
+          resolve: (submission) => {
+            signal?.removeEventListener("abort", onAbort);
+            finish(submission);
+          },
+        };
+        touchSession();
+      });
+    },
+    onStateChange: touchSession,
+  });
+
   const { skills: discoveredSkills } = await discoverSkills(repoInfo.cwd);
   const hasOpenAIOverride = Boolean(
     params.openaiConfig?.apiKey?.trim() ||
@@ -349,6 +552,12 @@ export async function createWorkbenchSession(params: {
   const { session: agentSession } = await createAgentSession({
     cwd: repoInfo.cwd,
     skills: discoveredSkills,
+    ...(extBundle.factories.length > 0
+      ? { extensions: extBundle.factories }
+      : {}),
+    ...(extBundle.appendSystemPrompt
+      ? { appendSystemPrompt: extBundle.appendSystemPrompt }
+      : {}),
     ...(mcpManager ? { mcpManager, enableMCP: true } : {}),
     sessionManager: SessionManager.inMemory(repoInfo.cwd),
     telemetry: buildSessionTelemetryConfig({
@@ -384,11 +593,18 @@ export async function createWorkbenchSession(params: {
     repoUrl: repoInfo.repoUrl,
     cwd: repoInfo.cwd,
     selectedMcps,
+    enabledExtensions: extBundle.enabledIds,
+    disabledExtensions,
     status: "idle",
     messages: [],
     streamingText: "",
     streamingThinking: "",
     streamingLogs: [],
+    streamingToolCalls: [],
+    pendingQuestionWaiter: null,
+    nextSteps: [],
+    todoStore,
+    bgCommandManager,
     updatedAt: Date.now(),
     isTempDir: repoInfo.isTempDir,
     agentSession,
@@ -396,6 +612,7 @@ export async function createWorkbenchSession(params: {
     skills: skillsList,
     configuredMcps,
   };
+  sessionRef = internal;
 
   sessions.set(sessionId, internal);
   return toSnapshot(internal);
@@ -433,6 +650,64 @@ export function setWorkbenchThinkingLevel(
   return toSnapshot(s);
 }
 
+export function submitWorkbenchQuestionAnswer(
+  sessionId: string,
+  submission: UserQuestionSubmission
+): WorkbenchSessionSnapshot | null {
+  const s = sessions.get(sessionId);
+  if (!s) return null;
+  const waiter = s.pendingQuestionWaiter;
+  if (!waiter) {
+    throw new Error("当前没有等待回答的提问卡片");
+  }
+  if (
+    submission.toolCallId &&
+    submission.toolCallId !== waiter.question.toolCallId
+  ) {
+    throw new Error("提问卡片 ID 不匹配或已过期");
+  }
+  waiter.resolve({
+    ...submission,
+    toolCallId: waiter.question.toolCallId,
+  });
+  s.updatedAt = Date.now();
+  return toSnapshot(s);
+}
+
+export function addWorkbenchUserTodo(
+  sessionId: string,
+  title: string,
+  group?: string
+): WorkbenchSessionSnapshot | null {
+  const s = sessions.get(sessionId);
+  if (!s) return null;
+  s.todoStore.addItem({ title, origin: "user", group });
+  s.updatedAt = Date.now();
+  return toSnapshot(s);
+}
+
+export function removeWorkbenchTodo(
+  sessionId: string,
+  itemId: string
+): WorkbenchSessionSnapshot | null {
+  const s = sessions.get(sessionId);
+  if (!s) return null;
+  s.todoStore.removeItem(itemId);
+  s.updatedAt = Date.now();
+  return toSnapshot(s);
+}
+
+export function stopWorkbenchBackgroundCommand(
+  sessionId: string,
+  commandId: string
+): WorkbenchSessionSnapshot | null {
+  const s = sessions.get(sessionId);
+  if (!s) return null;
+  s.bgCommandManager.stop(commandId);
+  s.updatedAt = Date.now();
+  return toSnapshot(s);
+}
+
 export function sendWorkbenchMessage(
   sessionId: string,
   content: string
@@ -454,6 +729,8 @@ export function sendWorkbenchMessage(
   s.streamingText = "";
   s.streamingThinking = "";
   s.streamingLogs = [];
+  s.streamingToolCalls = [];
+  s.nextSteps = [];
   s.errorMessage = undefined;
   s.updatedAt = Date.now();
 
@@ -475,6 +752,54 @@ export function sendWorkbenchMessage(
       s.streamingLogs.push(
         `[工具] ${event.toolName}${detail ? `: ${detail}` : ""}`
       );
+      s.streamingToolCalls.push({
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        args: { ...args },
+        status: "running",
+        startedAt: Date.now(),
+      });
+      s.updatedAt = Date.now();
+    } else if (event.type === "tool_execution_update") {
+      const target = s.streamingToolCalls.find(
+        (tc) => tc.toolCallId === event.toolCallId
+      );
+      if (target) {
+        const partialText = extractToolResultText(event.partialResult);
+        if (partialText) target.resultText = partialText;
+        const partialDetails = extractToolDetails(event.partialResult);
+        if (partialDetails) target.details = partialDetails;
+        s.updatedAt = Date.now();
+      }
+    } else if (event.type === "tool_execution_end") {
+      const target = s.streamingToolCalls.find(
+        (tc) => tc.toolCallId === event.toolCallId
+      );
+      const endedAt = Date.now();
+      const resultText = extractToolResultText(event.result);
+      const details = extractToolDetails(event.result);
+      const isError = Boolean(event.isError);
+      if (target) {
+        target.status = isError ? "error" : "completed";
+        target.endedAt = endedAt;
+        target.durationMs = Math.max(0, endedAt - target.startedAt);
+        target.resultText = resultText;
+        if (details) target.details = details;
+        target.isError = isError;
+      } else {
+        s.streamingToolCalls.push({
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          args: {},
+          status: isError ? "error" : "completed",
+          startedAt: endedAt,
+          endedAt,
+          durationMs: 0,
+          resultText,
+          ...(details ? { details } : {}),
+          isError,
+        });
+      }
       s.updatedAt = Date.now();
     } else if (
       event.type === "message_end" &&
@@ -501,12 +826,18 @@ export function sendWorkbenchMessage(
           ? { thinking: s.streamingThinking.trim() }
           : {}),
         toolLogs: s.streamingLogs.length > 0 ? [...s.streamingLogs] : undefined,
+        toolCalls:
+          s.streamingToolCalls.length > 0
+            ? s.streamingToolCalls.map(cloneToolCall)
+            : undefined,
         createdAt: Date.now(),
       });
       s.status = lastErrorMessage && !s.streamingText.trim() ? "error" : "idle";
       s.errorMessage = lastErrorMessage;
       s.streamingText = "";
       s.streamingThinking = "";
+      s.streamingLogs = [];
+      s.streamingToolCalls = [];
       s.updatedAt = Date.now();
     })
     .catch((err) => {
@@ -522,10 +853,16 @@ export function sendWorkbenchMessage(
           ? { thinking: s.streamingThinking.trim() }
           : {}),
         toolLogs: s.streamingLogs.length > 0 ? [...s.streamingLogs] : undefined,
+        toolCalls:
+          s.streamingToolCalls.length > 0
+            ? s.streamingToolCalls.map(cloneToolCall)
+            : undefined,
         createdAt: Date.now(),
       });
       s.streamingText = "";
       s.streamingThinking = "";
+      s.streamingLogs = [];
+      s.streamingToolCalls = [];
       s.updatedAt = Date.now();
     });
 
@@ -537,6 +874,14 @@ export async function abortWorkbenchSession(
 ): Promise<WorkbenchSessionSnapshot | null> {
   const s = sessions.get(sessionId);
   if (!s) return null;
+  if (s.pendingQuestionWaiter) {
+    s.pendingQuestionWaiter.resolve({
+      toolCallId: s.pendingQuestionWaiter.question.toolCallId,
+      answers: [],
+      cancelled: true,
+    });
+    s.pendingQuestionWaiter = null;
+  }
   if (s.status === "running") {
     await s.agentSession
       .abort({ goalReason: "interrupted", reason: "Aborted by user" })
@@ -551,6 +896,15 @@ export async function closeWorkbenchSession(sessionId: string): Promise<boolean>
   const s = sessions.get(sessionId);
   if (!s) return false;
   sessions.delete(sessionId);
+  if (s.pendingQuestionWaiter) {
+    s.pendingQuestionWaiter.resolve({
+      toolCallId: s.pendingQuestionWaiter.question.toolCallId,
+      answers: [],
+      cancelled: true,
+    });
+    s.pendingQuestionWaiter = null;
+  }
+  s.bgCommandManager.dispose();
   await s.agentSession.dispose().catch(() => {});
   if (s.mcpManager) {
     await s.mcpManager.disconnectAll().catch(() => {});

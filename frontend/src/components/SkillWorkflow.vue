@@ -568,6 +568,30 @@
                         v-if="workbenchSession"
                         size="small"
                         plain
+                        @click="workbenchTodoDialogVisible = true"
+                      >
+                        任务清单 ({{ workbenchTodoCount }})
+                      </el-button>
+                      <el-button
+                        v-if="workbenchSession"
+                        size="small"
+                        :type="workbenchRunningBgCount > 0 ? 'primary' : 'default'"
+                        plain
+                        @click="workbenchBgDialogVisible = true"
+                      >
+                        后台命令 ({{ workbenchSession.backgroundCommands?.length || 0 }})
+                      </el-button>
+                      <el-button
+                        size="small"
+                        plain
+                        @click="workbenchExtDialogVisible = true"
+                      >
+                        扩展 ({{ enabledExtensionCount }}/{{ workbenchExtensionCatalog.length }})
+                      </el-button>
+                      <el-button
+                        v-if="workbenchSession"
+                        size="small"
+                        plain
                         @click="workbenchSkillsDialogVisible = true"
                       >
                         Skills ({{ workbenchSession.skills.length }})
@@ -656,7 +680,11 @@
                       <summary>思考过程</summary>
                       <pre class="chat-thinking-body">{{ msg.thinking }}</pre>
                     </details>
-                    <div v-if="msg.toolLogs && msg.toolLogs.length > 0" class="chat-tool-logs">
+                    <ToolCallsView
+                      v-if="msg.toolCalls && msg.toolCalls.length > 0"
+                      :tool-calls="msg.toolCalls"
+                    />
+                    <div v-else-if="msg.toolLogs && msg.toolLogs.length > 0" class="chat-tool-logs">
                       <div v-for="(log, idx) in msg.toolLogs" :key="idx" class="chat-tool-item">
                         {{ log }}
                       </div>
@@ -678,8 +706,12 @@
                       <summary>正在思考...</summary>
                       <pre class="chat-thinking-body">{{ workbenchSession.streamingThinking }}</pre>
                     </details>
+                    <ToolCallsView
+                      v-if="workbenchSession.streamingToolCalls && workbenchSession.streamingToolCalls.length > 0"
+                      :tool-calls="workbenchSession.streamingToolCalls"
+                    />
                     <div
-                      v-if="workbenchSession.streamingLogs.length > 0"
+                      v-else-if="workbenchSession.streamingLogs.length > 0"
                       class="chat-tool-logs"
                     >
                       <div
@@ -698,6 +730,27 @@
                   </div>
                 </template>
               </div>
+
+              <!-- 交互式提问停靠栏 (ask_user_question) -->
+              <QuestionDock
+                v-if="workbenchSession?.pendingQuestion"
+                :pending-question="workbenchSession.pendingQuestion"
+                :submitting="workbenchSubmittingAnswer"
+                @submit="handleSubmitQuestionAnswer"
+              />
+
+              <!-- 下一步快捷建议 Chips (suggest_next_steps) -->
+              <NextStepsBar
+                v-if="
+                  workbenchSession &&
+                  !disabledWorkbenchExtensions.includes('next-steps') &&
+                  workbenchSession.nextSteps &&
+                  workbenchSession.nextSteps.length > 0
+                "
+                :steps="workbenchSession.nextSteps"
+                :disabled="workbenchSession.status === 'running' || workbenchSending"
+                @select="handleSelectNextStep"
+              />
 
               <!-- Thinkrail 风格 Composer 控制栏：模型、思考等级、Skills、MCP -->
               <div class="workbench-composer-toolbar">
@@ -1113,6 +1166,30 @@
         />
       </div>
     </el-dialog>
+    <!-- 会话任务清单弹窗 (pi-todos) -->
+    <TodoPanel
+      v-if="workbenchSession"
+      v-model:visible="workbenchTodoDialogVisible"
+      :todos="workbenchSession.todos"
+      @add="handleAddWorkbenchTodo"
+      @remove="handleRemoveWorkbenchTodo"
+    />
+
+    <!-- 受控后台命令弹窗 (background_command) -->
+    <BackgroundCommandsPanel
+      v-if="workbenchSession"
+      v-model:visible="workbenchBgDialogVisible"
+      :commands="workbenchSession.backgroundCommands || []"
+      @stop="handleStopWorkbenchBgCommand"
+    />
+
+    <!-- 工具扩展开关弹窗 -->
+    <ExtensionsDialog
+      v-model:visible="workbenchExtDialogVisible"
+      :extensions="workbenchExtensionCatalog"
+      :disabled-extensions="disabledWorkbenchExtensions"
+      @update:disabled-extensions="handleUpdateDisabledExtensions"
+    />
   </div>
 </template>
 
@@ -1121,9 +1198,16 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { Marked } from "marked";
 import hljs from "highlight.js";
+import BackgroundCommandsPanel from "./workbench/BackgroundCommandsPanel.vue";
+import ExtensionsDialog from "./workbench/ExtensionsDialog.vue";
+import NextStepsBar from "./workbench/NextStepsBar.vue";
+import QuestionDock from "./workbench/QuestionDock.vue";
+import TodoPanel from "./workbench/TodoPanel.vue";
+import ToolCallsView from "./workbench/ToolCallsView.vue";
 import {
   abortGenerationJob,
   abortWorkbenchSession,
+  addWorkbenchTodo,
   closeWorkbenchSession,
   createUserMcp,
   createWorkbenchSession,
@@ -1132,15 +1216,19 @@ import {
   fetchGenerationJob,
   fetchSkillDetail,
   fetchUserMcps,
+  fetchWorkbenchExtensions,
   fetchWorkbenchSession,
   fetchWorkbenchSessions,
   getSkillDownloadUrl,
   publishSkill,
+  removeWorkbenchTodo,
   restartGenerationJob,
   runTestPipeline,
   sendWorkbenchMessage,
   setWorkbenchThinking,
   startGenerationJob,
+  stopWorkbenchBgCommand,
+  submitWorkbenchQuestionAnswer,
   updateSkill,
   type AppCatalogItem,
   type GenerationJobSnapshot,
@@ -1150,6 +1238,8 @@ import {
   type RepoPipelineRun,
   type SkillFileEntry,
   type UserMcpServer,
+  type UserQuestionSubmission,
+  type WorkbenchExtensionDescriptor,
   type WorkbenchSessionSnapshot,
 } from "../api";
 
@@ -1580,6 +1670,119 @@ function getCustomOpenaiPayload(): OpenAIOverrideConfig | undefined {
   };
 }
 
+const EXTENSIONS_STORAGE_KEY = "workbench_disabled_extensions_v1";
+const workbenchTodoDialogVisible = ref(false);
+const workbenchBgDialogVisible = ref(false);
+const workbenchExtDialogVisible = ref(false);
+const workbenchSubmittingAnswer = ref(false);
+const workbenchExtensionCatalog = ref<WorkbenchExtensionDescriptor[]>([]);
+const disabledWorkbenchExtensions = ref<string[]>([]);
+
+const workbenchTodoCount = computed(() => {
+  const todos = workbenchSession.value?.todos;
+  if (!todos) return 0;
+  const groupCount = todos.groups.reduce((sum, g) => sum + g.items.length, 0);
+  return groupCount + todos.loose.length;
+});
+
+const workbenchRunningBgCount = computed(() => {
+  return (workbenchSession.value?.backgroundCommands ?? []).filter(
+    (c) => c.status === "running"
+  ).length;
+});
+
+const enabledExtensionCount = computed(() => {
+  const disabled = new Set(disabledWorkbenchExtensions.value);
+  return workbenchExtensionCatalog.value.filter((ext) => !disabled.has(ext.id))
+    .length;
+});
+
+function loadSavedDisabledExtensions() {
+  try {
+    const raw = localStorage.getItem(EXTENSIONS_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      disabledWorkbenchExtensions.value = parsed.filter(
+        (id): id is string => typeof id === "string"
+      );
+    }
+  } catch {
+    // Ignore invalid storage
+  }
+}
+
+function handleUpdateDisabledExtensions(next: string[]) {
+  disabledWorkbenchExtensions.value = next;
+  localStorage.setItem(EXTENSIONS_STORAGE_KEY, JSON.stringify(next));
+}
+
+async function handleSubmitQuestionAnswer(payload: UserQuestionSubmission) {
+  if (!workbenchSession.value) return;
+  workbenchSubmittingAnswer.value = true;
+  try {
+    const { session } = await submitWorkbenchQuestionAnswer(
+      workbenchSession.value.sessionId,
+      payload
+    );
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+    beginWorkbenchPolling(session.sessionId);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "提交回答失败");
+  } finally {
+    workbenchSubmittingAnswer.value = false;
+  }
+}
+
+async function handleSelectNextStep(prompt: string) {
+  workbenchInput.value = prompt;
+  await handleSendWorkbenchMessage();
+}
+
+async function handleAddWorkbenchTodo(title: string) {
+  if (!workbenchSession.value) return;
+  try {
+    const { session } = await addWorkbenchTodo(
+      workbenchSession.value.sessionId,
+      { title }
+    );
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "添加待办失败");
+  }
+}
+
+async function handleRemoveWorkbenchTodo(itemId: string) {
+  if (!workbenchSession.value) return;
+  try {
+    const { session } = await removeWorkbenchTodo(
+      workbenchSession.value.sessionId,
+      itemId
+    );
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "删除待办失败");
+  }
+}
+
+async function handleStopWorkbenchBgCommand(commandId: string) {
+  if (!workbenchSession.value) return;
+  try {
+    const { session } = await stopWorkbenchBgCommand(
+      workbenchSession.value.sessionId,
+      commandId
+    );
+    workbenchSession.value = session;
+    upsertWorkbenchSessionInList(session);
+    ElMessage.info("已请求停止后台命令");
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "停止后台命令失败");
+  }
+}
+
 async function handleStartWorkbench(): Promise<WorkbenchSessionSnapshot | null> {
   workbenchInitializing.value = true;
   stopWorkbenchPolling();
@@ -1589,6 +1792,7 @@ async function handleStartWorkbench(): Promise<WorkbenchSessionSnapshot | null> 
       repoId: workbenchRepoId.value || undefined,
       customCwd: workbenchCustomCwd.value.trim() || undefined,
       selectedMcps: selectedMcps.value,
+      disabledExtensions: disabledWorkbenchExtensions.value,
       openaiConfig: getCustomOpenaiPayload(),
       thinkingLevel: workbenchThinkingLevel.value,
     });
@@ -1766,6 +1970,12 @@ function resetOpenaiConfig() {
 
 onMounted(async () => {
   loadSavedOpenaiConfig();
+  loadSavedDisabledExtensions();
+  fetchWorkbenchExtensions()
+    .then((res) => {
+      workbenchExtensionCatalog.value = res.extensions || [];
+    })
+    .catch(() => {});
   try {
     const catalog = await fetchCatalog();
     catalogApps.value = catalog.apps;

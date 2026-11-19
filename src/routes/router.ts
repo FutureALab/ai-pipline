@@ -33,12 +33,17 @@ import {
 } from "../controllers/traceController.js";
 import {
   abortWorkbenchSessionHandler,
+  addWorkbenchTodoHandler,
   closeWorkbenchSessionHandler,
   createWorkbenchSessionHandler,
   getWorkbenchSessionHandler,
+  listWorkbenchExtensionsHandler,
   listWorkbenchSessionsHandler,
+  removeWorkbenchTodoHandler,
   sendWorkbenchMessageHandler,
   setWorkbenchThinkingHandler,
+  stopWorkbenchBgCommandHandler,
+  submitWorkbenchQuestionAnswerHandler,
 } from "../controllers/workbenchController.js";
 import { getDbDriver, isDbConnected } from "../db/database.js";
 import { isRedisConnected } from "../db/redis.js";
@@ -90,6 +95,9 @@ export async function routeRequest(
       return await deleteMcpHandler(res, mcpDeleteMatch[1], url);
     }
 
+    if (method === "GET" && url.pathname === "/api/workbench/extensions") {
+      return await listWorkbenchExtensionsHandler(res);
+    }
     if (method === "GET" && url.pathname === "/api/workbench/sessions") {
       return await listWorkbenchSessionsHandler(res, url);
     }
@@ -113,6 +121,42 @@ export async function routeRequest(
     );
     if (method === "POST" && wbThinkingMatch) {
       return await setWorkbenchThinkingHandler(req, res, wbThinkingMatch[1]);
+    }
+    const wbQuestionAnswerMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/question\/answer$/
+    );
+    if (method === "POST" && wbQuestionAnswerMatch) {
+      return await submitWorkbenchQuestionAnswerHandler(
+        req,
+        res,
+        wbQuestionAnswerMatch[1]
+      );
+    }
+    const wbTodosMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/todos$/
+    );
+    if (method === "POST" && wbTodosMatch) {
+      return await addWorkbenchTodoHandler(req, res, wbTodosMatch[1]);
+    }
+    const wbTodoItemMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/todos\/([^/]+)$/
+    );
+    if (method === "DELETE" && wbTodoItemMatch) {
+      return await removeWorkbenchTodoHandler(
+        res,
+        wbTodoItemMatch[1],
+        wbTodoItemMatch[2]
+      );
+    }
+    const wbBgStopMatch = url.pathname.match(
+      /^\/api\/workbench\/sessions\/([^/]+)\/bg-commands\/([^/]+)\/stop$/
+    );
+    if (method === "POST" && wbBgStopMatch) {
+      return await stopWorkbenchBgCommandHandler(
+        res,
+        wbBgStopMatch[1],
+        wbBgStopMatch[2]
+      );
     }
     const wbSessionMatch = url.pathname.match(
       /^\/api\/workbench\/sessions\/([^/]+)$/
