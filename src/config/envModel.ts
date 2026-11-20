@@ -21,8 +21,116 @@ export interface EnvSessionModelOptions {
 const PLACEHOLDER_KEY = "sk-your-api-key-here";
 const ENV_PROVIDER_NAME = "openai-env";
 
+export interface OpenAIModelItem {
+  id: string;
+  ownedBy?: string;
+}
+
 function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/, "");
+}
+
+function buildModelsEndpoint(baseUrl: string): string {
+  const clean = normalizeBaseUrl(baseUrl);
+  if (/\/models$/i.test(clean)) return clean;
+  return `${clean}/models`;
+}
+
+/**
+ * Fetch available models from an OpenAI-compatible `/models` endpoint.
+ */
+export async function fetchOpenAIAvailableModels(params: {
+  baseUrl?: string;
+  apiKey?: string;
+  apiMode?: OpenAIApiMode;
+}): Promise<{ baseUrl: string; models: OpenAIModelItem[] }> {
+  const mode: OpenAIApiMode =
+    params.apiMode === "responses" ? "responses" : "chat";
+  const modeKey =
+    mode === "responses"
+      ? process.env.OPENAI_RESPONSES_API_KEY
+      : process.env.OPENAI_CHAT_API_KEY;
+  const apiKey =
+    params.apiKey?.trim() ||
+    modeKey?.trim() ||
+    process.env.OPENAI_API_KEY?.trim() ||
+    "";
+
+  if (!apiKey || apiKey === PLACEHOLDER_KEY) {
+    throw new Error("请先填写有效的 API Key");
+  }
+
+  const modeBaseUrl =
+    mode === "responses"
+      ? process.env.OPENAI_RESPONSES_BASE_URL
+      : process.env.OPENAI_CHAT_BASE_URL;
+  const baseUrl = normalizeBaseUrl(
+    params.baseUrl?.trim() ||
+      modeBaseUrl?.trim() ||
+      process.env.OPENAI_BASE_URL?.trim() ||
+      "https://api.openai.com/v1"
+  );
+
+  if (!/^https?:\/\/.+/i.test(baseUrl)) {
+    throw new Error("Base URL 必须以 http:// 或 https:// 开头");
+  }
+
+  const endpoint = buildModelsEndpoint(baseUrl);
+  const res = await fetch(endpoint, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    const snippet = errBody.trim().slice(0, 200);
+    throw new Error(
+      `拉取 /models 失败 (HTTP ${res.status})${snippet ? `: ${snippet}` : ""}`
+    );
+  }
+
+  const payload = (await res.json()) as unknown;
+  const rawList: unknown[] = Array.isArray(payload)
+    ? payload
+    : payload &&
+        typeof payload === "object" &&
+        Array.isArray((payload as Record<string, unknown>).data)
+      ? ((payload as Record<string, unknown>).data as unknown[])
+      : payload &&
+          typeof payload === "object" &&
+          Array.isArray((payload as Record<string, unknown>).models)
+        ? ((payload as Record<string, unknown>).models as unknown[])
+        : [];
+
+  const seen = new Set<string>();
+  const models: OpenAIModelItem[] = [];
+  for (const item of rawList) {
+    if (typeof item === "string") {
+      const id = item.trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        models.push({ id });
+      }
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const obj = item as Record<string, unknown>;
+    const id = String(obj.id ?? obj.name ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const ownedBy =
+      typeof obj.owned_by === "string" && obj.owned_by.trim()
+        ? obj.owned_by.trim()
+        : undefined;
+    models.push({ id, ...(ownedBy ? { ownedBy } : {}) });
+  }
+
+  models.sort((a, b) => a.id.localeCompare(b.id));
+  return { baseUrl, models };
 }
 
 /**

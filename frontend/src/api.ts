@@ -189,6 +189,108 @@ export interface OpenAIOverrideConfig {
   apiMode?: "chat" | "responses";
 }
 
+export interface OpenAIModelItem {
+  id: string;
+  ownedBy?: string;
+}
+
+function parseOpenAIModelsPayload(payload: unknown): OpenAIModelItem[] {
+  const rawList: unknown[] = Array.isArray(payload)
+    ? payload
+    : payload &&
+        typeof payload === "object" &&
+        Array.isArray((payload as Record<string, unknown>).data)
+      ? ((payload as Record<string, unknown>).data as unknown[])
+      : payload &&
+          typeof payload === "object" &&
+          Array.isArray((payload as Record<string, unknown>).models)
+        ? ((payload as Record<string, unknown>).models as unknown[])
+        : [];
+
+  const seen = new Set<string>();
+  const models: OpenAIModelItem[] = [];
+  for (const item of rawList) {
+    if (typeof item === "string") {
+      const id = item.trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        models.push({ id });
+      }
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const obj = item as Record<string, unknown>;
+    const id = String(obj.id ?? obj.name ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const ownedBy =
+      typeof obj.owned_by === "string" && obj.owned_by.trim()
+        ? obj.owned_by.trim()
+        : undefined;
+    models.push({ id, ...(ownedBy ? { ownedBy } : {}) });
+  }
+  models.sort((a, b) => a.id.localeCompare(b.id));
+  return models;
+}
+
+export async function fetchOpenAIModels(payload: {
+  baseUrl?: string;
+  apiKey?: string;
+  apiMode?: "chat" | "responses";
+}): Promise<{ baseUrl: string; models: OpenAIModelItem[] }> {
+  const apiKey = payload.apiKey?.trim() || "";
+  const cleanBase = (payload.baseUrl?.trim() || "https://api.openai.com/v1").replace(
+    /\/+$/,
+    ""
+  );
+
+  // 1. Direct OpenAI protocol call: GET <baseUrl>/models with Bearer API Key
+  if (apiKey && /^https?:\/\/.+/i.test(cleanBase)) {
+    const endpoint = /\/models$/i.test(cleanBase)
+      ? cleanBase
+      : `${cleanBase}/models`;
+    try {
+      const res = await fetch(endpoint, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+        },
+      });
+      if (res.ok) {
+        const data = (await res.json()) as unknown;
+        return {
+          baseUrl: cleanBase,
+          models: parseOpenAIModelsPayload(data),
+        };
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw new Error("API Key 无效或无权限访问模型列表，请检查后重试");
+      }
+      throw new Error(
+        `模型列表获取失败（HTTP ${res.status}），请检查 Base URL 是否正确或直接手动输入模型名`
+      );
+    } catch (directErr) {
+      // Only fall back to backend proxy on network/CORS error (TypeError)
+      if (!(directErr instanceof TypeError)) {
+        throw directErr;
+      }
+    }
+  }
+
+  // 2. Fallback to backend proxy when CORS blocks direct browser call or using server .env key
+  try {
+    return await request("/api/openai/models", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    throw new Error(
+      "未能自动获取可用模型列表，请检查 Base URL 与 API Key，或直接手动输入模型名"
+    );
+  }
+}
+
 export function startGenerationJob(payload: {
   skillName?: string;
   description?: string;

@@ -1041,23 +1041,72 @@
     <el-dialog
       v-model="openaiDialogVisible"
       title="OpenAI API Key 与模型设置"
-      width="480px"
+      width="500px"
     >
       <el-form label-position="top">
+        <el-form-item label="Base URL（兼容 OpenAI 接口地址）">
+          <el-input
+            v-model="openaiDraft.baseUrl"
+            placeholder="例如：https://api.openai.com/v1（留空使用默认）"
+            @blur="handleOpenaiCredsBlur"
+          />
+        </el-form-item>
         <el-form-item label="OpenAI API Key">
           <el-input
             v-model="openaiDraft.apiKey"
             type="password"
             show-password
             placeholder="sk-...（留空则使用后端默认 .env 配置）"
+            @blur="handleOpenaiCredsBlur"
           />
         </el-form-item>
-        <el-form-item label="模型名称（Model）">
-          <el-input
+        <el-form-item>
+          <template #label>
+            <div class="model-select-label-row">
+              <span>模型名称（Model）</span>
+              <el-button
+                link
+                type="primary"
+                size="small"
+                :loading="loadingOpenaiModels"
+                @click="loadOpenaiModels(true)"
+              >
+                刷新可用模型 (/models)
+              </el-button>
+            </div>
+          </template>
+          <el-select
             v-model="openaiDraft.modelName"
-            placeholder="例如：gpt-4o、gpt-4.1、o3-mini、deepseek-chat"
-          />
-          <div class="model-quick-picks">
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            :loading="loadingOpenaiModels"
+            placeholder="填写 Base URL 与 API Key 后自动加载，或直接输入模型名"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="m in openaiModels"
+              :key="m.id"
+              :label="m.id"
+              :value="m.id"
+            >
+              <div class="model-option-row">
+                <span>{{ m.id }}</span>
+                <span v-if="m.ownedBy" class="model-option-owner">{{ m.ownedBy }}</span>
+              </div>
+            </el-option>
+          </el-select>
+          <div v-if="loadingOpenaiModels" class="model-status-hint">
+            正在从 /models 拉取可用模型列表...
+          </div>
+          <div v-else-if="openaiModelsError" class="model-status-hint error">
+            {{ openaiModelsError }}
+          </div>
+          <div v-else-if="openaiModels.length > 0" class="model-status-hint success">
+            已从 {{ openaiModelsSourceUrl || "当前网关" }} 获取 {{ openaiModels.length }} 个可用模型
+          </div>
+          <div v-if="openaiModels.length === 0" class="model-quick-picks">
             <span class="quick-label">常用：</span>
             <el-tag
               v-for="m in ['gpt-4o', 'gpt-4.1', 'o3-mini', 'deepseek-chat']"
@@ -1069,12 +1118,6 @@
               {{ m }}
             </el-tag>
           </div>
-        </el-form-item>
-        <el-form-item label="Base URL（可选，兼容 OpenAI 接口地址）">
-          <el-input
-            v-model="openaiDraft.baseUrl"
-            placeholder="例如：https://api.openai.com/v1（留空使用默认）"
-          />
         </el-form-item>
         <el-form-item label="API 模式">
           <el-radio-group v-model="openaiDraft.apiMode" size="small">
@@ -1197,7 +1240,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { ElButton, ElMessage, ElNotification } from "element-plus";
 import { Marked } from "marked";
 import hljs from "highlight.js";
@@ -1217,6 +1260,7 @@ import {
   deleteUserMcp,
   fetchCatalog,
   fetchGenerationJob,
+  fetchOpenAIModels,
   fetchSkillDetail,
   fetchUserMcps,
   fetchWorkbenchExtensions,
@@ -1236,6 +1280,7 @@ import {
   type AppCatalogItem,
   type GenerationJobSnapshot,
   type GenerationJobStatus,
+  type OpenAIModelItem,
   type OpenAIOverrideConfig,
   type RepoCatalogItem,
   type RepoPipelineRun,
@@ -1353,6 +1398,13 @@ const openaiDraft = reactive<OpenAIOverrideConfig>({
   baseUrl: "",
   apiMode: "chat",
 });
+const openaiModels = ref<OpenAIModelItem[]>([]);
+const loadingOpenaiModels = ref(false);
+const openaiModelsError = ref("");
+const openaiModelsSourceUrl = ref("");
+let openaiModelsRequestSeq = 0;
+let lastFetchedModelsKey = "";
+let openaiModelsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 const hasCustomOpenAI = computed(() =>
   Boolean(
     openaiConfig.apiKey?.trim() ||
@@ -2027,12 +2079,97 @@ function loadSavedOpenaiConfig() {
   }
 }
 
+async function loadOpenaiModels(force = false) {
+  const apiKey = openaiDraft.apiKey?.trim() || "";
+  const baseUrl = openaiDraft.baseUrl?.trim() || "";
+  const apiMode = openaiDraft.apiMode === "responses" ? "responses" : "chat";
+
+  if (!force && (!apiKey || (baseUrl && !/^https?:\/\/.+/i.test(baseUrl)))) {
+    return;
+  }
+
+  const cacheKey = `${baseUrl}|${apiKey}|${apiMode}`;
+  if (!force && cacheKey === lastFetchedModelsKey && openaiModels.value.length > 0) {
+    return;
+  }
+
+  const seq = ++openaiModelsRequestSeq;
+  loadingOpenaiModels.value = true;
+  openaiModelsError.value = "";
+  try {
+    const res = await fetchOpenAIModels({
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      apiMode,
+    });
+    if (seq !== openaiModelsRequestSeq) return;
+    openaiModels.value = res.models;
+    openaiModelsSourceUrl.value = res.baseUrl;
+    lastFetchedModelsKey = cacheKey;
+    if (
+      res.models.length > 0 &&
+      !openaiDraft.modelName?.trim()
+    ) {
+      openaiDraft.modelName = res.models[0].id;
+    }
+  } catch (err) {
+    if (seq !== openaiModelsRequestSeq) return;
+    openaiModels.value = [];
+    openaiModelsSourceUrl.value = "";
+    const msg =
+      err instanceof Error && err.message && err.message !== "Not Found"
+        ? err.message
+        : "未能自动获取可用模型列表，请检查 Base URL 与 API Key，或直接手动输入模型名";
+    openaiModelsError.value = msg;
+    if (force) {
+      ElMessage.warning(msg);
+    }
+  } finally {
+    if (seq === openaiModelsRequestSeq) {
+      loadingOpenaiModels.value = false;
+    }
+  }
+}
+
+function handleOpenaiCredsBlur() {
+  if (openaiModelsDebounceTimer) {
+    clearTimeout(openaiModelsDebounceTimer);
+    openaiModelsDebounceTimer = null;
+  }
+  const apiKey = openaiDraft.apiKey?.trim() || "";
+  const baseUrl = openaiDraft.baseUrl?.trim() || "";
+  if (apiKey && (!baseUrl || /^https?:\/\/.+/i.test(baseUrl))) {
+    void loadOpenaiModels(false);
+  }
+}
+
+watch(
+  () => [openaiDialogVisible.value, openaiDraft.baseUrl, openaiDraft.apiKey] as const,
+  ([visible, baseUrl, apiKey]) => {
+    if (openaiModelsDebounceTimer) {
+      clearTimeout(openaiModelsDebounceTimer);
+      openaiModelsDebounceTimer = null;
+    }
+    if (!visible) return;
+    const cleanKey = (apiKey || "").trim();
+    const cleanUrl = (baseUrl || "").trim();
+    if (!cleanKey || (cleanUrl && !/^https?:\/\/.+/i.test(cleanUrl))) return;
+    openaiModelsDebounceTimer = setTimeout(() => {
+      void loadOpenaiModels(false);
+    }, 600);
+  }
+);
+
 function openOpenaiDialog() {
   openaiDraft.apiKey = openaiConfig.apiKey || "";
   openaiDraft.modelName = openaiConfig.modelName || "";
   openaiDraft.baseUrl = openaiConfig.baseUrl || "";
   openaiDraft.apiMode = openaiConfig.apiMode || "chat";
+  openaiModelsError.value = "";
   openaiDialogVisible.value = true;
+  if (openaiDraft.apiKey.trim()) {
+    void loadOpenaiModels(false);
+  }
 }
 
 function saveOpenaiConfig() {
@@ -2749,6 +2886,42 @@ async function handlePublish() {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+.model-select-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.model-option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.model-option-owner {
+  font-size: 11px;
+  color: #909399;
+}
+
+.model-status-hint {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.45;
+}
+
+.model-status-hint.success {
+  color: #67c23a;
+}
+
+.model-status-hint.error {
+  color: #f56c6c;
 }
 
 .model-quick-picks {

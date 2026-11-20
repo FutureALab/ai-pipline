@@ -1,4 +1,5 @@
 import type http from "node:http";
+import { fetchOpenAIAvailableModels } from "../config/envModel.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import {
   abortWorkbenchSession,
@@ -15,6 +16,31 @@ import {
   submitWorkbenchQuestionAnswer,
 } from "../services/workbenchService.js";
 import type { UserQuestionAnswerItem } from "../workbench/types.js";
+
+export async function listOpenAIModelsHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  const body = await readJsonBody(req);
+  const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : undefined;
+  const apiKey = typeof body.apiKey === "string" ? body.apiKey : undefined;
+  const apiMode =
+    body.apiMode === "responses" || body.apiMode === "chat"
+      ? (body.apiMode as "chat" | "responses")
+      : undefined;
+
+  try {
+    const result = await fetchOpenAIAvailableModels({
+      baseUrl,
+      apiKey,
+      apiMode,
+    });
+    sendJson(res, 200, result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    sendJson(res, 400, { error: message });
+  }
+}
 
 export async function listWorkbenchExtensionsHandler(
   res: http.ServerResponse

@@ -40,6 +40,7 @@ import {
   closeWorkbenchSessionHandler,
   createWorkbenchSessionHandler,
   getWorkbenchSessionHandler,
+  listOpenAIModelsHandler,
   listWorkbenchExtensionsHandler,
   listWorkbenchSessionsHandler,
   removeWorkbenchTodoHandler,
@@ -96,6 +97,10 @@ export async function routeRequest(
     const mcpDeleteMatch = url.pathname.match(/^\/api\/mcps\/([^/]+)$/);
     if (method === "DELETE" && mcpDeleteMatch) {
       return await deleteMcpHandler(res, mcpDeleteMatch[1], url);
+    }
+
+    if (method === "POST" && url.pathname === "/api/openai/models") {
+      return await listOpenAIModelsHandler(req, res);
     }
 
     if (method === "GET" && url.pathname === "/api/workbench/extensions") {
