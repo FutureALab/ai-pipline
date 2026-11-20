@@ -260,6 +260,15 @@ export async function runSkillHandler(
 
   // Batch Jenkins execution mode when apps & repos are passed from frontend
   if (apps.length > 0 || repos.length > 0 || !cwd) {
+    const existing = await getSkillCard(skillName);
+    if (!existing) {
+      return sendJson(res, 404, { error: `Skill "${skillName}" 不存在` });
+    }
+    if (existing.card.status !== "published") {
+      return sendJson(res, 400, {
+        error: "只有已发布的 Skill 才能直接使用，请先完成测试并发布该 Skill",
+      });
+    }
     if (apps.length === 0) {
       return sendJson(res, 400, { error: "请至少选择 1 个相关应用" });
     }

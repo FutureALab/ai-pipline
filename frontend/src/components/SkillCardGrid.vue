@@ -48,7 +48,7 @@
                 </el-tag>
                 <el-popover
                   placement="bottom-end"
-                  :width="160"
+                  :width="196"
                   trigger="click"
                   :teleported="true"
                 >
@@ -65,11 +65,26 @@
                   <div class="card-more-menu" @click.stop>
                     <button
                       type="button"
-                      class="more-menu-item"
+                      :class="[
+                        'more-menu-item',
+                        { disabled: skill.status !== 'published' },
+                      ]"
+                      :disabled="skill.status !== 'published'"
+                      :title="
+                        skill.status === 'published'
+                          ? '直接使用 Skill'
+                          : '仅已发布的 Skill 可直接使用'
+                      "
                       @click="openRunSkillDialog(skill)"
                     >
                       <el-icon><VideoPlay /></el-icon>
-                      <span>直接使用 Skill</span>
+                      <span>
+                        {{
+                          skill.status === "published"
+                            ? "直接使用 Skill"
+                            : "直接使用 Skill（未发布）"
+                        }}
+                      </span>
                     </button>
                     <button
                       type="button"
@@ -719,6 +734,10 @@ function startRunPolling(skillName: string) {
 }
 
 async function openRunSkillDialog(skill: SkillCardRecord) {
+  if (skill.status !== "published") {
+    ElMessage.warning("只有已发布的 Skill 才能直接使用，请先完成测试并发布");
+    return;
+  }
   runTargetSkill.value = skill;
   runForm.apps = [...(skill.selectedApps ?? [])];
   runForm.repos = [...(skill.selectedRepos ?? [])];
@@ -939,6 +958,7 @@ function formatDate(iso: string): string {
   background: transparent;
   color: #303133;
   font-size: 13px;
+  white-space: nowrap;
   cursor: pointer;
   text-align: left;
   transition: background 0.15s ease;
@@ -946,6 +966,17 @@ function formatDate(iso: string): string {
 .more-menu-item:hover {
   background: #ecf5ff;
   color: #409eff;
+}
+.more-menu-item.disabled,
+.more-menu-item:disabled {
+  color: #9ca3af;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.more-menu-item.disabled:hover,
+.more-menu-item:disabled:hover {
+  background: transparent;
+  color: #9ca3af;
 }
 .more-menu-item.danger {
   color: #f56c6c;
