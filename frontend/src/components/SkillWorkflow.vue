@@ -2463,6 +2463,11 @@ function startJenkinsLogSync() {
       }
       if (!testing.value && detail.card.status !== "testing") {
         stopJenkinsLogSync();
+        if (detail.card.status === "test_passed") {
+          ElMessage.success("10 个版本库流水线全部测试成功，可以点击发布了！");
+        } else if (detail.card.status === "test_failed") {
+          ElMessage.error("部分测试流水线失败，请查看控制台日志");
+        }
       }
     } catch {
       // Ignore transient polling errors
@@ -2481,6 +2486,7 @@ async function handleRunPipeline() {
   }
 
   testing.value = true;
+  let keepPolling = false;
   startJenkinsLogSync();
   try {
     const res = await runTestPipeline(form.skillName, {
@@ -2492,7 +2498,12 @@ async function handleRunPipeline() {
     if (res.pipelineRuns.length > 0) {
       activeLogRepoId.value = res.pipelineRuns[0].repoId;
     }
-    if (res.allPassed) {
+    if (res.card.status === "testing") {
+      keepPolling = true;
+      ElMessage.success(
+        `已并发提交 ${res.pipelineRuns.length} 个 Jenkins 任务，正在实时同步控制台日志...`
+      );
+    } else if (res.allPassed) {
       ElMessage.success("10 个版本库流水线全部测试成功，可以点击发布了！");
     } else {
       ElMessage.error("部分测试流水线失败，请查看控制台日志");
@@ -2501,7 +2512,9 @@ async function handleRunPipeline() {
     ElMessage.error(err instanceof Error ? err.message : "流水线执行失败");
   } finally {
     testing.value = false;
-    stopJenkinsLogSync();
+    if (!keepPolling) {
+      stopJenkinsLogSync();
+    }
   }
 }
 

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { closeDatabase, initDatabase } from "../src/db/database.js";
 import type { EmbeddedSkillPackage } from "../src/generated/embeddedSkills.js";
@@ -68,6 +69,13 @@ const GENERATED_FILE_PATH = path.resolve(
   "src/generated/embeddedSkills.ts"
 );
 
+const NATIVES_PKG_DIR = path.resolve(
+  process.cwd(),
+  "node_modules/@oh-my-pi/pi-natives"
+);
+const NATIVES_NATIVE_DIR = path.join(NATIVES_PKG_DIR, "native");
+const EMBEDDED_ADDON_JS_PATH = path.join(NATIVES_NATIVE_DIR, "embedded-addon.js");
+
 const DEFAULT_GENERATED_STUB = `import type { SkillFileEntry } from "../types/skill.js";
 
 export interface EmbeddedSkillPackage {
@@ -80,6 +88,108 @@ export interface EmbeddedSkillPackage {
 // Populated automatically by scripts/build-binaries.ts during binary compilation.
 export const EMBEDDED_SKILLS: readonly EmbeddedSkillPackage[] = [];
 `;
+
+function readNativesVersion(): string {
+  const pkgPath = path.join(NATIVES_PKG_DIR, "package.json");
+  const raw = fs.readFileSync(pkgPath, "utf-8");
+  const parsed = JSON.parse(raw) as { version?: string };
+  if (!parsed.version) {
+    throw new Error(`Could not determine @oh-my-pi/pi-natives version from ${pkgPath}`);
+  }
+  return parsed.version;
+}
+
+function listNodeFilesInDir(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith(".node"))
+    .sort()
+    .map((f) => path.join(dir, f));
+}
+
+function inferNativeVariant(filename: string): "modern" | "baseline" | "default" {
+  if (filename.includes("-modern.")) return "modern";
+  if (filename.includes("-baseline.")) return "baseline";
+  return "default";
+}
+
+async function ensureNativeAddonFiles(
+  target: BuildTarget,
+  version: string
+): Promise<string[]> {
+  const pkgDir = path.resolve(process.cwd(), "node_modules", target.nativePkg);
+  let nodeFiles = listNodeFilesInDir(pkgDir);
+  if (nodeFiles.length > 0) {
+    return nodeFiles;
+  }
+
+  console.log(
+    `[BUILD] Native addon for ${target.name} not found locally; downloading ${target.nativePkg}@${version}...`
+  );
+  await fsp.mkdir(pkgDir, { recursive: true });
+
+  const pkgBaseName = target.nativePkg.split("/")[1]; // e.g. pi-natives-linux-arm64
+  const npmRegistry = (
+    process.env.NPM_REGISTRY_URL || "https://registry.npmjs.org"
+  ).replace(/\/+$/, "");
+  const tarballUrl = `${npmRegistry}/${target.nativePkg}/-/${pkgBaseName}-${version}.tgz`;
+
+  try {
+    const res = await fetch(tarballUrl, { redirect: "follow" });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText} from ${tarballUrl}`);
+    }
+    const tgzBuf = Buffer.from(await res.arrayBuffer());
+    const tmpTgz = path.join(
+      os.tmpdir(),
+      `${pkgBaseName}-${version}-${Date.now()}.tgz`
+    );
+    await fsp.writeFile(tmpTgz, tgzBuf);
+    try {
+      execFileSync("tar", ["-xzf", tmpTgz, "-C", pkgDir, "--strip-components=1"], {
+        stdio: "pipe",
+      });
+    } finally {
+      await fsp.rm(tmpTgz, { force: true }).catch(() => {});
+    }
+    nodeFiles = listNodeFilesInDir(pkgDir);
+    if (nodeFiles.length > 0) {
+      console.log(
+        `[BUILD] Downloaded & cached ${nodeFiles.map((f) => path.basename(f)).join(", ")} -> ${pkgDir}`
+      );
+      return nodeFiles;
+    }
+  } catch (err) {
+    console.warn(
+      `[WARN] Failed to fetch npm tarball (${tarballUrl}): ${err instanceof Error ? err.message : err}`
+    );
+  }
+
+  // Fallback: download directly from oh-my-pi GitHub release
+  const ghUrl = `https://github.com/can1357/oh-my-pi/releases/download/v${version}/${target.nativeFile}`;
+  try {
+    console.log(`[BUILD] Trying GitHub release fallback: ${ghUrl}`);
+    const res = await fetch(ghUrl, { redirect: "follow" });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText} from ${ghUrl}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    const dest = path.join(pkgDir, target.nativeFile);
+    await fsp.writeFile(dest, buf);
+    nodeFiles = listNodeFilesInDir(pkgDir);
+    if (nodeFiles.length > 0) {
+      console.log(`[BUILD] Downloaded native addon -> ${dest}`);
+      return nodeFiles;
+    }
+  } catch (err) {
+    console.warn(
+      `[WARN] GitHub release fallback also failed: ${err instanceof Error ? err.message : err}`
+    );
+  }
+
+  return [];
+}
 
 function parseCliArgs(rawArgs: string[]): {
   targetKeys: string[];
@@ -201,48 +311,105 @@ export const EMBEDDED_SKILLS: readonly EmbeddedSkillPackage[] = ${JSON.stringify
   await fsp.writeFile(GENERATED_FILE_PATH, content, "utf-8");
 }
 
-function buildOne(target: BuildTarget): void {
+async function buildOne(
+  target: BuildTarget,
+  nativesVersion: string
+): Promise<void> {
   const outDirAbs = path.resolve(process.cwd(), target.outDir);
   const outFile = path.join(outDirAbs, target.binaryName);
   fs.mkdirSync(outDirAbs, { recursive: true });
 
-  console.log(
-    `\n[BUILD] Compiling ${target.name} (${target.bunTarget}) -> ${outFile}`
-  );
-  execFileSync(
-    "bun",
-    [
-      "build",
-      "--compile",
-      "--external",
-      "omp-legacy-pi-modules",
-      `--target=${target.bunTarget}`,
-      "src/main.ts",
-      "--outfile",
-      outFile,
-    ],
-    { stdio: "inherit" }
-  );
+  const nativeFiles = await ensureNativeAddonFiles(target, nativesVersion);
+  const originalEmbeddedAddonJs = fs.existsSync(EMBEDDED_ADDON_JS_PATH)
+    ? await fsp.readFile(EMBEDDED_ADDON_JS_PATH, "utf-8")
+    : null;
+  const tempZstFiles: string[] = [];
 
-  const nativeSrc = path.resolve(
-    process.cwd(),
-    "node_modules",
-    target.nativePkg,
-    target.nativeFile
-  );
-  if (fs.existsSync(nativeSrc)) {
-    const nativeDest = path.join(outDirAbs, target.nativeFile);
-    fs.copyFileSync(nativeSrc, nativeDest);
-    console.log(`[BUILD] Copied native addon -> ${nativeDest}`);
-  } else {
-    console.warn(
-      `[WARN] Native addon not found locally: ${nativeSrc} (target machine may download or require it alongside the binary)`
+  try {
+    if (nativeFiles.length > 0 && originalEmbeddedAddonJs !== null) {
+      const importLines: string[] = [];
+      const fileEntries: string[] = [];
+
+      for (let idx = 0; idx < nativeFiles.length; idx++) {
+        const srcPath = nativeFiles[idx];
+        const filename = path.basename(srcPath);
+        const rawBytes = await fsp.readFile(srcPath);
+        const compressed = Bun.zstdCompressSync(rawBytes);
+        const zstFilename = `${filename}.zst`;
+        const zstDest = path.join(NATIVES_NATIVE_DIR, zstFilename);
+        await fsp.writeFile(zstDest, compressed);
+        tempZstFiles.push(zstDest);
+
+        const variant = inferNativeVariant(filename);
+        importLines.push(
+          `import zstd${idx} from "./${zstFilename}" with { type: "file" };`
+        );
+        fileEntries.push(
+          `    { variant: ${JSON.stringify(variant)}, filename: ${JSON.stringify(filename)}, size: ${rawBytes.byteLength}, zstdPath: zstd${idx} },`
+        );
+      }
+
+      const embeddedAddonModule = `${importLines.join("\n")}
+
+export const embeddedAddon = {
+  platformTag: ${JSON.stringify(target.name)},
+  version: ${JSON.stringify(nativesVersion)},
+  files: [
+${fileEntries.join("\n")}
+  ],
+};
+`;
+      await fsp.writeFile(EMBEDDED_ADDON_JS_PATH, embeddedAddonModule, "utf-8");
+      console.log(
+        `[BUILD] Embedded ${nativeFiles.length} native addon(s) into ${target.name} binary (${nativeFiles.map((f) => path.basename(f)).join(", ")})`
+      );
+    } else {
+      console.warn(
+        `[WARN] Could not embed native addon for ${target.name}; target machine will need ${target.nativeFile} on disk.`
+      );
+    }
+
+    console.log(
+      `\n[BUILD] Compiling ${target.name} (${target.bunTarget}) -> ${outFile}`
     );
+    execFileSync(
+      "bun",
+      [
+        "build",
+        "--compile",
+        "--external",
+        "omp-legacy-pi-modules",
+        `--target=${target.bunTarget}`,
+        "src/main.ts",
+        "--outfile",
+        outFile,
+      ],
+      { stdio: "inherit" }
+    );
+
+    // Also copy raw .node file(s) alongside the binary as secondary fallback
+    for (const srcPath of nativeFiles) {
+      const nativeDest = path.join(outDirAbs, path.basename(srcPath));
+      fs.copyFileSync(srcPath, nativeDest);
+      console.log(`[BUILD] Copied native addon -> ${nativeDest}`);
+    }
+  } finally {
+    if (originalEmbeddedAddonJs !== null) {
+      await fsp.writeFile(
+        EMBEDDED_ADDON_JS_PATH,
+        originalEmbeddedAddonJs,
+        "utf-8"
+      );
+    }
+    for (const zstFile of tempZstFiles) {
+      await fsp.rm(zstFile, { force: true }).catch(() => {});
+    }
   }
 }
 
 async function runBuild(): Promise<void> {
   const { targetKeys, skillNames } = parseCliArgs(process.argv.slice(2));
+  const nativesVersion = readNativesVersion();
 
   const selected =
     targetKeys.length === 0 || targetKeys.includes("all")
@@ -282,7 +449,7 @@ async function runBuild(): Promise<void> {
   try {
     await writeEmbeddedSkillsModule(mergedPackages);
     for (const target of selected) {
-      buildOne(target);
+      await buildOne(target, nativesVersion);
     }
     console.log("\n[DONE] Compilation finished.");
   } finally {

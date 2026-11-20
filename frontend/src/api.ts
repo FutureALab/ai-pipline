@@ -135,6 +135,35 @@ export function fetchSkills(): Promise<{ skills: SkillCardRecord[] }> {
   return request("/api/skills");
 }
 
+export function deleteSkill(skillName: string): Promise<{
+  ok: boolean;
+  skillName: string;
+  removedDirs: string[];
+}> {
+  return request(`/api/skills/${encodeURIComponent(skillName)}`, {
+    method: "DELETE",
+  });
+}
+
+export function uploadSkill(payload: {
+  skillName?: string;
+  description?: string;
+  creator?: string;
+  fileName?: string;
+  zipBase64?: string;
+  files?: Array<{ path: string; content: string; encoding?: "utf-8" | "base64" }>;
+}): Promise<{
+  card: SkillCardRecord;
+  skillName: string;
+  filePath: string;
+  files: SkillFileEntry[];
+}> {
+  return request("/api/skills/upload", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function fetchSkillDetail(
   skillName: string
 ): Promise<{ card: SkillCardRecord; content: string; files: SkillFileEntry[] }> {
@@ -723,5 +752,23 @@ export function publishSkill(
 ): Promise<{ card: SkillCardRecord }> {
   return request(`/api/skills/${encodeURIComponent(skillName)}/publish`, {
     method: "POST",
+  });
+}
+
+export function runSkillOnJenkins(payload: {
+  skillName: string;
+  apps: string[];
+  repos: string[];
+  taskPrompt?: string;
+  waitForCompletion?: boolean;
+}): Promise<{
+  skillName: string;
+  binaryTarget: string;
+  card: SkillCardRecord;
+  pipelineRuns: RepoPipelineRun[];
+}> {
+  return request("/api/skills/run", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }

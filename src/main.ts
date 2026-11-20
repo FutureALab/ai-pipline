@@ -26,21 +26,28 @@ function getArg(args: string[], flag: string): string | undefined {
 
 function printUsage(): void {
   process.stdout.write(`Usage:
-  bun run src/main.ts generate --prompt "<prompt>" [--name <skill-name>] [--scope global|project] [--cwd <dir>] [--model <provider/model>]
-  bun run src/main.ts run --skill <skill-name> --cwd <repo-dir> [--prompt "<task>"] [--model <provider/model>]
-  bun run src/main.ts list [--scope global|project] [--cwd <dir>]
-  bun run src/main.ts serve [--port 3000]
+  ai-pipeline --skill <skill-name> [--cwd <repo-dir>] [--prompt "<task>"] [--model <provider/model>]
+  ai-pipeline run --skill <skill-name> [--cwd <repo-dir>] [--prompt "<task>"] [--model <provider/model>]
+  ai-pipeline generate --prompt "<prompt>" [--name <skill-name>] [--scope global|project] [--cwd <dir>] [--model <provider/model>]
+  ai-pipeline list [--scope global|project] [--cwd <dir>]
+  ai-pipeline serve [--port 3000]
 `);
 }
 
 async function main(): Promise<void> {
-  const [, , command, ...args] = process.argv;
+  const rawArgs = process.argv.slice(2);
+  const firstArg = rawArgs[0];
   const startedAt = Date.now();
 
-  if (!command || command === "-h" || command === "--help") {
+  if (!firstArg || firstArg === "-h" || firstArg === "--help") {
     printUsage();
     process.exit(0);
   }
+
+  // Allow invoking the compiled binary directly with flags (e.g. ./ai-pipeline --skill foo --cwd /path --prompt "...")
+  const isDirectRun = firstArg.startsWith("-");
+  const command = isDirectRun ? "run" : firstArg;
+  const args = isDirectRun ? rawArgs : rawArgs.slice(1);
 
   log.info(
     {

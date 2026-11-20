@@ -6,6 +6,7 @@
       :loading="loading"
       @select="openSkill"
       @create="createNewSkill"
+      @uploaded="loadSkills"
     />
 
     <SkillWorkflow

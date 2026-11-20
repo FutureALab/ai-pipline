@@ -18,6 +18,7 @@ import type {
 import {
   executeJenkinsJobWithXml,
   getJenkinsBuildStatus,
+  resolveJenkinsQueueItem,
 } from "./jenkinsClient.js";
 import { runSkillInRepo } from "./skillRunner.js";
 
@@ -26,21 +27,21 @@ const pipelineLog = createLogger("pipeline");
 
 export type PipelineExecutionMode = "real" | "simulate" | "jenkins";
 
-async function ensureJenkinsBundledBinaryForSkill(
+export async function ensureJenkinsBundledBinaryForSkill(
   skillName: string
-): Promise<void> {
-  if (process.env.JENKINS_AUTO_BUILD_BINARY === "false") {
-    return;
-  }
+): Promise<string> {
   const target =
     process.env.JENKINS_BINARY_TARGET?.trim() ||
     (process.arch === "arm64" ? "linux-arm64" : "linux-x64");
+  if (process.env.JENKINS_AUTO_BUILD_BINARY === "false") {
+    return target;
+  }
   const scriptPath = path.resolve(process.cwd(), "scripts/build-binaries.ts");
   const exists = await fs
     .stat(scriptPath)
     .then((s) => s.isFile())
     .catch(() => false);
-  if (!exists) return;
+  if (!exists) return target;
 
   pipelineLog.info(
     { skillName, target },
@@ -54,6 +55,7 @@ async function ensureJenkinsBundledBinaryForSkill(
       timeout: 180_000,
     }
   );
+  return target;
 }
 
 async function runSingleRepoPipeline(
@@ -228,6 +230,7 @@ export async function executeBatchPipelineTest(params: {
   });
 
   if (params.mode === "jenkins") {
+    let buildWarn: string | null = null;
     try {
       await ensureJenkinsBundledBinaryForSkill(params.skillName);
     } catch (err) {
@@ -236,8 +239,92 @@ export async function executeBatchPipelineTest(params: {
         { skillName: params.skillName, err },
         "Auto-build of Jenkins binary failed; continuing with existing binary if present"
       );
-      pipelineRuns[0].logs.push(`[WARN] Auto-build binary failed: ${msg}`);
+      buildWarn = `[WARN] Auto-build binary failed: ${msg}`;
     }
+
+    const skillContent = await readSkillMarkdown(params.skillName).catch(() => "");
+
+    // Fire ALL selected repos to Jenkins concurrently without waiting for each build to complete
+    const dispatchedRuns: RepoPipelineRun[] = await Promise.all(
+      selectedRepos.map(async (repo) => {
+        const start = Date.now();
+        const jobName = `ai-skill-${params.skillName}-${repo.id}`;
+        try {
+          const result = await executeJenkinsJobWithXml({
+            jobName,
+            repoUrl: repo.url,
+            repoBranch: repo.branch,
+            skillName: params.skillName,
+            skillContent,
+            taskPrompt: `Apply skill ${params.skillName} for apps [${params.apps.join(", ")}] on repository ${repo.name}.`,
+            waitForCompletion: false,
+          });
+          const status: RepoPipelineRun["status"] =
+            result.status === "success"
+              ? "success"
+              : result.status === "queued"
+                ? "running"
+                : "failed";
+          return {
+            repoId: repo.id,
+            repoName: repo.name,
+            repoUrl: repo.url,
+            status,
+            durationMs: result.durationMs,
+            jenkinsJobName: result.jobName,
+            jenkinsBuildNumber: result.buildNumber,
+            jenkinsBuildUrl: result.buildUrl,
+            jenkinsQueueUrl: result.queueUrl,
+            logs: [
+              ...(buildWarn ? [buildWarn] : []),
+              `[Jenkins] Triggering pipeline for repo "${repo.name}" (${repo.url})`,
+              `[Jenkins] Target apps: ${params.apps.join(", ") || "none"}`,
+              ...result.logs,
+            ],
+          };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            repoId: repo.id,
+            repoName: repo.name,
+            repoUrl: repo.url,
+            status: "failed",
+            durationMs: Date.now() - start,
+            jenkinsJobName: jobName,
+            logs: [
+              ...(buildWarn ? [buildWarn] : []),
+              `[Jenkins] Triggering pipeline for repo "${repo.name}" (${repo.url})`,
+              `[Jenkins] Target apps: ${params.apps.join(", ") || "none"}`,
+              `[ERROR] ${msg}`,
+            ],
+          };
+        }
+      })
+    );
+
+    const anyRunning = dispatchedRuns.some((r) => r.status === "running");
+    const allPassed =
+      !anyRunning && dispatchedRuns.every((r) => r.status === "success");
+    const nextStatus = anyRunning
+      ? "testing"
+      : allPassed
+        ? "test_passed"
+        : "test_failed";
+
+    const card = await upsertSkillCard(params.skillName, {
+      selectedApps: params.apps,
+      selectedRepos: params.repoIds,
+      pipelineRuns: dispatchedRuns,
+      currentStep: 3,
+      progress: allPassed ? 90 : 66,
+      status: nextStatus,
+    });
+
+    return {
+      card,
+      allPassed,
+      pipelineRuns: dispatchedRuns,
+    };
   }
 
   for (let i = 0; i < selectedRepos.length; i++) {
@@ -301,6 +388,128 @@ export async function executeBatchPipelineTest(params: {
   };
 }
 
+/**
+ * Directly run a Skill across multiple selected apps & repositories by:
+ * 1. Compiling the `ai-pipeline` binary with `--skill <skillName>` embedded from DB
+ * 2. Creating and triggering a dedicated Jenkins job for each selected repository
+ *    that executes the compiled binary directly.
+ */
+export async function executeDirectSkillJenkinsRuns(params: {
+  skillName: string;
+  apps: string[];
+  repoIds: string[];
+  taskPrompt?: string;
+  waitForCompletion?: boolean;
+}): Promise<{
+  skillName: string;
+  binaryTarget: string;
+  card: SkillCardRecord;
+  pipelineRuns: RepoPipelineRun[];
+}> {
+  const catalogRepos = await listCatalogRepos();
+  const repoMap = new Map(catalogRepos.map((r) => [r.id, r]));
+  const selectedRepos = params.repoIds.map(
+    (id) =>
+      repoMap.get(id) ?? {
+        id,
+        name: id,
+        url: id.startsWith("http")
+          ? id
+          : `https://git.example.com/org/${id}.git`,
+        branch: "main",
+      }
+  );
+
+  // 1. Build the binary embedding this skill from database
+  const binaryTarget = await ensureJenkinsBundledBinaryForSkill(
+    params.skillName
+  );
+  const skillContent = await readSkillMarkdown(params.skillName).catch(
+    () => ""
+  );
+  const wait = params.waitForCompletion === true;
+
+  // 2. Create & trigger a Jenkins job for each selected repository
+  const pipelineRuns: RepoPipelineRun[] = await Promise.all(
+    selectedRepos.map(async (repo) => {
+      const start = Date.now();
+      const jobName = `ai-skill-run-${params.skillName}-${repo.id}`;
+      const prompt = params.taskPrompt?.trim()
+        ? `${params.taskPrompt.trim()} (Target apps: [${params.apps.join(", ")}], repository: ${repo.name})`
+        : `Apply skill ${params.skillName} for apps [${params.apps.join(", ")}] on repository ${repo.name}.`;
+
+      try {
+        const result = await executeJenkinsJobWithXml({
+          jobName,
+          repoUrl: repo.url,
+          repoBranch: repo.branch,
+          skillName: params.skillName,
+          skillContent,
+          taskPrompt: prompt,
+          waitForCompletion: wait,
+          pollIntervalMs: 3000,
+        });
+
+        const status: RepoPipelineRun["status"] =
+          result.status === "success"
+            ? "success"
+            : result.status === "queued"
+              ? "running"
+              : "failed";
+
+        return {
+          repoId: repo.id,
+          repoName: repo.name,
+          repoUrl: repo.url,
+          status,
+          durationMs: result.durationMs,
+          jenkinsJobName: result.jobName,
+          jenkinsBuildNumber: result.buildNumber,
+          jenkinsBuildUrl: result.buildUrl,
+          jenkinsQueueUrl: result.queueUrl,
+          logs: [
+            `[Binary] Built ${binaryTarget} binary with embedded skill "${params.skillName}"`,
+            `[Jenkins] Job: ${result.jobName}${result.buildNumber ? ` (#${result.buildNumber})` : ""}`,
+            `[Jenkins] Target apps: ${params.apps.join(", ") || "none"}`,
+            ...(result.buildUrl
+              ? [`[Jenkins] Build URL: ${result.buildUrl}`]
+              : []),
+            ...result.logs,
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          repoId: repo.id,
+          repoName: repo.name,
+          repoUrl: repo.url,
+          status: "failed",
+          durationMs: Date.now() - start,
+          jenkinsJobName: jobName,
+          logs: [
+            `[Binary] Built ${binaryTarget} binary with embedded skill "${params.skillName}"`,
+            `[Jenkins] Triggering job "${jobName}" for repo "${repo.name}" (${repo.url})`,
+            `[ERROR] ${msg}`,
+          ],
+        };
+      }
+    })
+  );
+
+  const card = await upsertSkillCard(params.skillName, {
+    selectedApps: params.apps,
+    selectedRepos: params.repoIds,
+    pipelineRuns,
+  });
+
+  return {
+    skillName: params.skillName,
+    binaryTarget,
+    card,
+    pipelineRuns,
+  };
+}
+
 let jenkinsSyncTimer: ReturnType<typeof setInterval> | null = null;
 let jenkinsSyncInFlight = false;
 
@@ -312,28 +521,72 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
   jenkinsSyncInFlight = true;
   try {
     const cards = await listSkillCards();
-    const testingCards = cards.filter((c) => c.status === "testing");
+    const testingCards = cards.filter(
+      (c) =>
+        c.status === "testing" ||
+        c.pipelineRuns.some((r) => r.status === "running")
+    );
 
     for (const card of testingCards) {
       let changed = false;
       const updatedRuns = await Promise.all(
         card.pipelineRuns.map(async (run) => {
-          if (
-            run.status !== "running" ||
-            !run.jenkinsJobName ||
-            !run.jenkinsBuildNumber
-          ) {
+          if (run.status !== "running") {
             return run;
           }
+
+          let buildNumber = run.jenkinsBuildNumber;
+          let buildUrl = run.jenkinsBuildUrl;
+
+          // Resolve queued Jenkins builds that didn't have a buildNumber at dispatch time
+          if (!buildNumber && run.jenkinsQueueUrl) {
+            try {
+              const queueInfo = await resolveJenkinsQueueItem(
+                run.jenkinsQueueUrl
+              );
+              if (queueInfo.cancelled) {
+                changed = true;
+                return {
+                  ...run,
+                  status: "failed" as const,
+                  logs: [
+                    ...run.logs,
+                    "[Jenkins] Build was cancelled while waiting in queue.",
+                  ],
+                };
+              }
+              if (queueInfo.buildNumber) {
+                buildNumber = queueInfo.buildNumber;
+                buildUrl = queueInfo.buildUrl || buildUrl;
+                changed = true;
+              } else {
+                if (queueInfo.why) {
+                  const whyLine = `[Jenkins] Queued: ${queueInfo.why}`;
+                  if (run.logs[run.logs.length - 1] !== whyLine) {
+                    changed = true;
+                    return { ...run, logs: [...run.logs, whyLine] };
+                  }
+                }
+                return run;
+              }
+            } catch {
+              return run;
+            }
+          }
+
+          if (!run.jenkinsJobName || !buildNumber) {
+            return run;
+          }
+
           try {
             const build = await getJenkinsBuildStatus(
               run.jenkinsJobName,
-              run.jenkinsBuildNumber
+              buildNumber
             );
             const nextLogs = [
-              `[Jenkins] Job: ${run.jenkinsJobName} (#${run.jenkinsBuildNumber})`,
-              ...(build.url || run.jenkinsBuildUrl
-                ? [`[Jenkins] Build URL: ${build.url || run.jenkinsBuildUrl}`]
+              `[Jenkins] Job: ${run.jenkinsJobName} (#${buildNumber})`,
+              ...(build.url || buildUrl
+                ? [`[Jenkins] Build URL: ${build.url || buildUrl}`]
                 : []),
               ...(build.consoleText ? build.consoleText.split("\n") : []),
             ];
@@ -347,7 +600,8 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
               ...run,
               status: nextStatus,
               durationMs: build.duration || run.durationMs,
-              jenkinsBuildUrl: build.url || run.jenkinsBuildUrl,
+              jenkinsBuildNumber: buildNumber,
+              jenkinsBuildUrl: build.url || buildUrl,
               logs: nextLogs,
             };
           } catch {
@@ -356,10 +610,26 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
         })
       );
 
-      if (changed) {
-        await upsertSkillCard(card.skillName, {
-          pipelineRuns: updatedRuns,
-        }).catch(() => {});
+      const allTerminal =
+        updatedRuns.length > 0 &&
+        updatedRuns.every(
+          (r) => r.status === "success" || r.status === "failed"
+        );
+      const shouldFinalizeTesting = card.status === "testing" && allTerminal;
+
+      if (changed || shouldFinalizeTesting) {
+        if (shouldFinalizeTesting) {
+          const allPassed = updatedRuns.every((r) => r.status === "success");
+          await upsertSkillCard(card.skillName, {
+            pipelineRuns: updatedRuns,
+            progress: allPassed ? 90 : 66,
+            status: allPassed ? "test_passed" : "test_failed",
+          }).catch(() => {});
+        } else {
+          await upsertSkillCard(card.skillName, {
+            pipelineRuns: updatedRuns,
+          }).catch(() => {});
+        }
       }
     }
   } catch {

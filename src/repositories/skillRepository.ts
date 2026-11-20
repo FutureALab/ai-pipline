@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { queryDb } from "../db/database.js";
 import type {
@@ -19,7 +20,9 @@ import {
   normalizeSkillName,
   parseSkillFrontmatter,
   readSkillDirectoryFiles,
+  resolveAllGlobalSkillRoots,
   resolveDefaultSkillsRoot,
+  resolvePiSkillsRoot,
 } from "./skillStorage.js";
 
 function resolveSafeSkillFilePath(skillName: string, relativePath: string): string {
@@ -445,6 +448,69 @@ const SKILL_SELECT_COLUMNS = `
   current_step, progress, status, selected_apps, selected_repos, selected_mcps,
   pipeline_runs, frontmatter, has_scripts, resource_summary
 `;
+
+export async function deleteSkillCompletely(skillName: string): Promise<{
+  skillName: string;
+  removedDirs: string[];
+}> {
+  const normalized = normalizeSkillName(skillName);
+  if (!normalized) {
+    throw new Error("Invalid skill name");
+  }
+
+  // 1. Delete from database tables
+  await queryDb(`DELETE FROM skill_files WHERE skill_name = $1`, [normalized]);
+  await queryDb(`DELETE FROM skills WHERE skill_name = $1`, [normalized]);
+
+  // 2. Remove from all disk locations:
+  //    - resource/builtin-skills/<name>, resource/skills/<name>, resource/<name>
+  //    - ~/.pi/agent/skills/<name>, ~/.pi/skills/<name>
+  //    - ~/.omp/agent/skills/<name>
+  //    - project .omp/skills/<name>, .pi/skills/<name>
+  const cwd = process.cwd();
+  const home = os.homedir();
+  const candidateRoots = new Set<string>([
+    ...resolveAllGlobalSkillRoots(),
+    resolveDefaultSkillsRoot("global", cwd),
+    resolveDefaultSkillsRoot("project", cwd),
+    resolvePiSkillsRoot(),
+    path.join(home, ".pi", "agent", "skills"),
+    path.join(home, ".pi", "skills"),
+    path.join(home, ".omp", "agent", "skills"),
+    path.join(home, ".omp", "skills"),
+    path.resolve(cwd, "resource", "builtin-skills"),
+    path.resolve(cwd, "resource", "skills"),
+    path.resolve(cwd, "resource"),
+    path.resolve(cwd, ".pi", "agent", "skills"),
+    path.resolve(cwd, ".pi", "skills"),
+  ]);
+
+  const removedDirs: string[] = [];
+  for (const root of candidateRoots) {
+    const absRoot = path.resolve(root);
+    const targetDir = path.resolve(absRoot, normalized);
+    // Safety guard: targetDir must be a direct child of absRoot and not equal to absRoot
+    if (
+      targetDir === absRoot ||
+      path.dirname(targetDir) !== absRoot ||
+      normalized === "builtin-skills" ||
+      normalized === "skills"
+    ) {
+      continue;
+    }
+
+    const stat = await fs.stat(targetDir).catch(() => null);
+    if (stat?.isDirectory()) {
+      await fs.rm(targetDir, { recursive: true, force: true }).catch(() => {});
+      removedDirs.push(targetDir);
+    }
+  }
+
+  return {
+    skillName: normalized,
+    removedDirs,
+  };
+}
 
 export async function listCatalogApps(): Promise<CatalogAppRow[]> {
   const res = await queryDb<CatalogAppRow & Record<string, unknown>>(

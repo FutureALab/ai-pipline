@@ -23,12 +23,14 @@ import {
   testPipelineHandler,
 } from "../controllers/pipelineController.js";
 import {
+  deleteSkillHandler,
   downloadSkillHandler,
   generateSkillSyncHandler,
   getSkillDetailHandler,
   listSkillsHandler,
   runSkillHandler,
   updateSkillHandler,
+  uploadSkillHandler,
 } from "../controllers/skillController.js";
 import {
   getTraceByIdHandler,
@@ -195,6 +197,10 @@ export async function routeRequest(
       return await listSkillsHandler(res);
     }
 
+    if (method === "POST" && url.pathname === "/api/skills/upload") {
+      return await uploadSkillHandler(req, res);
+    }
+
     if (method === "POST" && url.pathname === "/api/skills/generate/start") {
       return await startGenerationJobHandler(req, res);
     }
@@ -253,6 +259,9 @@ export async function routeRequest(
     }
     if (method === "PUT" && detailMatch) {
       return await updateSkillHandler(req, res, detailMatch[1]);
+    }
+    if (method === "DELETE" && detailMatch) {
+      return await deleteSkillHandler(res, detailMatch[1]);
     }
 
     return sendJson(res, 404, { error: "Not Found" });

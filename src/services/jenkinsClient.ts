@@ -159,7 +159,7 @@ export function buildJenkinsPipelineXml(
 
                         if [ -x "\${BIN}" ]; then
                             echo "[Jenkins] Using bundled binary: \${BIN} (arch=\${ARCH})"
-                            "\${BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
+                            "\${BIN}" --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
                         else
                             echo "Error: compiled ai-pipeline binary (\${BIN}) not found on Jenkins agent (arch=\${ARCH})."
                             echo "Please build with: bun run scripts/build-binaries.ts linux-arm64 linux-x64 --skill ${options.skillName}"
@@ -259,6 +259,33 @@ async function pollQueueForBuildNumber(
   }
 
   throw new Error("Timed out waiting for Jenkins build to start from queue");
+}
+
+export async function resolveJenkinsQueueItem(queueUrl: string): Promise<{
+  cancelled: boolean;
+  buildNumber?: number;
+  buildUrl?: string;
+  why?: string;
+}> {
+  const cfg = getJenkinsConfig();
+  const normalizedQueue = queueUrl.replace(/\/+$/, "");
+  const res = await fetch(`${normalizedQueue}/api/json`, {
+    headers: buildAuthHeaders(cfg),
+  });
+  if (!res.ok) {
+    return { cancelled: false };
+  }
+  const data = (await res.json()) as {
+    cancelled?: boolean;
+    why?: string;
+    executable?: { number?: number; url?: string };
+  };
+  return {
+    cancelled: Boolean(data.cancelled),
+    buildNumber: data.executable?.number,
+    buildUrl: data.executable?.url,
+    why: data.why,
+  };
 }
 
 export async function getJenkinsBuildStatus(
@@ -411,13 +438,40 @@ export async function executeJenkinsJobWithXml(
   const wait = req.waitForCompletion !== false;
   const timeoutMs = req.timeoutMs ?? 180_000;
 
-  if (!wait || !queueUrl) {
+  if (!wait) {
+    let buildNumber: number | undefined;
+    let buildUrl: string | undefined;
+    if (queueUrl) {
+      try {
+        const queued = await pollQueueForBuildNumber(cfg, queueUrl, 1_500);
+        buildNumber = queued.buildNumber;
+        buildUrl = queued.buildUrl;
+      } catch {
+        // Build is still queued in Jenkins; background sync will resolve buildNumber from queueUrl
+      }
+    }
     return {
       jobName: req.jobName,
+      buildNumber,
+      buildUrl,
       queueUrl,
       status: "queued",
       durationMs: Date.now() - start,
-      logs: [`[Jenkins] Job "${req.jobName}" queued: ${queueUrl ?? "triggered"}`],
+      logs: [
+        `[Jenkins] Job "${req.jobName}" triggered${buildNumber ? ` (#${buildNumber})` : " (queued)"}`,
+        ...(buildUrl ? [`[Jenkins] Build URL: ${buildUrl}`] : []),
+        ...(queueUrl ? [`[Jenkins] Queue URL: ${queueUrl}`] : []),
+      ],
+      xml,
+    };
+  }
+
+  if (!queueUrl) {
+    return {
+      jobName: req.jobName,
+      status: "queued",
+      durationMs: Date.now() - start,
+      logs: [`[Jenkins] Job "${req.jobName}" triggered`],
       xml,
     };
   }
