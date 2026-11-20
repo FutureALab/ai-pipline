@@ -806,3 +806,24 @@ export function runSkillOnJenkins(payload: {
     body: JSON.stringify(payload),
   });
 }
+
+export function runMultipleSkillsOnJenkins(payload: {
+  skillNames: string[];
+  apps: string[];
+  repos: string[];
+  taskPrompt?: string;
+}): Promise<{
+  skillNames: string[];
+  binaryTarget: string;
+  totalTasks: number;
+  results: Array<{
+    skillName: string;
+    card: SkillCardRecord;
+    pipelineRuns: RepoPipelineRun[];
+  }>;
+}> {
+  return request("/api/skills/run", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}

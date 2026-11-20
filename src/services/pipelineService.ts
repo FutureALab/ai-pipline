@@ -185,9 +185,10 @@ const PIPELINE_IDLE_LOG_TIMEOUT_MS = Number(
 
 export type PipelineExecutionMode = "real" | "simulate" | "jenkins";
 
-export async function ensureJenkinsBundledBinaryForSkill(
-  skillName: string
+export async function ensureJenkinsBundledBinaryForSkills(
+  skillNames: string[]
 ): Promise<string> {
+  const uniqueNames = [...new Set(skillNames.map((s) => s.trim()).filter(Boolean))];
   const target =
     process.env.JENKINS_BINARY_TARGET?.trim() ||
     (process.arch === "arm64" ? "linux-arm64" : "linux-x64");
@@ -202,18 +203,24 @@ export async function ensureJenkinsBundledBinaryForSkill(
   if (!exists) return target;
 
   pipelineLog.info(
-    { skillName, target },
-    "Building Linux ai-pipeline binary with embedded skill for Jenkins"
+    { skillNames: uniqueNames, target },
+    "Building Linux ai-pipeline binary with embedded skill(s) for Jenkins"
   );
-  await execFileAsync(
-    "bun",
-    ["run", scriptPath, target, "--skill", skillName],
-    {
-      cwd: process.cwd(),
-      timeout: 180_000,
-    }
-  );
+  const cliArgs = ["run", scriptPath, target];
+  if (uniqueNames.length > 0) {
+    cliArgs.push("--skills", uniqueNames.join(","));
+  }
+  await execFileAsync("bun", cliArgs, {
+    cwd: process.cwd(),
+    timeout: 180_000,
+  });
   return target;
+}
+
+export async function ensureJenkinsBundledBinaryForSkill(
+  skillName: string
+): Promise<string> {
+  return ensureJenkinsBundledBinaryForSkills([skillName]);
 }
 
 async function runSingleRepoPipeline(
@@ -1008,6 +1015,113 @@ export async function executeDirectSkillJenkinsRuns(params: {
     binaryTarget,
     card,
     pipelineRuns,
+  };
+}
+
+/**
+ * Batch-run multiple published Skills across selected apps & repositories:
+ * 1. Compiles the `ai-pipeline` binary ONCE embedding all requested skills
+ * 2. Enqueues all (skill × repo) Jenkins jobs into the Redis blocking queue
+ *    throttled by JENKINS_CONCURRENCY_SEMAPHORE.
+ */
+export async function executeBatchDirectSkillsJenkinsRuns(params: {
+  skillNames: string[];
+  apps: string[];
+  repoIds: string[];
+  taskPrompt?: string;
+}): Promise<{
+  skillNames: string[];
+  binaryTarget: string;
+  totalTasks: number;
+  results: Array<{
+    skillName: string;
+    card: SkillCardRecord;
+    pipelineRuns: RepoPipelineRun[];
+  }>;
+}> {
+  const uniqueSkillNames = [...new Set(params.skillNames)];
+  const catalogRepos = await listCatalogRepos();
+  const repoMap = new Map(catalogRepos.map((r) => [r.id, r]));
+  const selectedRepos = params.repoIds.map(
+    (id) =>
+      repoMap.get(id) ?? {
+        id,
+        name: id,
+        url: id.startsWith("http")
+          ? id
+          : `https://git.example.com/org/${id}.git`,
+        branch: "main",
+      }
+  );
+
+  // 1. Build ONE binary embedding all selected skills
+  const binaryTarget =
+    await ensureJenkinsBundledBinaryForSkills(uniqueSkillNames);
+
+  const limit = getJenkinsConcurrencyLimit();
+  const now = Date.now();
+  const allQueuedTasks: JenkinsQueuedTask[] = [];
+  const results: Array<{
+    skillName: string;
+    card: SkillCardRecord;
+    pipelineRuns: RepoPipelineRun[];
+  }> = [];
+
+  for (const skillName of uniqueSkillNames) {
+    const skillContent = await readSkillMarkdown(skillName).catch(() => "");
+    const queuedRuns: RepoPipelineRun[] = selectedRepos.map((repo) => ({
+      repoId: repo.id,
+      repoName: repo.name,
+      repoUrl: repo.url,
+      status: "pending",
+      durationMs: 0,
+      jenkinsJobName: `ai-skill-run-${skillName}-${repo.id}`,
+      startedAt: now,
+      lastUpdatedAt: now,
+      logs: [
+        `[Binary] Built ${binaryTarget} binary with embedded skill(s): ${uniqueSkillNames.join(", ")}`,
+        `[Queue] 已进入 Redis 阻塞队列，等待信号量槽位（并发上限: ${limit}）...`,
+      ],
+    }));
+
+    const card = await withSkillCardLock(skillName, () =>
+      upsertSkillCard(skillName, {
+        selectedApps: params.apps,
+        selectedRepos: params.repoIds,
+        pipelineRuns: queuedRuns,
+      })
+    );
+
+    results.push({ skillName, card, pipelineRuns: queuedRuns });
+
+    for (const repo of selectedRepos) {
+      const prompt = params.taskPrompt?.trim()
+        ? `${params.taskPrompt.trim()} (Target apps: [${params.apps.join(", ")}], repository: ${repo.name})`
+        : `Apply skill ${skillName} for apps [${params.apps.join(", ")}] on repository ${repo.name}.`;
+      allQueuedTasks.push({
+        taskId: crypto.randomUUID(),
+        skillName,
+        repoId: repo.id,
+        repoName: repo.name,
+        repoUrl: repo.url,
+        repoBranch: repo.branch,
+        apps: params.apps,
+        jobName: `ai-skill-run-${skillName}-${repo.id}`,
+        taskPrompt: prompt,
+        skillContent,
+        binaryTarget,
+        enqueuedAt: now,
+      });
+    }
+  }
+
+  await enqueueJenkinsDispatchTasks(allQueuedTasks);
+
+  return {
+    skillNames: uniqueSkillNames,
+    binaryTarget,
+    totalTasks: allQueuedTasks.length,
+    results,
   };
 }
 

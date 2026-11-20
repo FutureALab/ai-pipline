@@ -17,6 +17,82 @@
       </div>
     </div>
 
+    <div v-if="!loading && skills.length > 0" class="filter-toolbar">
+      <div class="filter-controls">
+        <el-input
+          v-model="filterKeyword"
+          placeholder="搜索 Skill 名称、描述或创建人..."
+          clearable
+          style="width: 260px"
+        />
+        <el-select
+          v-model="filterStatus"
+          placeholder="全部状态"
+          clearable
+          style="width: 150px"
+        >
+          <el-option label="草稿（第1步）" value="draft" />
+          <el-option label="待测试（第3步）" value="submitted" />
+          <el-option label="测试中" value="testing" />
+          <el-option label="测试通过" value="test_passed" />
+          <el-option label="测试失败" value="test_failed" />
+          <el-option label="已发布" value="published" />
+        </el-select>
+        <el-select
+          v-model="filterCreator"
+          placeholder="全部创建人"
+          clearable
+          filterable
+          style="width: 150px"
+        >
+          <el-option
+            v-for="creator in creatorOptions"
+            :key="creator"
+            :label="creator"
+            :value="creator"
+          />
+        </el-select>
+        <el-button v-if="hasActiveFilters" link type="primary" @click="resetFilters">
+          重置筛选
+        </el-button>
+        <span class="filter-count">
+          共 {{ filteredSkills.length }} / {{ skills.length }} 个 Skill
+        </span>
+      </div>
+
+      <div class="batch-controls">
+        <el-button
+          v-if="filteredPublishedSkills.length > 0"
+          size="small"
+          plain
+          @click="toggleSelectAllPublished"
+        >
+          {{
+            allFilteredPublishedSelected
+              ? `取消全选已发布 (${filteredPublishedSkills.length})`
+              : `全选已发布 (${filteredPublishedSkills.length})`
+          }}
+        </el-button>
+        <el-button
+          v-if="selectedSkillNames.length > 0"
+          size="small"
+          plain
+          @click="clearSelectedSkills"
+        >
+          清空已选
+        </el-button>
+        <el-button
+          v-if="selectedSkillNames.length > 0"
+          type="primary"
+          size="small"
+          @click="openBatchRunSkillDialog"
+        >
+          <el-icon><VideoPlay /></el-icon>
+          <span>批量运行已选 Skill ({{ selectedSkillNames.length }})</span>
+        </el-button>
+      </div>
+    </div>
+
     <el-skeleton v-if="loading" :rows="4" animated />
 
     <el-empty
@@ -24,9 +100,16 @@
       description="暂无 Skill，点击右上角「上传 Skill」或「新建 Skill」开始"
     />
 
+    <el-empty
+      v-else-if="filteredSkills.length === 0"
+      description="没有符合当前过滤条件的 Skill"
+    >
+      <el-button type="primary" plain @click="resetFilters">清空过滤条件</el-button>
+    </el-empty>
+
     <el-row v-else :gutter="20">
       <el-col
-        v-for="skill in skills"
+        v-for="skill in filteredSkills"
         :key="skill.skillName"
         :xs="24"
         :sm="12"
@@ -35,13 +118,30 @@
         class="card-col"
       >
         <el-card
-          class="skill-card"
+          :class="['skill-card', { 'is-selected': isSkillSelected(skill.skillName) }]"
           shadow="hover"
           @click="$emit('select', skill)"
         >
           <template #header>
             <div class="card-header">
-              <span class="skill-name">{{ skill.skillName }}</span>
+              <div class="card-title-left">
+                <span
+                  class="card-checkbox-wrap"
+                  :title="
+                    skill.status === 'published'
+                      ? '勾选以批量运行多个 Skill'
+                      : '仅已发布的 Skill 支持多选批量运行'
+                  "
+                  @click.stop
+                >
+                  <el-checkbox
+                    :model-value="isSkillSelected(skill.skillName)"
+                    :disabled="skill.status !== 'published'"
+                    @change="(val) => toggleSkillSelection(skill.skillName, Boolean(val))"
+                  />
+                </span>
+                <span class="skill-name">{{ skill.skillName }}</span>
+              </div>
               <div class="card-header-right" @click.stop>
                 <el-tag :type="statusTagType(skill.status)" size="small">
                   {{ statusLabel(skill.status) }}
@@ -230,11 +330,15 @@
       </template>
     </el-dialog>
 
-    <!-- 直接使用 Skill（创建多个 Jenkins 任务并执行打包后的二进制）弹窗 -->
+    <!-- 直接使用 / 批量运行 Skill（创建多个 Jenkins 任务并执行打包后的二进制）弹窗 -->
     <el-dialog
       v-model="runDialogVisible"
-      :title="`直接使用 Skill：${runTargetSkill?.skillName || ''}`"
-      width="680px"
+      :title="
+        runTargetSkills.length > 1
+          ? `批量运行 ${runTargetSkills.length} 个 Skill`
+          : `直接使用 Skill：${runTargetSkills[0]?.skillName || ''}`
+      "
+      width="720px"
       :close-on-click-modal="!runningSkill"
       @closed="stopRunPolling"
     >
@@ -243,8 +347,27 @@
         :closable="false"
         show-icon
         style="margin-bottom: 14px"
-        title="后端将自动把当前 Skill 从数据库打包进 ai-pipeline 二进制可执行文件，并为所选的每个 Git 版本库创建独立的 Jenkins 任务直接执行该二进制。"
+        :title="
+          runTargetSkills.length > 1
+            ? `后端将一次性把所选 ${runTargetSkills.length} 个 Skill 打包进 ai-pipeline 二进制，并通过 Redis 阻塞队列 + 信号量限流为每个（Skill × 版本库）创建独立 Jenkins 任务（共 ${runTargetSkills.length * runForm.repos.length} 个任务）。`
+            : '后端将自动把当前 Skill 从数据库打包进 ai-pipeline 二进制可执行文件，并为所选的每个 Git 版本库创建独立的 Jenkins 任务直接执行该二进制。'
+        "
       />
+
+      <div v-if="runTargetSkills.length > 0" class="run-selected-skills">
+        <span class="run-selected-label">已选 Skill（{{ runTargetSkills.length }}）：</span>
+        <div class="run-selected-tags">
+          <el-tag
+            v-for="sk in runTargetSkills"
+            :key="sk.skillName"
+            size="small"
+            type="success"
+            effect="light"
+          >
+            {{ sk.skillName }}
+          </el-tag>
+        </div>
+      </div>
 
       <el-form label-position="top">
         <el-form-item required>
@@ -335,9 +458,9 @@
         <div class="run-jobs-list">
           <div
             v-for="job in runJobs"
-            :key="job.repoId"
-            :class="['run-job-item', { active: activeRunRepoId === job.repoId }]"
-            @click="activeRunRepoId = job.repoId"
+            :key="job.jobKey"
+            :class="['run-job-item', { active: activeRunJobKey === job.jobKey }]"
+            @click="activeRunJobKey = job.jobKey"
           >
             <div class="run-job-left">
               <el-tag
@@ -347,7 +470,9 @@
                     ? 'success'
                     : job.status === 'failed'
                       ? 'danger'
-                      : 'warning'
+                      : job.status === 'pending'
+                        ? 'info'
+                        : 'warning'
                 "
               >
                 {{
@@ -355,8 +480,18 @@
                     ? "成功"
                     : job.status === "failed"
                       ? "失败"
-                      : "执行中"
+                      : job.status === "pending"
+                        ? "排队中"
+                        : "执行中"
                 }}
+              </el-tag>
+              <el-tag
+                v-if="runTargetSkills.length > 1"
+                size="small"
+                effect="plain"
+                class="run-job-skill-tag"
+              >
+                {{ job.skillName }}
               </el-tag>
               <span class="run-job-repo">{{ job.repoName }}</span>
               <code v-if="job.jenkinsJobName" class="run-job-name">
@@ -374,14 +509,16 @@
               >
                 Jenkins 控制台
               </a>
-              <span class="run-job-dur">{{ job.durationMs }} ms</span>
+              <span class="run-job-dur">
+                {{ job.status === "pending" ? "排队中" : `${job.durationMs} ms` }}
+              </span>
             </div>
           </div>
         </div>
 
         <div v-if="activeRunJob" class="run-job-console">
           <div class="run-console-head">
-            Jenkins 日志 — {{ activeRunJob.repoName }}
+            Jenkins 日志 — {{ activeRunJob.skillName }} / {{ activeRunJob.repoName }}
           </div>
           <pre class="run-console-body">{{ activeRunJob.logs.join("\n") }}</pre>
         </div>
@@ -394,10 +531,14 @@
         <el-button
           type="primary"
           :loading="runningSkill"
-          :disabled="runForm.apps.length === 0 || runForm.repos.length === 0"
+          :disabled="runTargetSkills.length === 0 || runForm.apps.length === 0 || runForm.repos.length === 0"
           @click="handleExecuteRunSkill"
         >
-          打包二进制并创建 Jenkins 任务
+          {{
+            runTargetSkills.length > 1
+              ? `批量打包并创建 ${runTargetSkills.length * runForm.repos.length} 个 Jenkins 任务`
+              : "打包二进制并创建 Jenkins 任务"
+          }}
         </el-button>
       </template>
     </el-dialog>
@@ -405,12 +546,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, reactive, ref } from "vue";
+import { computed, onUnmounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   deleteSkill,
   fetchCatalog,
   fetchSkillDetail,
+  runMultipleSkillsOnJenkins,
   runSkillOnJenkins,
   uploadSkill,
   type AppCatalogItem,
@@ -420,10 +562,109 @@ import {
   type SkillLifecycleStatus,
 } from "../api";
 
-defineProps<{
+const props = defineProps<{
   skills: SkillCardRecord[];
   loading: boolean;
 }>();
+
+// 过滤与多选状态
+const filterKeyword = ref("");
+const filterStatus = ref<SkillLifecycleStatus | "">("");
+const filterCreator = ref("");
+const selectedSkillNames = ref<string[]>([]);
+
+const creatorOptions = computed(() =>
+  [...new Set(props.skills.map((s) => s.creator).filter(Boolean))].sort()
+);
+
+const hasActiveFilters = computed(() =>
+  Boolean(filterKeyword.value.trim() || filterStatus.value || filterCreator.value)
+);
+
+const filteredSkills = computed(() => {
+  const kw = filterKeyword.value.trim().toLowerCase();
+  return props.skills.filter((skill) => {
+    if (filterStatus.value && skill.status !== filterStatus.value) {
+      return false;
+    }
+    if (filterCreator.value && skill.creator !== filterCreator.value) {
+      return false;
+    }
+    if (kw) {
+      const hay = `${skill.skillName} ${skill.description || ""} ${skill.creator || ""}`.toLowerCase();
+      if (!hay.includes(kw)) return false;
+    }
+    return true;
+  });
+});
+
+const filteredPublishedSkills = computed(() =>
+  filteredSkills.value.filter((s) => s.status === "published")
+);
+
+const allFilteredPublishedSelected = computed(
+  () =>
+    filteredPublishedSkills.value.length > 0 &&
+    filteredPublishedSkills.value.every((s) =>
+      selectedSkillNames.value.includes(s.skillName)
+    )
+);
+
+watch(
+  () => props.skills,
+  (nextSkills) => {
+    const validPublished = new Set(
+      nextSkills.filter((s) => s.status === "published").map((s) => s.skillName)
+    );
+    selectedSkillNames.value = selectedSkillNames.value.filter((name) =>
+      validPublished.has(name)
+    );
+  },
+  { deep: true }
+);
+
+function resetFilters() {
+  filterKeyword.value = "";
+  filterStatus.value = "";
+  filterCreator.value = "";
+}
+
+function isSkillSelected(skillName: string): boolean {
+  return selectedSkillNames.value.includes(skillName);
+}
+
+function toggleSkillSelection(skillName: string, checked: boolean) {
+  if (checked) {
+    if (!selectedSkillNames.value.includes(skillName)) {
+      selectedSkillNames.value = [...selectedSkillNames.value, skillName];
+    }
+  } else {
+    selectedSkillNames.value = selectedSkillNames.value.filter(
+      (n) => n !== skillName
+    );
+  }
+}
+
+function toggleSelectAllPublished() {
+  if (allFilteredPublishedSelected.value) {
+    const visibleSet = new Set(
+      filteredPublishedSkills.value.map((s) => s.skillName)
+    );
+    selectedSkillNames.value = selectedSkillNames.value.filter(
+      (n) => !visibleSet.has(n)
+    );
+  } else {
+    const merged = new Set([
+      ...selectedSkillNames.value,
+      ...filteredPublishedSkills.value.map((s) => s.skillName),
+    ]);
+    selectedSkillNames.value = [...merged];
+  }
+}
+
+function clearSelectedSkills() {
+  selectedSkillNames.value = [];
+}
 
 const emit = defineEmits<{
   (e: "select", skill: SkillCardRecord): void;
@@ -655,16 +896,21 @@ async function handleConfirmUpload() {
   }
 }
 
-// 直接使用 Skill（打包二进制 + 批量创建 Jenkins 任务）
+// 直接使用 / 批量运行 Skill（打包二进制 + 批量创建 Jenkins 任务）
+interface DirectRunJobItem extends RepoPipelineRun {
+  skillName: string;
+  jobKey: string;
+}
+
 const runDialogVisible = ref(false);
 const runningSkill = ref(false);
 const loadingCatalog = ref(false);
 const catalogApps = ref<AppCatalogItem[]>([]);
 const catalogRepos = ref<RepoCatalogItem[]>([]);
-const runTargetSkill = ref<SkillCardRecord | null>(null);
+const runTargetSkills = ref<SkillCardRecord[]>([]);
 const runBinaryTarget = ref("");
-const runJobs = ref<RepoPipelineRun[]>([]);
-const activeRunRepoId = ref("");
+const runJobs = ref<DirectRunJobItem[]>([]);
+const activeRunJobKey = ref("");
 let runPollTimer: ReturnType<typeof setInterval> | null = null;
 
 const runForm = reactive({
@@ -675,7 +921,7 @@ const runForm = reactive({
 
 const activeRunJob = computed(
   () =>
-    runJobs.value.find((j) => j.repoId === activeRunRepoId.value) ??
+    runJobs.value.find((j) => j.jobKey === activeRunJobKey.value) ??
     runJobs.value[0] ??
     null
 );
@@ -709,23 +955,38 @@ function stopRunPolling() {
   }
 }
 
-function startRunPolling(skillName: string) {
+function startRunPolling(skillNames: string[]) {
   stopRunPolling();
+  if (skillNames.length === 0) return;
   runPollTimer = setInterval(async () => {
     try {
-      const detail = await fetchSkillDetail(skillName);
-      if (detail.card.pipelineRuns && detail.card.pipelineRuns.length > 0) {
-        runJobs.value = detail.card.pipelineRuns;
-        if (!activeRunRepoId.value && runJobs.value[0]) {
-          activeRunRepoId.value = runJobs.value[0].repoId;
+      const details = await Promise.all(
+        skillNames.map((name) => fetchSkillDetail(name))
+      );
+      const nextJobs: DirectRunJobItem[] = [];
+      for (const detail of details) {
+        for (const r of detail.card.pipelineRuns ?? []) {
+          nextJobs.push({
+            ...r,
+            skillName: detail.card.skillName,
+            jobKey: `${detail.card.skillName}::${r.repoId}`,
+          });
         }
       }
-      const hasRunning = runJobs.value.some(
+      if (nextJobs.length > 0) {
+        runJobs.value = nextJobs;
+        if (!activeRunJobKey.value && nextJobs[0]) {
+          activeRunJobKey.value = nextJobs[0].jobKey;
+        }
+      }
+      const hasRunning = nextJobs.some(
         (j) => j.status === "running" || j.status === "pending"
       );
       if (!hasRunning) {
         stopRunPolling();
-        emit("uploaded", detail.card);
+        if (details[0]) {
+          emit("uploaded", details[0].card);
+        }
       }
     } catch {
       stopRunPolling();
@@ -733,18 +994,20 @@ function startRunPolling(skillName: string) {
   }, 2500);
 }
 
-async function openRunSkillDialog(skill: SkillCardRecord) {
-  if (skill.status !== "published") {
+async function openRunDialogForSkills(targets: SkillCardRecord[]) {
+  const published = targets.filter((s) => s.status === "published");
+  if (published.length === 0) {
     ElMessage.warning("只有已发布的 Skill 才能直接使用，请先完成测试并发布");
     return;
   }
-  runTargetSkill.value = skill;
-  runForm.apps = [...(skill.selectedApps ?? [])];
-  runForm.repos = [...(skill.selectedRepos ?? [])];
+  runTargetSkills.value = published;
+  const first = published[0];
+  runForm.apps = [...(first.selectedApps ?? [])];
+  runForm.repos = [...(first.selectedRepos ?? [])];
   runForm.taskPrompt = "";
   runBinaryTarget.value = "";
   runJobs.value = [];
-  activeRunRepoId.value = "";
+  activeRunJobKey.value = "";
   runDialogVisible.value = true;
   await ensureCatalogLoaded();
   if (runForm.apps.length === 0 && catalogApps.value.length > 0) {
@@ -755,8 +1018,24 @@ async function openRunSkillDialog(skill: SkillCardRecord) {
   }
 }
 
+async function openRunSkillDialog(skill: SkillCardRecord) {
+  await openRunDialogForSkills([skill]);
+}
+
+async function openBatchRunSkillDialog() {
+  const selectedSet = new Set(selectedSkillNames.value);
+  const targets = props.skills.filter(
+    (s) => selectedSet.has(s.skillName) && s.status === "published"
+  );
+  if (targets.length === 0) {
+    ElMessage.warning("请先勾选至少 1 个已发布的 Skill");
+    return;
+  }
+  await openRunDialogForSkills(targets);
+}
+
 async function handleExecuteRunSkill() {
-  if (!runTargetSkill.value) return;
+  if (runTargetSkills.value.length === 0) return;
   if (runForm.apps.length === 0 || runForm.repos.length === 0) {
     ElMessage.warning("请至少选择 1 个应用和 1 个 Git 版本库");
     return;
@@ -765,25 +1044,64 @@ async function handleExecuteRunSkill() {
   runningSkill.value = true;
   stopRunPolling();
   try {
-    const res = await runSkillOnJenkins({
-      skillName: runTargetSkill.value.skillName,
-      apps: runForm.apps,
-      repos: runForm.repos,
-      taskPrompt: runForm.taskPrompt.trim() || undefined,
-    });
-    runBinaryTarget.value = res.binaryTarget;
-    runJobs.value = res.pipelineRuns;
-    activeRunRepoId.value = res.pipelineRuns[0]?.repoId || "";
-    ElMessage.success(
-      `已打包二进制并创建 ${res.pipelineRuns.length} 个 Jenkins 任务`
-    );
-    emit("uploaded", res.card);
-    if (
-      res.pipelineRuns.some(
-        (j) => j.status === "running" || j.status === "pending"
-      )
-    ) {
-      startRunPolling(runTargetSkill.value.skillName);
+    if (runTargetSkills.value.length === 1) {
+      const target = runTargetSkills.value[0];
+      const res = await runSkillOnJenkins({
+        skillName: target.skillName,
+        apps: runForm.apps,
+        repos: runForm.repos,
+        taskPrompt: runForm.taskPrompt.trim() || undefined,
+      });
+      runBinaryTarget.value = res.binaryTarget;
+      runJobs.value = res.pipelineRuns.map((r) => ({
+        ...r,
+        skillName: target.skillName,
+        jobKey: `${target.skillName}::${r.repoId}`,
+      }));
+      activeRunJobKey.value = runJobs.value[0]?.jobKey || "";
+      ElMessage.success(
+        `已打包二进制并创建 ${res.pipelineRuns.length} 个 Jenkins 任务`
+      );
+      emit("uploaded", res.card);
+      if (
+        runJobs.value.some(
+          (j) => j.status === "running" || j.status === "pending"
+        )
+      ) {
+        startRunPolling([target.skillName]);
+      }
+    } else {
+      const skillNames = runTargetSkills.value.map((s) => s.skillName);
+      const res = await runMultipleSkillsOnJenkins({
+        skillNames,
+        apps: runForm.apps,
+        repos: runForm.repos,
+        taskPrompt: runForm.taskPrompt.trim() || undefined,
+      });
+      runBinaryTarget.value = res.binaryTarget;
+      const flatJobs: DirectRunJobItem[] = [];
+      for (const item of res.results) {
+        for (const r of item.pipelineRuns) {
+          flatJobs.push({
+            ...r,
+            skillName: item.skillName,
+            jobKey: `${item.skillName}::${r.repoId}`,
+          });
+        }
+      }
+      runJobs.value = flatJobs;
+      activeRunJobKey.value = flatJobs[0]?.jobKey || "";
+      ElMessage.success(
+        `已打包 ${skillNames.length} 个 Skill 并提交 ${res.totalTasks} 个 Jenkins 任务进入队列`
+      );
+      if (res.results[0]) {
+        emit("uploaded", res.results[0].card);
+      }
+      if (
+        flatJobs.some((j) => j.status === "running" || j.status === "pending")
+      ) {
+        startRunPolling(skillNames);
+      }
     }
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : "创建 Jenkins 任务失败");
@@ -903,11 +1221,83 @@ function formatDate(iso: string): string {
   height: 100%;
   display: flex;
   flex-direction: column;
-  transition: transform 0.15s ease;
+  transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .skill-card:hover {
   transform: translateY(-2px);
+}
+
+.skill-card.is-selected {
+  border-color: #409eff;
+  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.16);
+}
+
+.filter-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  background: #ffffff;
+  border: 1px solid #ebeef5;
+  border-radius: 10px;
+}
+
+.filter-controls,
+.batch-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.filter-count {
+  font-size: 12px;
+  color: #909399;
+}
+
+.card-title-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.card-checkbox-wrap {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.run-selected-skills {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  background: #f5f7fa;
+  border-radius: 8px;
+}
+
+.run-selected-label {
+  font-size: 12px;
+  color: #606266;
+  white-space: nowrap;
+  padding-top: 2px;
+}
+
+.run-selected-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.run-job-skill-tag {
+  flex-shrink: 0;
 }
 
 .card-header {

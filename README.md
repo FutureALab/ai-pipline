@@ -111,3 +111,4 @@ cd frontend && bun run dev
 - `GET /api/catalog` & `POST /api/skills/:name/test-pipeline` & `POST /api/skills/:name/publish`：应用/仓库目录、10 仓库流水线测试与发布
 - `POST /api/jenkins/execute` & `GET /api/jenkins/jobs/:jobName/:buildNumber`：第三方直接传递 XML 触发 Jenkins 任务及查询构建日志
 - `GET /api/traces` & `GET /api/traces/:traceId`：查询 AI Trace 遥测数据
+   

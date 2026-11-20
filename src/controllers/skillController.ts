@@ -29,7 +29,10 @@ import {
 } from "../repositories/skillStorage.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import { generateSkillFromPrompt } from "../services/skillGenerator.js";
-import { executeDirectSkillJenkinsRuns } from "../services/pipelineService.js";
+import {
+  executeBatchDirectSkillsJenkinsRuns,
+  executeDirectSkillJenkinsRuns,
+} from "../services/pipelineService.js";
 import { runSkillInRepo } from "../services/skillRunner.js";
 import type { SkillFileEncoding, SkillFileEntry } from "../types/skill.js";
 
@@ -242,6 +245,11 @@ export async function runSkillHandler(
   const body = await readJsonBody(req);
   const rawSkillName =
     typeof body.skillName === "string" ? body.skillName.trim() : "";
+  const rawSkillNames = Array.isArray(body.skillNames)
+    ? body.skillNames
+        .filter((x): x is string => typeof x === "string" && Boolean(x.trim()))
+        .map((x) => normalizeSkillName(x.trim()))
+    : [];
   const cwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
   const taskPrompt =
     typeof body.taskPrompt === "string" ? body.taskPrompt : undefined;
@@ -253,8 +261,43 @@ export async function runSkillHandler(
     : [];
   const waitForCompletion = body.waitForCompletion === true;
 
+  // Multi-skill batch execution mode
+  if (rawSkillNames.length > 0) {
+    const uniqueNames = [...new Set(rawSkillNames)];
+    if (apps.length === 0) {
+      return sendJson(res, 400, { error: "请至少选择 1 个相关应用" });
+    }
+    if (repos.length === 0) {
+      return sendJson(res, 400, { error: "请至少选择 1 个 Git 版本库" });
+    }
+
+    const unpublished: string[] = [];
+    for (const name of uniqueNames) {
+      const existing = await getSkillCard(name);
+      if (!existing) {
+        return sendJson(res, 404, { error: `Skill "${name}" 不存在` });
+      }
+      if (existing.card.status !== "published") {
+        unpublished.push(name);
+      }
+    }
+    if (unpublished.length > 0) {
+      return sendJson(res, 400, {
+        error: `以下 Skill 尚未发布，无法直接运行：${unpublished.join(", ")}`,
+      });
+    }
+
+    const result = await executeBatchDirectSkillsJenkinsRuns({
+      skillNames: uniqueNames,
+      apps,
+      repoIds: repos,
+      taskPrompt,
+    });
+    return sendJson(res, 200, result);
+  }
+
   if (!rawSkillName) {
-    return sendJson(res, 400, { error: "`skillName` is required" });
+    return sendJson(res, 400, { error: "`skillName` or `skillNames` is required" });
   }
   const skillName = normalizeSkillName(rawSkillName);
 
