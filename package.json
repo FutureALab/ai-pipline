@@ -11,6 +11,7 @@
     "generate": "bun run src/main.ts generate",
     "run-skill": "bun run src/main.ts run",
     "serve": "bun run src/main.ts serve",
+    "jenkins:up": "bun run scripts/setup-jenkins.ts",
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build-binaries.ts darwin-arm64",
     "build:linux": "bun run scripts/build-binaries.ts linux-x64",

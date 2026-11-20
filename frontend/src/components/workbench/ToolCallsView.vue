@@ -221,18 +221,7 @@
           v-else-if="block.call.details?.type === 'diagram'"
           class="wb-viz-diagram"
         >
-          <div class="wb-viz-toolbar">
-            <span class="wb-viz-hint">Mermaid 架构 / 流程图</span>
-            <el-button
-              size="small"
-              link
-              type="primary"
-              @click="copyText(String(block.call.details?.mermaid || ''))"
-            >
-              复制 Mermaid 源码
-            </el-button>
-          </div>
-          <pre class="wb-mermaid-code">{{ String(block.call.details?.mermaid || "") }}</pre>
+          <MermaidView :code="String(block.call.details?.mermaid || '')" />
         </div>
 
         <!-- 多方案对比卡片 -->
@@ -264,7 +253,7 @@
                 <li v-for="(c, ci) in opt.cons" :key="ci">{{ c }}</li>
               </ul>
             </div>
-            <pre v-if="opt.mermaid" class="wb-mermaid-code small">{{ opt.mermaid }}</pre>
+            <MermaidView v-if="opt.mermaid" :code="opt.mermaid" />
           </div>
         </div>
 
@@ -330,8 +319,8 @@
 
 <script setup lang="ts">
 import { computed, reactive } from "vue";
-import { ElMessage } from "element-plus";
 import type { WorkbenchToolCall } from "../../api";
+import MermaidView from "./MermaidView.vue";
 import {
   groupToolCallsForRender,
   resolveWebTool,
@@ -489,15 +478,6 @@ function activePreviewFile(call: WorkbenchToolCall): FileDetail | null {
 
 function isHtmlFile(ext: string): boolean {
   return ext === "html" || ext === "htm";
-}
-
-async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    ElMessage.success("已复制到剪贴板");
-  } catch {
-    ElMessage.warning("复制失败，请手动选中复制");
-  }
 }
 </script>
 

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createLogger } from "../config/logger.js";
 import {
   listCatalogRepos,
   listSkillCards,
@@ -21,8 +22,39 @@ import {
 import { runSkillInRepo } from "./skillRunner.js";
 
 const execFileAsync = promisify(execFile);
+const pipelineLog = createLogger("pipeline");
 
 export type PipelineExecutionMode = "real" | "simulate" | "jenkins";
+
+async function ensureJenkinsBundledBinaryForSkill(
+  skillName: string
+): Promise<void> {
+  if (process.env.JENKINS_AUTO_BUILD_BINARY === "false") {
+    return;
+  }
+  const target =
+    process.env.JENKINS_BINARY_TARGET?.trim() ||
+    (process.arch === "arm64" ? "linux-arm64" : "linux-x64");
+  const scriptPath = path.resolve(process.cwd(), "scripts/build-binaries.ts");
+  const exists = await fs
+    .stat(scriptPath)
+    .then((s) => s.isFile())
+    .catch(() => false);
+  if (!exists) return;
+
+  pipelineLog.info(
+    { skillName, target },
+    "Building Linux ai-pipeline binary with embedded skill for Jenkins"
+  );
+  await execFileAsync(
+    "bun",
+    ["run", scriptPath, target, "--skill", skillName],
+    {
+      cwd: process.cwd(),
+      timeout: 180_000,
+    }
+  );
+}
 
 async function runSingleRepoPipeline(
   skillName: string,
@@ -194,6 +226,19 @@ export async function executeBatchPipelineTest(params: {
     progress: 66,
     status: "testing",
   });
+
+  if (params.mode === "jenkins") {
+    try {
+      await ensureJenkinsBundledBinaryForSkill(params.skillName);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      pipelineLog.warn(
+        { skillName: params.skillName, err },
+        "Auto-build of Jenkins binary failed; continuing with existing binary if present"
+      );
+      pipelineRuns[0].logs.push(`[WARN] Auto-build binary failed: ${msg}`);
+    }
+  }
 
   for (let i = 0; i < selectedRepos.length; i++) {
     const repo = selectedRepos[i];

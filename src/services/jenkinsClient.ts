@@ -1,7 +1,31 @@
+import { execFileSync } from "node:child_process";
+
 export interface JenkinsConfig {
   baseUrl: string;
   username: string;
   apiToken: string;
+}
+
+let cachedDockerToken: string | null = null;
+
+function tryReadLocalDockerJenkinsToken(): string {
+  if (cachedDockerToken) return cachedDockerToken;
+  const container =
+    (process.env.JENKINS_DOCKER_CONTAINER || "ai-pipeline-jenkins").trim();
+  try {
+    const token = execFileSync(
+      "docker",
+      ["exec", container, "cat", "/var/jenkins_home/.ai-pipeline-api-token"],
+      { encoding: "utf-8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+    if (token) {
+      cachedDockerToken = token;
+      return token;
+    }
+  } catch {
+    // Container not running or docker unavailable
+  }
+  return "";
 }
 
 export interface JenkinsPipelineXmlOptions {
@@ -51,11 +75,14 @@ export function getJenkinsConfig(): JenkinsConfig {
     .trim()
     .replace(/\/+$/, "");
   const username = (process.env.JENKINS_USER || "admin").trim();
-  const apiToken = (process.env.JENKINS_API_TOKEN || "").trim();
+  const apiToken =
+    (process.env.JENKINS_API_TOKEN || "").trim() ||
+    tryReadLocalDockerJenkinsToken() ||
+    (process.env.JENKINS_PASSWORD || "").trim();
 
   if (!apiToken) {
     throw new Error(
-      "JENKINS_API_TOKEN is not configured in .env; cannot authenticate with Jenkins."
+      "JENKINS_API_TOKEN is not configured in .env and local Docker Jenkins container is not initialized. Run `bun run jenkins:up` to start and auto-configure Jenkins."
     );
   }
 
@@ -117,14 +144,25 @@ export function buildJenkinsPipelineXml(
             steps {
                 dir('target-repo') {
                     sh '''
-                        AI_BIN="\${AI_PIPELINE_BIN:-ai-pipeline}"
-                        if [ -x "\${AI_BIN}" ]; then
-                            "\${AI_BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
-                        elif command -v "\${AI_BIN}" >/dev/null 2>&1; then
-                            "\${AI_BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
+                        ARCH="$(uname -m)"
+                        if [ -n "\${AI_PIPELINE_BIN:-}" ] && [ -x "\${AI_PIPELINE_BIN}" ]; then
+                            BIN="\${AI_PIPELINE_BIN}"
+                        elif [ "\${ARCH}" = "aarch64" ] || [ "\${ARCH}" = "arm64" ]; then
+                            BIN="/opt/ai-pipeline-bin/arm64/ai-pipeline"
                         else
-                            echo "Error: compiled ai-pipeline binary (\${AI_BIN}) not found on Jenkins agent."
-                            echo "Please build with: bun run scripts/build-binaries.ts linux-x64 --skill ${options.skillName}"
+                            BIN="/opt/ai-pipeline-bin/x64/ai-pipeline"
+                        fi
+
+                        if [ ! -x "\${BIN}" ] && command -v ai-pipeline >/dev/null 2>&1; then
+                            BIN="$(command -v ai-pipeline)"
+                        fi
+
+                        if [ -x "\${BIN}" ]; then
+                            echo "[Jenkins] Using bundled binary: \${BIN} (arch=\${ARCH})"
+                            "\${BIN}" run --skill "${options.skillName}" --cwd "$(pwd)" --prompt '${escapedPrompt}'
+                        else
+                            echo "Error: compiled ai-pipeline binary (\${BIN}) not found on Jenkins agent (arch=\${ARCH})."
+                            echo "Please build with: bun run scripts/build-binaries.ts linux-arm64 linux-x64 --skill ${options.skillName}"
                             exit 1
                         fi
                     '''
@@ -170,10 +208,15 @@ async function fetchJenkinsCrumb(
       crumbRequestField?: string;
       crumb?: string;
     };
+    const headers: Record<string, string> = {};
     if (data.crumbRequestField && data.crumb) {
-      return { [data.crumbRequestField]: data.crumb };
+      headers[data.crumbRequestField] = data.crumb;
     }
-    return {};
+    const setCookie = res.headers.get("set-cookie");
+    if (setCookie) {
+      headers.Cookie = setCookie.split(";")[0];
+    }
+    return headers;
   } catch {
     return {};
   }

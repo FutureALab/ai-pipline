@@ -57,8 +57,8 @@
     <div v-if="activeStep === 0" class="step-one-container">
       <div class="mode-switch-bar">
         <el-radio-group v-model="stepOneMode" size="default">
-          <el-radio-button value="skill">Skill 模式（直接生成与编辑）</el-radio-button>
           <el-radio-button value="creative">创造模式（pi-agent 对话工作台）</el-radio-button>
+          <el-radio-button value="skill">Skill 模式（直接生成与编辑）</el-radio-button>
         </el-radio-group>
         <span class="mode-hint">
           {{
@@ -316,6 +316,12 @@
                   placeholder="等待 AI 生成 SKILL.md，或直接在此编写 / 修改文件内容..."
                   spellcheck="false"
                 />
+                <div
+                  v-else-if="activeFilePath.toLowerCase().endsWith('.md')"
+                  class="vscode-markdown-preview"
+                >
+                  <MarkdownRenderer :content="activeFileContent" />
+                </div>
                 <div
                   v-else
                   class="vscode-markdown-preview"
@@ -691,10 +697,10 @@
                         {{ log }}
                       </div>
                     </div>
-                    <div
+                    <MarkdownRenderer
                       v-if="msg.role === 'assistant'"
                       class="chat-markdown"
-                      v-html="renderMarkdownText(msg.content)"
+                      :content="msg.content"
                     />
                     <div v-else class="chat-plain">{{ msg.content }}</div>
                   </div>
@@ -725,10 +731,11 @@
                         {{ log }}
                       </div>
                     </div>
-                    <div
+                    <MarkdownRenderer
                       v-if="workbenchSession.streamingText"
                       class="chat-markdown"
-                      v-html="renderMarkdownText(workbenchSession.streamingText)"
+                      :content="workbenchSession.streamingText"
+                      :streaming="true"
                     />
                   </div>
                 </template>
@@ -1246,6 +1253,7 @@ import { Marked } from "marked";
 import hljs from "highlight.js";
 import BackgroundCommandsPanel from "./workbench/BackgroundCommandsPanel.vue";
 import ExtensionsDialog from "./workbench/ExtensionsDialog.vue";
+import MarkdownRenderer from "./workbench/MarkdownRenderer.vue";
 import NextStepsBar from "./workbench/NextStepsBar.vue";
 import QuestionDock from "./workbench/QuestionDock.vue";
 import TodoPanel from "./workbench/TodoPanel.vue";
@@ -1320,7 +1328,9 @@ const marked = new Marked({
 
 const activeStep = ref<0 | 2>(0);
 const maxReachedStep = ref<0 | 2>(0);
-const stepOneMode = ref<"skill" | "creative">("skill");
+const stepOneMode = ref<"skill" | "creative">(
+  props.initialSkillName ? "skill" : "creative"
+);
 const isNewSkill = ref(!props.initialSkillName);
 const editorMode = ref<"preview" | "edit">("preview");
 
@@ -2582,17 +2592,41 @@ async function handlePublish() {
 }
 
 .vscode-explorer-layout {
+  --vsc-sidebar-bg: #f8f9fb;
+  --vsc-sidebar-fg: #303133;
+  --vsc-sidebar-hover: #edf2f7;
+  --vsc-sidebar-active-bg: #ecf5ff;
+  --vsc-sidebar-active-fg: #409eff;
+  --vsc-surface-bg: #ffffff;
+  --vsc-surface-fg: #303133;
+  --vsc-border: #e4e7ed;
+  --vsc-muted: #909399;
+
   display: grid;
   grid-template-columns: 200px 1fr;
   gap: 12px;
   height: 520px;
 }
 
+@media (prefers-color-scheme: dark) {
+  .vscode-explorer-layout {
+    --vsc-sidebar-bg: #181b20;
+    --vsc-sidebar-fg: #c9d1d9;
+    --vsc-sidebar-hover: #21262d;
+    --vsc-sidebar-active-bg: #1f3a5f;
+    --vsc-sidebar-active-fg: #ffffff;
+    --vsc-surface-bg: #1e2228;
+    --vsc-surface-fg: #e6edf3;
+    --vsc-border: #30363d;
+    --vsc-muted: #8b949e;
+  }
+}
+
 .vscode-sidebar {
-  border: 1px solid #2d2d2d;
+  border: 1px solid var(--vsc-border);
   border-radius: 6px;
-  background: #252526;
-  color: #cccccc;
+  background: var(--vsc-sidebar-bg);
+  color: var(--vsc-sidebar-fg);
   overflow-y: auto;
   padding: 8px 4px;
 }
@@ -2601,22 +2635,23 @@ async function handlePublish() {
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: #9ca3af;
+  color: var(--vsc-muted);
   padding: 4px 10px 8px;
 }
 
 .vscode-sidebar :deep(.el-tree) {
   background: transparent;
-  color: #d4d4d4;
+  color: var(--vsc-sidebar-fg);
 }
 
 .vscode-sidebar :deep(.el-tree-node__content:hover) {
-  background: #2a2d2e;
+  background: var(--vsc-sidebar-hover);
 }
 
 .vscode-sidebar :deep(.el-tree--highlight-current .el-tree-node.is-current > .el-tree-node__content) {
-  background: #094771;
-  color: #ffffff;
+  background: var(--vsc-sidebar-active-bg);
+  color: var(--vsc-sidebar-active-fg);
+  font-weight: 600;
 }
 
 .tree-node-label {
@@ -2630,7 +2665,7 @@ async function handlePublish() {
 .sidebar-empty {
   padding: 12px;
   font-size: 12px;
-  color: #6b7280;
+  color: var(--vsc-muted);
 }
 
 .vscode-main {
@@ -2642,11 +2677,11 @@ async function handlePublish() {
   width: 100%;
   height: 100%;
   resize: none;
-  border: 1px solid #2d2d2d;
+  border: 1px solid var(--vsc-border);
   border-radius: 6px;
   padding: 14px;
-  background: #1e1e1e;
-  color: #d4d4d4;
+  background: var(--vsc-surface-bg);
+  color: var(--vsc-surface-fg);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 13px;
   line-height: 1.6;
@@ -2657,62 +2692,28 @@ async function handlePublish() {
 .vscode-markdown-preview {
   height: 100%;
   overflow-y: auto;
-  border: 1px solid #2d2d2d;
+  border: 1px solid var(--vsc-border);
   border-radius: 6px;
   padding: 16px 20px;
-  background: #1e1e1e;
-  color: #d4d4d4;
+  background: var(--vsc-surface-bg);
+  color: var(--vsc-surface-fg);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   font-size: 14px;
   line-height: 1.65;
   box-sizing: border-box;
 }
 
-.vscode-markdown-preview :deep(h1),
-.vscode-markdown-preview :deep(h2),
-.vscode-markdown-preview :deep(h3) {
-  color: #ffffff;
-  border-bottom: 1px solid #333;
-  padding-bottom: 4px;
-  margin-top: 16px;
-}
-
-.vscode-markdown-preview :deep(code) {
-  background: #2d2d2d;
-  padding: 2px 5px;
-  border-radius: 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12.5px;
-}
-
-.vscode-markdown-preview :deep(pre.hljs) {
-  background: #141414;
-  padding: 12px;
-  border-radius: 6px;
-  overflow-x: auto;
-  border: 1px solid #303030;
-}
-
 .vscode-markdown-preview :deep(pre.hljs.code-file-preview) {
   margin: 0;
   min-height: 100%;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
   box-sizing: border-box;
 }
 
-.vscode-markdown-preview :deep(pre.hljs code) {
-  background: transparent;
-  padding: 0;
-}
-
-.vscode-markdown-preview :deep(blockquote) {
-  border-left: 3px solid #3b82f6;
-  margin: 10px 0;
-  padding-left: 12px;
-  color: #9ca3af;
-}
-
 .empty-preview {
-  color: #6b7280;
+  color: var(--vsc-muted);
 }
 
 .step-actions {
@@ -3076,6 +3077,13 @@ async function handlePublish() {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  width: 88px;
+  flex-shrink: 0;
+}
+
+.workbench-send-col :deep(.el-button) {
+  width: 100%;
+  margin-left: 0;
 }
 
 .workbench-header-wrap {
