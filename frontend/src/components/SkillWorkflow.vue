@@ -24,7 +24,7 @@
             :disabled="maxReachedStep < 2"
             @click="switchStep(2)"
           >
-            第三步：测试与发布
+            第二步：测试与发布
           </el-button>
         </el-button-group>
       </div>
@@ -57,8 +57,8 @@
     <div v-if="activeStep === 0" class="step-one-container">
       <div class="mode-switch-bar">
         <el-radio-group v-model="stepOneMode" size="default">
-          <el-radio-button value="creative">创造模式（pi-agent 对话工作台）</el-radio-button>
-          <el-radio-button value="skill">Skill 模式（直接生成与编辑）</el-radio-button>
+          <el-radio-button value="creative">创造模式</el-radio-button>
+          <el-radio-button value="skill">Skill 模式</el-radio-button>
         </el-radio-group>
         <span class="mode-hint">
           {{
@@ -341,7 +341,7 @@
           :disabled="!form.skillName.trim() || !hasSkillContent"
           @click="handleSubmitStepOne"
         >
-          提交并进入第三步
+          提交并进入第二步
         </el-button>
       </div>
       </template>
