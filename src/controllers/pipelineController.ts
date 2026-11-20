@@ -9,6 +9,7 @@ import { normalizeSkillName } from "../repositories/skillStorage.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import {
   executeBatchPipelineTest,
+  rerunPipelineTestRepos,
   type PipelineExecutionMode,
 } from "../services/pipelineService.js";
 
@@ -46,6 +47,35 @@ export async function testPipelineHandler(
   }
 
   const result = await executeBatchPipelineTest({
+    skillName: name,
+    apps,
+    repoIds,
+    mode,
+  });
+  sendJson(res, 200, result);
+}
+
+export async function rerunPipelineReposHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  rawName: string
+): Promise<void> {
+  const name = normalizeSkillName(decodeURIComponent(rawName));
+  const body = await readJsonBody(req);
+  const apps = Array.isArray(body.apps)
+    ? body.apps.filter((x): x is string => typeof x === "string")
+    : [];
+  const repoIds = Array.isArray(body.repos)
+    ? body.repos.filter((x): x is string => typeof x === "string" && Boolean(x.trim()))
+    : [];
+  const mode: PipelineExecutionMode =
+    body.mode === "real" || body.mode === "jenkins" ? body.mode : "simulate";
+
+  if (repoIds.length === 0) {
+    return sendJson(res, 400, { error: "请至少指定 1 个需要重跑的 Git 版本库" });
+  }
+
+  const result = await rerunPipelineTestRepos({
     skillName: name,
     apps,
     repoIds,

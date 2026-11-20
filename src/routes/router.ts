@@ -20,6 +20,7 @@ import {
 import {
   getCatalogHandler,
   publishSkillHandler,
+  rerunPipelineReposHandler,
   testPipelineHandler,
 } from "../controllers/pipelineController.js";
 import {
@@ -239,6 +240,13 @@ export async function routeRequest(
     );
     if (method === "GET" && downloadMatch) {
       return await downloadSkillHandler(res, downloadMatch[1]);
+    }
+
+    const rerunMatch = url.pathname.match(
+      /^\/api\/skills\/([^/]+)\/test-pipeline\/rerun$/
+    );
+    if (method === "POST" && rerunMatch) {
+      return await rerunPipelineReposHandler(req, res, rerunMatch[1]);
     }
 
     const testMatch = url.pathname.match(

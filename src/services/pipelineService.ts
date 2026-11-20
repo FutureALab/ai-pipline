@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { createLogger } from "../config/logger.js";
 import {
+  getSkillCard,
   listCatalogRepos,
   listSkillCards,
   readSkillMarkdown,
@@ -385,6 +386,220 @@ export async function executeBatchPipelineTest(params: {
     card,
     allPassed,
     pipelineRuns,
+  };
+}
+
+/**
+ * Re-run one or more specific repositories (e.g. failed ones) in an existing
+ * test pipeline while preserving the status/logs of all other repositories.
+ */
+export async function rerunPipelineTestRepos(params: {
+  skillName: string;
+  apps: string[];
+  repoIds: string[];
+  mode: PipelineExecutionMode;
+}): Promise<{
+  card: SkillCardRecord;
+  allPassed: boolean;
+  pipelineRuns: RepoPipelineRun[];
+}> {
+  const existing = await getSkillCard(params.skillName);
+  const existingRuns: RepoPipelineRun[] = existing?.card.pipelineRuns
+    ? [...existing.card.pipelineRuns]
+    : [];
+  const effectiveApps =
+    params.apps.length > 0 ? params.apps : (existing?.card.selectedApps ?? []);
+  const effectiveSelectedRepos =
+    existing?.card.selectedRepos && existing.card.selectedRepos.length > 0
+      ? existing.card.selectedRepos
+      : params.repoIds;
+
+  const catalogRepos = await listCatalogRepos();
+  const repoMap = new Map(catalogRepos.map((r) => [r.id, r]));
+  const targetRepoIds = [...new Set(params.repoIds)];
+  const targetRepos = targetRepoIds.map(
+    (id) =>
+      repoMap.get(id) ?? {
+        id,
+        name: id,
+        url: id.startsWith("http")
+          ? id
+          : `https://git.example.com/org/${id}.git`,
+        branch: "main",
+      }
+  );
+
+  // Mark target repos as running immediately in DB
+  const targetIdSet = new Set(targetRepoIds);
+  const mergedRuns: RepoPipelineRun[] = existingRuns.map((r) =>
+    targetIdSet.has(r.repoId)
+      ? {
+          ...r,
+          status: "running",
+          durationMs: 0,
+          jenkinsBuildNumber: undefined,
+          jenkinsBuildUrl: undefined,
+          jenkinsQueueUrl: undefined,
+          logs: [`[Jenkins] Re-running pipeline for repo "${r.repoName}"...`],
+        }
+      : r
+  );
+  for (const repo of targetRepos) {
+    if (!mergedRuns.some((r) => r.repoId === repo.id)) {
+      mergedRuns.push({
+        repoId: repo.id,
+        repoName: repo.name,
+        repoUrl: repo.url,
+        status: "running",
+        durationMs: 0,
+        logs: [`[Jenkins] Re-running pipeline for repo "${repo.name}"...`],
+      });
+    }
+  }
+
+  await upsertSkillCard(params.skillName, {
+    selectedApps: effectiveApps,
+    selectedRepos: effectiveSelectedRepos,
+    pipelineRuns: mergedRuns,
+    currentStep: 3,
+    progress: 66,
+    status: "testing",
+  });
+
+  if (params.mode === "jenkins") {
+    let buildWarn: string | null = null;
+    try {
+      await ensureJenkinsBundledBinaryForSkill(params.skillName);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      pipelineLog.warn(
+        { skillName: params.skillName, err },
+        "Auto-build of Jenkins binary failed during rerun; continuing with existing binary if present"
+      );
+      buildWarn = `[WARN] Auto-build binary failed: ${msg}`;
+    }
+
+    const skillContent = await readSkillMarkdown(params.skillName).catch(
+      () => ""
+    );
+
+    const rerunResults = await Promise.all(
+      targetRepos.map(async (repo): Promise<RepoPipelineRun> => {
+        const start = Date.now();
+        const jobName = `ai-skill-${params.skillName}-${repo.id}`;
+        try {
+          const result = await executeJenkinsJobWithXml({
+            jobName,
+            repoUrl: repo.url,
+            repoBranch: repo.branch,
+            skillName: params.skillName,
+            skillContent,
+            taskPrompt: `Apply skill ${params.skillName} for apps [${effectiveApps.join(", ")}] on repository ${repo.name}.`,
+            waitForCompletion: false,
+          });
+          const status: RepoPipelineRun["status"] =
+            result.status === "success"
+              ? "success"
+              : result.status === "queued"
+                ? "running"
+                : "failed";
+          return {
+            repoId: repo.id,
+            repoName: repo.name,
+            repoUrl: repo.url,
+            status,
+            durationMs: result.durationMs,
+            jenkinsJobName: result.jobName,
+            jenkinsBuildNumber: result.buildNumber,
+            jenkinsBuildUrl: result.buildUrl,
+            jenkinsQueueUrl: result.queueUrl,
+            logs: [
+              ...(buildWarn ? [buildWarn] : []),
+              `[Jenkins] Re-triggering pipeline for repo "${repo.name}" (${repo.url})`,
+              `[Jenkins] Target apps: ${effectiveApps.join(", ") || "none"}`,
+              ...result.logs,
+            ],
+          };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            repoId: repo.id,
+            repoName: repo.name,
+            repoUrl: repo.url,
+            status: "failed",
+            durationMs: Date.now() - start,
+            jenkinsJobName: jobName,
+            logs: [
+              ...(buildWarn ? [buildWarn] : []),
+              `[Jenkins] Re-triggering pipeline for repo "${repo.name}" (${repo.url})`,
+              `[Jenkins] Target apps: ${effectiveApps.join(", ") || "none"}`,
+              `[ERROR] ${msg}`,
+            ],
+          };
+        }
+      })
+    );
+
+    const resultById = new Map(rerunResults.map((r) => [r.repoId, r]));
+    const finalRuns = mergedRuns.map((r) => resultById.get(r.repoId) ?? r);
+
+    const anyRunning = finalRuns.some(
+      (r) => r.status === "running" || r.status === "pending"
+    );
+    const allPassed =
+      !anyRunning &&
+      finalRuns.length > 0 &&
+      finalRuns.every((r) => r.status === "success");
+    const nextStatus = anyRunning
+      ? "testing"
+      : allPassed
+        ? "test_passed"
+        : "test_failed";
+
+    const card = await upsertSkillCard(params.skillName, {
+      selectedApps: effectiveApps,
+      selectedRepos: effectiveSelectedRepos,
+      pipelineRuns: finalRuns,
+      currentStep: 3,
+      progress: allPassed ? 90 : 66,
+      status: nextStatus,
+    });
+
+    return {
+      card,
+      allPassed,
+      pipelineRuns: finalRuns,
+    };
+  }
+
+  // simulate / real modes: run requested repos and merge back
+  const updatedMap = new Map<string, RepoPipelineRun>();
+  for (const repo of targetRepos) {
+    const run = await runSingleRepoPipeline(
+      params.skillName,
+      repo,
+      effectiveApps,
+      params.mode
+    );
+    updatedMap.set(repo.id, run);
+  }
+
+  const finalRuns = mergedRuns.map((r) => updatedMap.get(r.repoId) ?? r);
+  const allPassed =
+    finalRuns.length > 0 && finalRuns.every((r) => r.status === "success");
+  const card = await upsertSkillCard(params.skillName, {
+    selectedApps: effectiveApps,
+    selectedRepos: effectiveSelectedRepos,
+    pipelineRuns: finalRuns,
+    currentStep: 3,
+    progress: allPassed ? 90 : 66,
+    status: allPassed ? "test_passed" : "test_failed",
+  });
+
+  return {
+    card,
+    allPassed,
+    pipelineRuns: finalRuns,
   };
 }
 

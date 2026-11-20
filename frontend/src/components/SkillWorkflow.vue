@@ -919,12 +919,12 @@
 
               <el-button
                 type="primary"
-                :loading="testing"
+                :loading="testing || hasRunningPipeline"
                 :disabled="selectedApps.length === 0 || selectedRepos.length !== 10"
                 style="width: 100%"
                 @click="handleRunPipeline"
               >
-                {{ testing ? "流水线执行中..." : "运行测试流水线" }}
+                {{ testing || hasRunningPipeline ? "流水线运行中..." : "运行测试流水线" }}
               </el-button>
             </el-form>
           </el-card>
@@ -935,12 +935,36 @@
             <template #header>
               <div class="repo-header">
                 <span class="panel-title">测试流水线状态与日志</span>
-                <el-tag
-                  v-if="pipelineRuns.length > 0"
-                  :type="allTestsPassed ? 'success' : 'danger'"
-                >
-                  {{ allTestsPassed ? "全部测试成功" : "存在失败流水线" }}
-                </el-tag>
+                <div v-if="pipelineRuns.length > 0" class="repo-header-actions">
+                  <el-button
+                    v-if="failedPipelineRuns.length > 0"
+                    size="small"
+                    type="warning"
+                    plain
+                    :loading="rerunningRepoIds.size > 0"
+                    :disabled="testing"
+                    @click="handleRerunFailedRepos"
+                  >
+                    重跑失败项 ({{ failedPipelineRuns.length }})
+                  </el-button>
+                  <el-tag
+                    :type="
+                      testing || hasRunningPipeline
+                        ? 'warning'
+                        : allTestsPassed
+                          ? 'success'
+                          : 'danger'
+                    "
+                  >
+                    {{
+                      testing || hasRunningPipeline
+                        ? `流水线运行中 (${completedPipelineCount}/${pipelineRuns.length})`
+                        : allTestsPassed
+                          ? "全部测试成功"
+                          : "存在失败流水线"
+                    }}
+                  </el-tag>
+                </div>
               </div>
             </template>
 
@@ -961,13 +985,34 @@
                   <div class="run-info">
                     <el-tag
                       size="small"
-                      :type="run.status === 'success' ? 'success' : 'danger'"
+                      :type="pipelineRunTagType(run.status)"
                     >
-                      {{ run.status === "success" ? "成功" : "失败" }}
+                      {{ pipelineRunStatusLabel(run.status) }}
                     </el-tag>
                     <span class="run-repo-name">{{ run.repoName }}</span>
                   </div>
-                  <span class="run-duration">{{ run.durationMs }} ms</span>
+                  <div class="run-row-right">
+                    <span class="run-duration">
+                      {{
+                        run.status === "running" && !run.durationMs
+                          ? "运行中..."
+                          : run.status === "pending"
+                            ? "排队中"
+                            : `${run.durationMs} ms`
+                      }}
+                    </span>
+                    <el-button
+                      v-if="run.status === 'failed'"
+                      size="small"
+                      type="primary"
+                      plain
+                      :loading="rerunningRepoIds.has(run.repoId)"
+                      :disabled="testing"
+                      @click.stop="handleRerunRepos([run.repoId])"
+                    >
+                      重跑
+                    </el-button>
+                  </div>
                 </div>
               </div>
 
@@ -1277,6 +1322,7 @@ import {
   getSkillDownloadUrl,
   publishSkill,
   removeWorkbenchTodo,
+  rerunTestPipelineRepos,
   restartGenerationJob,
   runTestPipeline,
   sendWorkbenchMessage,
@@ -1425,6 +1471,7 @@ const hasCustomOpenAI = computed(() =>
 const pipelineMode = ref<"simulate" | "real" | "jenkins">("simulate");
 const pipelineRuns = ref<RepoPipelineRun[]>([]);
 const activeLogRepoId = ref<string>("");
+const rerunningRepoIds = ref<Set<string>>(new Set());
 
 const activeFileContent = computed({
   get() {
@@ -1521,6 +1568,51 @@ const allTestsPassed = computed(
     pipelineRuns.value.length === 10 &&
     pipelineRuns.value.every((r) => r.status === "success")
 );
+
+const hasRunningPipeline = computed(() =>
+  pipelineRuns.value.some(
+    (r) => r.status === "running" || r.status === "pending"
+  )
+);
+
+const failedPipelineRuns = computed(() =>
+  pipelineRuns.value.filter((r) => r.status === "failed")
+);
+
+const completedPipelineCount = computed(
+  () =>
+    pipelineRuns.value.filter(
+      (r) => r.status === "success" || r.status === "failed"
+    ).length
+);
+
+function pipelineRunTagType(
+  status: RepoPipelineRun["status"]
+): "success" | "warning" | "info" | "danger" {
+  switch (status) {
+    case "success":
+      return "success";
+    case "running":
+      return "warning";
+    case "pending":
+      return "info";
+    default:
+      return "danger";
+  }
+}
+
+function pipelineRunStatusLabel(status: RepoPipelineRun["status"]): string {
+  switch (status) {
+    case "success":
+      return "成功";
+    case "running":
+      return "运行中";
+    case "pending":
+      return "排队中";
+    default:
+      return "失败";
+  }
+}
 
 const activeRun = computed(
   () =>
@@ -2461,7 +2553,15 @@ function startJenkinsLogSync() {
           activeLogRepoId.value = detail.card.pipelineRuns[0].repoId;
         }
       }
-      if (!testing.value && detail.card.status !== "testing") {
+      const stillRunning = detail.card.pipelineRuns?.some(
+        (r) => r.status === "running" || r.status === "pending"
+      );
+      if (
+        !testing.value &&
+        rerunningRepoIds.value.size === 0 &&
+        detail.card.status !== "testing" &&
+        !stillRunning
+      ) {
         stopJenkinsLogSync();
         if (detail.card.status === "test_passed") {
           ElMessage.success("10 个版本库流水线全部测试成功，可以点击发布了！");
@@ -2485,6 +2585,31 @@ async function handleRunPipeline() {
     return;
   }
 
+  // Immediately reflect "running" state in UI before backend finishes building/dispatching
+  const repoCatalogMap = new Map(catalogRepos.value.map((r) => [r.id, r]));
+  pipelineRuns.value = selectedRepos.value.map((id) => {
+    const repo = repoCatalogMap.get(id);
+    const repoName = repo?.name ?? id;
+    return {
+      repoId: id,
+      repoName,
+      repoUrl: repo?.url ?? "",
+      status: "running",
+      durationMs: 0,
+      logs: [
+        pipelineMode.value === "jenkins"
+          ? `[Jenkins] 正在构建二进制并并发下发任务 "${repoName}"...`
+          : `[Pipeline] 正在启动 "${repoName}" 测试流水线...`,
+      ],
+    };
+  });
+  if (
+    !activeLogRepoId.value ||
+    !selectedRepos.value.includes(activeLogRepoId.value)
+  ) {
+    activeLogRepoId.value = selectedRepos.value[0];
+  }
+
   testing.value = true;
   let keepPolling = false;
   startJenkinsLogSync();
@@ -2495,7 +2620,7 @@ async function handleRunPipeline() {
       mode: pipelineMode.value,
     });
     pipelineRuns.value = res.pipelineRuns;
-    if (res.pipelineRuns.length > 0) {
+    if (res.pipelineRuns.length > 0 && !activeLogRepoId.value) {
       activeLogRepoId.value = res.pipelineRuns[0].repoId;
     }
     if (res.card.status === "testing") {
@@ -2516,6 +2641,72 @@ async function handleRunPipeline() {
       stopJenkinsLogSync();
     }
   }
+}
+
+async function handleRerunRepos(repoIds: string[]) {
+  if (repoIds.length === 0) return;
+  if (selectedApps.value.length === 0) {
+    ElMessage.warning("请至少选择 1 个相关应用");
+    return;
+  }
+
+  const targetSet = new Set(repoIds);
+  const nextRerunning = new Set(rerunningRepoIds.value);
+  for (const id of repoIds) nextRerunning.add(id);
+  rerunningRepoIds.value = nextRerunning;
+
+  // Immediately switch targeted rows to "running" state in UI
+  pipelineRuns.value = pipelineRuns.value.map((run) =>
+    targetSet.has(run.repoId)
+      ? {
+          ...run,
+          status: "running",
+          durationMs: 0,
+          logs: [
+            pipelineMode.value === "jenkins"
+              ? `[Jenkins] 正在重新构建并下发任务 "${run.repoName}"...`
+              : `[Pipeline] 正在重新执行 "${run.repoName}" 测试流水线...`,
+          ],
+        }
+      : run
+  );
+  activeLogRepoId.value = repoIds[0];
+
+  let keepPolling = false;
+  startJenkinsLogSync();
+  try {
+    const res = await rerunTestPipelineRepos(form.skillName, {
+      apps: selectedApps.value,
+      repos: repoIds,
+      mode: pipelineMode.value,
+    });
+    pipelineRuns.value = res.pipelineRuns;
+    if (res.card.status === "testing") {
+      keepPolling = true;
+      ElMessage.success(
+        `已重新提交 ${repoIds.length} 个版本库测试任务，正在实时同步日志...`
+      );
+    } else if (res.allPassed) {
+      ElMessage.success("重跑完成，10 个版本库流水线已全部测试成功！");
+    } else {
+      ElMessage.error("重跑后仍有失败的流水线，请查看控制台日志");
+    }
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "重跑测试流水线失败");
+  } finally {
+    const remaining = new Set(rerunningRepoIds.value);
+    for (const id of repoIds) remaining.delete(id);
+    rerunningRepoIds.value = remaining;
+    if (!keepPolling && !hasRunningPipeline.value) {
+      stopJenkinsLogSync();
+    }
+  }
+}
+
+function handleRerunFailedRepos() {
+  const failedIds = failedPipelineRuns.value.map((r) => r.repoId);
+  if (failedIds.length === 0) return;
+  void handleRerunRepos(failedIds);
 }
 
 async function handlePublish() {
@@ -2784,6 +2975,13 @@ async function handlePublish() {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
+}
+
+.repo-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .pipeline-results {
@@ -2825,6 +3023,12 @@ async function handlePublish() {
 .run-repo-name {
   font-weight: 500;
   font-size: 13px;
+}
+
+.run-row-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .run-duration {

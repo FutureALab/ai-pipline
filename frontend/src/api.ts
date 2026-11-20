@@ -747,6 +747,23 @@ export function runTestPipeline(
   );
 }
 
+export function rerunTestPipelineRepos(
+  skillName: string,
+  payload: { apps: string[]; repos: string[]; mode: "simulate" | "real" | "jenkins" }
+): Promise<{
+  card: SkillCardRecord;
+  allPassed: boolean;
+  pipelineRuns: RepoPipelineRun[];
+}> {
+  return request(
+    `/api/skills/${encodeURIComponent(skillName)}/test-pipeline/rerun`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
 export function publishSkill(
   skillName: string
 ): Promise<{ card: SkillCardRecord }> {
