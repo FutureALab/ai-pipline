@@ -8,6 +8,7 @@ import {
 import { normalizeSkillName } from "../repositories/skillStorage.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import {
+  abortPipelineTestRepos,
   executeBatchPipelineTest,
   rerunPipelineTestRepos,
   type PipelineExecutionMode,
@@ -80,6 +81,28 @@ export async function rerunPipelineReposHandler(
     apps,
     repoIds,
     mode,
+  });
+  sendJson(res, 200, result);
+}
+
+export async function abortPipelineReposHandler(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  rawName: string
+): Promise<void> {
+  const name = normalizeSkillName(decodeURIComponent(rawName));
+  const body: Record<string, unknown> = await readJsonBody(req).catch(
+    () => ({} as Record<string, unknown>)
+  );
+  const repoIds = Array.isArray(body.repos)
+    ? body.repos.filter(
+        (x): x is string => typeof x === "string" && Boolean(x.trim())
+      )
+    : undefined;
+
+  const result = await abortPipelineTestRepos({
+    skillName: name,
+    repoIds: repoIds && repoIds.length > 0 ? repoIds : undefined,
   });
   sendJson(res, 200, result);
 }

@@ -18,6 +18,18 @@ export function getRedisClient(): Redis {
 }
 
 /**
+ * Create a dedicated Redis connection for blocking commands (e.g. BLPOP)
+ * so the shared command connection is never blocked.
+ */
+export function createBlockingRedisClient(): Redis | null {
+  if (!redisReady || !redisClient) return null;
+  return redisClient.duplicate({
+    maxRetriesPerRequest: null,
+    lazyConnect: false,
+  });
+}
+
+/**
  * Initialize Redis connection on startup (for user auth lookup, caching, etc.).
  */
 export async function initRedis(): Promise<boolean> {

@@ -18,6 +18,7 @@ import {
   listMcpsHandler,
 } from "../controllers/mcpController.js";
 import {
+  abortPipelineReposHandler,
   getCatalogHandler,
   publishSkillHandler,
   rerunPipelineReposHandler,
@@ -240,6 +241,13 @@ export async function routeRequest(
     );
     if (method === "GET" && downloadMatch) {
       return await downloadSkillHandler(res, downloadMatch[1]);
+    }
+
+    const abortMatch = url.pathname.match(
+      /^\/api\/skills\/([^/]+)\/test-pipeline\/abort$/
+    );
+    if (method === "POST" && abortMatch) {
+      return await abortPipelineReposHandler(req, res, abortMatch[1]);
     }
 
     const rerunMatch = url.pathname.match(

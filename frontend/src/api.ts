@@ -764,6 +764,23 @@ export function rerunTestPipelineRepos(
   );
 }
 
+export function abortTestPipelineRepos(
+  skillName: string,
+  repos?: string[]
+): Promise<{
+  card: SkillCardRecord;
+  abortedRepoIds: string[];
+  pipelineRuns: RepoPipelineRun[];
+}> {
+  return request(
+    `/api/skills/${encodeURIComponent(skillName)}/test-pipeline/abort`,
+    {
+      method: "POST",
+      body: JSON.stringify(repos && repos.length > 0 ? { repos } : {}),
+    }
+  );
+}
+
 export function publishSkill(
   skillName: string
 ): Promise<{ card: SkillCardRecord }> {

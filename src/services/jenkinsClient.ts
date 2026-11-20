@@ -288,6 +288,64 @@ export async function resolveJenkinsQueueItem(queueUrl: string): Promise<{
   };
 }
 
+export async function abortJenkinsJob(params: {
+  jobName?: string;
+  buildNumber?: number;
+  queueUrl?: string;
+}): Promise<{ aborted: boolean; detail: string }> {
+  const cfg = getJenkinsConfig();
+  const authHeaders = buildAuthHeaders(cfg);
+  const crumbHeaders = await fetchJenkinsCrumb(cfg);
+  const headers = { ...authHeaders, ...crumbHeaders };
+
+  if (params.jobName && params.buildNumber) {
+    const encodedJob = encodeURIComponent(params.jobName);
+    const stopUrl = `${cfg.baseUrl}/job/${encodedJob}/${params.buildNumber}/stop`;
+    const res = await fetch(stopUrl, { method: "POST", headers });
+    if (res.ok || res.status === 302 || res.status === 204) {
+      return {
+        aborted: true,
+        detail: `Stopped Jenkins build ${params.jobName} #${params.buildNumber}`,
+      };
+    }
+    // Fallback to /term if /stop didn't accept
+    const termRes = await fetch(
+      `${cfg.baseUrl}/job/${encodedJob}/${params.buildNumber}/term`,
+      { method: "POST", headers }
+    ).catch(() => null);
+    if (termRes && (termRes.ok || termRes.status === 302 || termRes.status === 204)) {
+      return {
+        aborted: true,
+        detail: `Terminated Jenkins build ${params.jobName} #${params.buildNumber}`,
+      };
+    }
+    return {
+      aborted: false,
+      detail: `Jenkins stop returned HTTP ${res.status}`,
+    };
+  }
+
+  if (params.queueUrl) {
+    const match = params.queueUrl.match(/\/queue\/item\/(\d+)/);
+    if (match?.[1]) {
+      const cancelUrl = `${cfg.baseUrl}/queue/cancelItem?id=${match[1]}`;
+      const res = await fetch(cancelUrl, { method: "POST", headers });
+      if (res.ok || res.status === 204 || res.status === 302) {
+        return {
+          aborted: true,
+          detail: `Cancelled Jenkins queue item #${match[1]}`,
+        };
+      }
+      return {
+        aborted: false,
+        detail: `Jenkins queue cancel returned HTTP ${res.status}`,
+      };
+    }
+  }
+
+  return { aborted: false, detail: "No Jenkins buildNumber or queueUrl to stop" };
+}
+
 export async function getJenkinsBuildStatus(
   jobName: string,
   buildNumber: number

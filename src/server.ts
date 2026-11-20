@@ -5,7 +5,10 @@ import { ensureTelemetryInitialized } from "./config/telemetry.js";
 import { getDbDriver, initDatabase } from "./db/database.js";
 import { initRedis, isRedisConnected } from "./db/redis.js";
 import { routeRequest } from "./routes/router.js";
-import { startJenkinsLogSyncScheduler } from "./services/pipelineService.js";
+import {
+  initJenkinsPipelineQueueWorker,
+  startJenkinsLogSyncScheduler,
+} from "./services/pipelineService.js";
 
 const serverLog = createLogger("server");
 const httpLog = createLogger("http");
@@ -20,6 +23,7 @@ export async function startServer(port: number = 3000): Promise<http.Server> {
   await initDatabase();
   await initRedis();
   ensureTelemetryInitialized();
+  await initJenkinsPipelineQueueWorker();
   startJenkinsLogSyncScheduler(3000);
 
   const server = http.createServer((req, res) => {

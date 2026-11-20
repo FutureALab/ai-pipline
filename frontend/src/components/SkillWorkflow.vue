@@ -937,6 +937,16 @@
                 <span class="panel-title">测试流水线状态与日志</span>
                 <div v-if="pipelineRuns.length > 0" class="repo-header-actions">
                   <el-button
+                    v-if="hasRunningPipeline"
+                    size="small"
+                    type="danger"
+                    plain
+                    :loading="abortingRepoIds.size > 0"
+                    @click="handleAbortAllRunning"
+                  >
+                    中断全部
+                  </el-button>
+                  <el-button
                     v-if="failedPipelineRuns.length > 0"
                     size="small"
                     type="warning"
@@ -1001,6 +1011,16 @@
                             : `${run.durationMs} ms`
                       }}
                     </span>
+                    <el-button
+                      v-if="run.status === 'running' || run.status === 'pending'"
+                      size="small"
+                      type="danger"
+                      plain
+                      :loading="abortingRepoIds.has(run.repoId)"
+                      @click.stop="handleAbortRepos([run.repoId])"
+                    >
+                      中断
+                    </el-button>
                     <el-button
                       v-if="run.status === 'failed'"
                       size="small"
@@ -1305,6 +1325,7 @@ import TodoPanel from "./workbench/TodoPanel.vue";
 import ToolCallsView from "./workbench/ToolCallsView.vue";
 import {
   abortGenerationJob,
+  abortTestPipelineRepos,
   abortWorkbenchSession,
   addWorkbenchTodo,
   closeWorkbenchSession,
@@ -1472,6 +1493,7 @@ const pipelineMode = ref<"simulate" | "real" | "jenkins">("simulate");
 const pipelineRuns = ref<RepoPipelineRun[]>([]);
 const activeLogRepoId = ref<string>("");
 const rerunningRepoIds = ref<Set<string>>(new Set());
+const abortingRepoIds = ref<Set<string>>(new Set());
 
 const activeFileContent = computed({
   get() {
@@ -2707,6 +2729,42 @@ function handleRerunFailedRepos() {
   const failedIds = failedPipelineRuns.value.map((r) => r.repoId);
   if (failedIds.length === 0) return;
   void handleRerunRepos(failedIds);
+}
+
+async function handleAbortRepos(repoIds: string[]) {
+  if (repoIds.length === 0 || !form.skillName.trim()) return;
+  const nextAborting = new Set(abortingRepoIds.value);
+  for (const id of repoIds) nextAborting.add(id);
+  abortingRepoIds.value = nextAborting;
+
+  try {
+    const res = await abortTestPipelineRepos(form.skillName, repoIds);
+    pipelineRuns.value = res.pipelineRuns;
+    if (res.abortedRepoIds.length > 0) {
+      ElMessage.warning(
+        `已中断 ${res.abortedRepoIds.length} 个任务，现在可直接点击「重跑」`
+      );
+    } else {
+      ElMessage.info("目标任务已结束，无需中断");
+    }
+    if (!hasRunningPipeline.value && !testing.value) {
+      stopJenkinsLogSync();
+    }
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : "中断任务失败");
+  } finally {
+    const remaining = new Set(abortingRepoIds.value);
+    for (const id of repoIds) remaining.delete(id);
+    abortingRepoIds.value = remaining;
+  }
+}
+
+function handleAbortAllRunning() {
+  const activeIds = pipelineRuns.value
+    .filter((r) => r.status === "running" || r.status === "pending")
+    .map((r) => r.repoId);
+  if (activeIds.length === 0) return;
+  void handleAbortRepos(activeIds);
 }
 
 async function handlePublish() {

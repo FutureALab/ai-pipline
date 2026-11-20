@@ -63,6 +63,8 @@ export interface RepoPipelineRun {
   jenkinsBuildNumber?: number;
   jenkinsBuildUrl?: string;
   jenkinsQueueUrl?: string;
+  startedAt?: number;
+  lastUpdatedAt?: number;
 }
 
 export interface UserMcpServer {

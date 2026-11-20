@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -17,14 +18,170 @@ import type {
   SkillCardRecord,
 } from "../types/skill.js";
 import {
+  abortJenkinsJob,
   executeJenkinsJobWithXml,
   getJenkinsBuildStatus,
   resolveJenkinsQueueItem,
 } from "./jenkinsClient.js";
+import {
+  enqueueJenkinsDispatchTasks,
+  getJenkinsConcurrencyLimit,
+  isTaskPendingInQueue,
+  markJenkinsTasksAborted,
+  releaseJenkinsSemaphorePermit,
+  startJenkinsDispatchWorker,
+  type JenkinsQueuedTask,
+} from "./jenkinsDispatchQueue.js";
 import { runSkillInRepo } from "./skillRunner.js";
 
 const execFileAsync = promisify(execFile);
 const pipelineLog = createLogger("pipeline");
+
+/** Per-skill mutex to serialize pipeline_runs DB updates across concurrent workers */
+const skillCardLocks = new Map<string, Promise<unknown>>();
+async function withSkillCardLock<T>(
+  skillName: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const prev = skillCardLocks.get(skillName) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((r) => {
+    release = r;
+  });
+  skillCardLocks.set(
+    skillName,
+    prev.then(() => next)
+  );
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (skillCardLocks.get(skillName) === next) {
+      skillCardLocks.delete(skillName);
+    }
+  }
+}
+
+async function dispatchSingleQueuedJenkinsTask(
+  task: JenkinsQueuedTask
+): Promise<void> {
+  const start = Date.now();
+  try {
+    const result = await executeJenkinsJobWithXml({
+      jobName: task.jobName,
+      repoUrl: task.repoUrl,
+      repoBranch: task.repoBranch,
+      skillName: task.skillName,
+      skillContent: task.skillContent,
+      taskPrompt: task.taskPrompt,
+      waitForCompletion: false,
+    });
+
+    const now = Date.now();
+    const status: RepoPipelineRun["status"] =
+      result.status === "success"
+        ? "success"
+        : result.status === "queued"
+          ? "running"
+          : "failed";
+
+    const updatedRun: RepoPipelineRun = {
+      repoId: task.repoId,
+      repoName: task.repoName,
+      repoUrl: task.repoUrl,
+      status,
+      durationMs: result.durationMs,
+      jenkinsJobName: result.jobName,
+      jenkinsBuildNumber: result.buildNumber,
+      jenkinsBuildUrl: result.buildUrl,
+      jenkinsQueueUrl: result.queueUrl,
+      startedAt: start,
+      lastUpdatedAt: now,
+      logs: [
+        ...(task.binaryTarget
+          ? [
+              `[Binary] Built ${task.binaryTarget} binary with embedded skill "${task.skillName}"`,
+            ]
+          : []),
+        ...(task.buildWarn ? [task.buildWarn] : []),
+        `[Jenkins] Triggering pipeline for repo "${task.repoName}" (${task.repoUrl})`,
+        `[Jenkins] Target apps: ${task.apps.join(", ") || "none"}`,
+        ...result.logs,
+      ],
+    };
+
+    await withSkillCardLock(task.skillName, async () => {
+      const latest = await getSkillCard(task.skillName);
+      if (!latest) return;
+      const runs = latest.card.pipelineRuns.map((r) =>
+        r.repoId === task.repoId ? updatedRun : r
+      );
+      if (!runs.some((r) => r.repoId === task.repoId)) {
+        runs.push(updatedRun);
+      }
+      await upsertSkillCard(task.skillName, { pipelineRuns: runs });
+    });
+
+    if (status === "success" || status === "failed") {
+      await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const failedRun: RepoPipelineRun = {
+      repoId: task.repoId,
+      repoName: task.repoName,
+      repoUrl: task.repoUrl,
+      status: "failed",
+      durationMs: Date.now() - start,
+      jenkinsJobName: task.jobName,
+      startedAt: start,
+      lastUpdatedAt: Date.now(),
+      logs: [
+        ...(task.buildWarn ? [task.buildWarn] : []),
+        `[Jenkins] Triggering pipeline for repo "${task.repoName}" (${task.repoUrl})`,
+        `[Jenkins] Target apps: ${task.apps.join(", ") || "none"}`,
+        `[ERROR] ${msg}`,
+      ],
+    };
+
+    await withSkillCardLock(task.skillName, async () => {
+      const latest = await getSkillCard(task.skillName);
+      if (!latest) return;
+      const runs = latest.card.pipelineRuns.map((r) =>
+        r.repoId === task.repoId ? failedRun : r
+      );
+      const allTerminal =
+        runs.length > 0 &&
+        runs.every((r) => r.status === "success" || r.status === "failed");
+      const allPassed = allTerminal && runs.every((r) => r.status === "success");
+      await upsertSkillCard(task.skillName, {
+        pipelineRuns: runs,
+        ...(latest.card.status === "testing" && allTerminal
+          ? {
+              progress: allPassed ? 90 : 66,
+              status: allPassed ? "test_passed" : "test_failed",
+            }
+          : {}),
+      });
+    });
+
+    await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
+  }
+}
+
+export async function initJenkinsPipelineQueueWorker(): Promise<void> {
+  await startJenkinsDispatchWorker(dispatchSingleQueuedJenkinsTask);
+}
+
+/** Max time (ms) a running/pending pipeline item may stay without Jenkins build/queue response before auto-failing (default 45s) */
+const PIPELINE_NO_RESPONSE_TIMEOUT_MS = Number(
+  process.env.PIPELINE_NO_RESPONSE_TIMEOUT_MS || 45_000
+);
+/** Max time (ms) a building Jenkins job may produce zero console log updates before auto-failing (default 60s) */
+const PIPELINE_IDLE_LOG_TIMEOUT_MS = Number(
+  process.env.PIPELINE_IDLE_LOG_TIMEOUT_MS || 60_000
+);
 
 export type PipelineExecutionMode = "real" | "simulate" | "jenkins";
 
@@ -244,87 +401,56 @@ export async function executeBatchPipelineTest(params: {
     }
 
     const skillContent = await readSkillMarkdown(params.skillName).catch(() => "");
+    const limit = getJenkinsConcurrencyLimit();
+    const now = Date.now();
 
-    // Fire ALL selected repos to Jenkins concurrently without waiting for each build to complete
-    const dispatchedRuns: RepoPipelineRun[] = await Promise.all(
-      selectedRepos.map(async (repo) => {
-        const start = Date.now();
-        const jobName = `ai-skill-${params.skillName}-${repo.id}`;
-        try {
-          const result = await executeJenkinsJobWithXml({
-            jobName,
-            repoUrl: repo.url,
-            repoBranch: repo.branch,
-            skillName: params.skillName,
-            skillContent,
-            taskPrompt: `Apply skill ${params.skillName} for apps [${params.apps.join(", ")}] on repository ${repo.name}.`,
-            waitForCompletion: false,
-          });
-          const status: RepoPipelineRun["status"] =
-            result.status === "success"
-              ? "success"
-              : result.status === "queued"
-                ? "running"
-                : "failed";
-          return {
-            repoId: repo.id,
-            repoName: repo.name,
-            repoUrl: repo.url,
-            status,
-            durationMs: result.durationMs,
-            jenkinsJobName: result.jobName,
-            jenkinsBuildNumber: result.buildNumber,
-            jenkinsBuildUrl: result.buildUrl,
-            jenkinsQueueUrl: result.queueUrl,
-            logs: [
-              ...(buildWarn ? [buildWarn] : []),
-              `[Jenkins] Triggering pipeline for repo "${repo.name}" (${repo.url})`,
-              `[Jenkins] Target apps: ${params.apps.join(", ") || "none"}`,
-              ...result.logs,
-            ],
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            repoId: repo.id,
-            repoName: repo.name,
-            repoUrl: repo.url,
-            status: "failed",
-            durationMs: Date.now() - start,
-            jenkinsJobName: jobName,
-            logs: [
-              ...(buildWarn ? [buildWarn] : []),
-              `[Jenkins] Triggering pipeline for repo "${repo.name}" (${repo.url})`,
-              `[Jenkins] Target apps: ${params.apps.join(", ") || "none"}`,
-              `[ERROR] ${msg}`,
-            ],
-          };
-        }
+    const queuedRuns: RepoPipelineRun[] = selectedRepos.map((repo) => ({
+      repoId: repo.id,
+      repoName: repo.name,
+      repoUrl: repo.url,
+      status: "pending",
+      durationMs: 0,
+      jenkinsJobName: `ai-skill-${params.skillName}-${repo.id}`,
+      startedAt: now,
+      lastUpdatedAt: now,
+      logs: [
+        ...(buildWarn ? [buildWarn] : []),
+        `[Queue] 已进入 Redis 阻塞队列，等待信号量槽位（并发上限: ${limit}）...`,
+      ],
+    }));
+
+    const card = await withSkillCardLock(params.skillName, () =>
+      upsertSkillCard(params.skillName, {
+        selectedApps: params.apps,
+        selectedRepos: params.repoIds,
+        pipelineRuns: queuedRuns,
+        currentStep: 3,
+        progress: 66,
+        status: "testing",
       })
     );
 
-    const anyRunning = dispatchedRuns.some((r) => r.status === "running");
-    const allPassed =
-      !anyRunning && dispatchedRuns.every((r) => r.status === "success");
-    const nextStatus = anyRunning
-      ? "testing"
-      : allPassed
-        ? "test_passed"
-        : "test_failed";
-
-    const card = await upsertSkillCard(params.skillName, {
-      selectedApps: params.apps,
-      selectedRepos: params.repoIds,
-      pipelineRuns: dispatchedRuns,
-      currentStep: 3,
-      progress: allPassed ? 90 : 66,
-      status: nextStatus,
-    });
+    await enqueueJenkinsDispatchTasks(
+      selectedRepos.map((repo) => ({
+        taskId: crypto.randomUUID(),
+        skillName: params.skillName,
+        repoId: repo.id,
+        repoName: repo.name,
+        repoUrl: repo.url,
+        repoBranch: repo.branch,
+        apps: params.apps,
+        jobName: `ai-skill-${params.skillName}-${repo.id}`,
+        taskPrompt: `Apply skill ${params.skillName} for apps [${params.apps.join(", ")}] on repository ${repo.name}.`,
+        skillContent,
+        buildWarn,
+        enqueuedAt: now,
+      }))
+    );
 
     return {
       card,
-      allPassed,
-      pipelineRuns: dispatchedRuns,
+      allPassed: false,
+      pipelineRuns: queuedRuns,
     };
   }
 
@@ -430,6 +556,7 @@ export async function rerunPipelineTestRepos(params: {
   );
 
   // Mark target repos as running immediately in DB
+  const rerunStartedAt = Date.now();
   const targetIdSet = new Set(targetRepoIds);
   const mergedRuns: RepoPipelineRun[] = existingRuns.map((r) =>
     targetIdSet.has(r.repoId)
@@ -440,6 +567,8 @@ export async function rerunPipelineTestRepos(params: {
           jenkinsBuildNumber: undefined,
           jenkinsBuildUrl: undefined,
           jenkinsQueueUrl: undefined,
+          startedAt: rerunStartedAt,
+          lastUpdatedAt: rerunStartedAt,
           logs: [`[Jenkins] Re-running pipeline for repo "${r.repoName}"...`],
         }
       : r
@@ -452,6 +581,8 @@ export async function rerunPipelineTestRepos(params: {
         repoUrl: repo.url,
         status: "running",
         durationMs: 0,
+        startedAt: rerunStartedAt,
+        lastUpdatedAt: rerunStartedAt,
         logs: [`[Jenkins] Re-running pipeline for repo "${repo.name}"...`],
       });
     }
@@ -482,92 +613,73 @@ export async function rerunPipelineTestRepos(params: {
     const skillContent = await readSkillMarkdown(params.skillName).catch(
       () => ""
     );
+    const limit = getJenkinsConcurrencyLimit();
+    const now = Date.now();
 
-    const rerunResults = await Promise.all(
-      targetRepos.map(async (repo): Promise<RepoPipelineRun> => {
-        const start = Date.now();
-        const jobName = `ai-skill-${params.skillName}-${repo.id}`;
-        try {
-          const result = await executeJenkinsJobWithXml({
-            jobName,
-            repoUrl: repo.url,
-            repoBranch: repo.branch,
-            skillName: params.skillName,
-            skillContent,
-            taskPrompt: `Apply skill ${params.skillName} for apps [${effectiveApps.join(", ")}] on repository ${repo.name}.`,
-            waitForCompletion: false,
-          });
-          const status: RepoPipelineRun["status"] =
-            result.status === "success"
-              ? "success"
-              : result.status === "queued"
-                ? "running"
-                : "failed";
-          return {
-            repoId: repo.id,
-            repoName: repo.name,
-            repoUrl: repo.url,
-            status,
-            durationMs: result.durationMs,
-            jenkinsJobName: result.jobName,
-            jenkinsBuildNumber: result.buildNumber,
-            jenkinsBuildUrl: result.buildUrl,
-            jenkinsQueueUrl: result.queueUrl,
-            logs: [
-              ...(buildWarn ? [buildWarn] : []),
-              `[Jenkins] Re-triggering pipeline for repo "${repo.name}" (${repo.url})`,
-              `[Jenkins] Target apps: ${effectiveApps.join(", ") || "none"}`,
-              ...result.logs,
-            ],
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return {
-            repoId: repo.id,
-            repoName: repo.name,
-            repoUrl: repo.url,
-            status: "failed",
-            durationMs: Date.now() - start,
-            jenkinsJobName: jobName,
-            logs: [
-              ...(buildWarn ? [buildWarn] : []),
-              `[Jenkins] Re-triggering pipeline for repo "${repo.name}" (${repo.url})`,
-              `[Jenkins] Target apps: ${effectiveApps.join(", ") || "none"}`,
-              `[ERROR] ${msg}`,
-            ],
-          };
+    const queuedById = new Map<string, RepoPipelineRun>();
+    for (const repo of targetRepos) {
+      queuedById.set(repo.id, {
+        repoId: repo.id,
+        repoName: repo.name,
+        repoUrl: repo.url,
+        status: "pending",
+        durationMs: 0,
+        jenkinsJobName: `ai-skill-${params.skillName}-${repo.id}`,
+        startedAt: now,
+        lastUpdatedAt: now,
+        logs: [
+          ...(buildWarn ? [buildWarn] : []),
+          `[Queue] 已重新进入 Redis 阻塞队列，等待信号量槽位（并发上限: ${limit}）...`,
+        ],
+      });
+    }
+
+    const { card, finalRuns } = await withSkillCardLock(
+      params.skillName,
+      async () => {
+        const latest = await getSkillCard(params.skillName);
+        const baseRuns =
+          latest?.card.pipelineRuns && latest.card.pipelineRuns.length > 0
+            ? latest.card.pipelineRuns
+            : mergedRuns;
+        const nextRuns = baseRuns.map((r) => queuedById.get(r.repoId) ?? r);
+        for (const r of queuedById.values()) {
+          if (!nextRuns.some((item) => item.repoId === r.repoId)) {
+            nextRuns.push(r);
+          }
         }
-      })
+        const savedCard = await upsertSkillCard(params.skillName, {
+          selectedApps: effectiveApps,
+          selectedRepos: effectiveSelectedRepos,
+          pipelineRuns: nextRuns,
+          currentStep: 3,
+          progress: 66,
+          status: "testing",
+        });
+        return { card: savedCard, finalRuns: nextRuns };
+      }
     );
 
-    const resultById = new Map(rerunResults.map((r) => [r.repoId, r]));
-    const finalRuns = mergedRuns.map((r) => resultById.get(r.repoId) ?? r);
-
-    const anyRunning = finalRuns.some(
-      (r) => r.status === "running" || r.status === "pending"
+    await enqueueJenkinsDispatchTasks(
+      targetRepos.map((repo) => ({
+        taskId: crypto.randomUUID(),
+        skillName: params.skillName,
+        repoId: repo.id,
+        repoName: repo.name,
+        repoUrl: repo.url,
+        repoBranch: repo.branch,
+        apps: effectiveApps,
+        jobName: `ai-skill-${params.skillName}-${repo.id}`,
+        taskPrompt: `Apply skill ${params.skillName} for apps [${effectiveApps.join(", ")}] on repository ${repo.name}.`,
+        skillContent,
+        buildWarn,
+        enqueuedAt: now,
+      }))
     );
-    const allPassed =
-      !anyRunning &&
-      finalRuns.length > 0 &&
-      finalRuns.every((r) => r.status === "success");
-    const nextStatus = anyRunning
-      ? "testing"
-      : allPassed
-        ? "test_passed"
-        : "test_failed";
-
-    const card = await upsertSkillCard(params.skillName, {
-      selectedApps: effectiveApps,
-      selectedRepos: effectiveSelectedRepos,
-      pipelineRuns: finalRuns,
-      currentStep: 3,
-      progress: allPassed ? 90 : 66,
-      status: nextStatus,
-    });
 
     return {
       card,
-      allPassed,
+      allPassed: false,
       pipelineRuns: finalRuns,
     };
   }
@@ -599,6 +711,123 @@ export async function rerunPipelineTestRepos(params: {
   return {
     card,
     allPassed,
+    pipelineRuns: finalRuns,
+  };
+}
+
+/**
+ * Abort one or more (or all) running/pending Jenkins pipeline runs for a Skill:
+ * 1. Marks them aborted in the Redis dispatch queue (so queued tasks are skipped)
+ * 2. Stops any active Jenkins build or cancels any Jenkins queue item
+ * 3. Releases their Redis semaphore permits
+ * 4. Marks those runs as `failed` so the user can immediately click "重跑"
+ */
+export async function abortPipelineTestRepos(params: {
+  skillName: string;
+  repoIds?: string[];
+}): Promise<{
+  card: SkillCardRecord;
+  abortedRepoIds: string[];
+  pipelineRuns: RepoPipelineRun[];
+}> {
+  const existing = await getSkillCard(params.skillName);
+  if (!existing) {
+    throw new Error(`Skill "${params.skillName}" not found`);
+  }
+
+  const currentRuns = existing.card.pipelineRuns ?? [];
+  const requestedSet =
+    params.repoIds && params.repoIds.length > 0
+      ? new Set(params.repoIds)
+      : null;
+
+  const targetRuns = currentRuns.filter((r) => {
+    const matchesTarget = requestedSet ? requestedSet.has(r.repoId) : true;
+    return matchesTarget && (r.status === "running" || r.status === "pending");
+  });
+
+  const targetRepoIds = targetRuns.map((r) => r.repoId);
+  if (targetRepoIds.length === 0) {
+    return {
+      card: existing.card,
+      abortedRepoIds: [],
+      pipelineRuns: currentRuns,
+    };
+  }
+
+  // 1. Mark aborted in Redis queue & release held semaphore permits
+  await markJenkinsTasksAborted(params.skillName, targetRepoIds);
+
+  // 2. Best-effort stop on Jenkins server for already-dispatched builds/queues
+  const stopResults = await Promise.all(
+    targetRuns.map(async (run) => {
+      if (!run.jenkinsBuildNumber && !run.jenkinsQueueUrl) {
+        return { repoId: run.repoId, note: "已从 Redis 阻塞队列移除" };
+      }
+      try {
+        const res = await abortJenkinsJob({
+          jobName: run.jenkinsJobName,
+          buildNumber: run.jenkinsBuildNumber,
+          queueUrl: run.jenkinsQueueUrl,
+        });
+        return { repoId: run.repoId, note: res.detail };
+      } catch (err) {
+        return {
+          repoId: run.repoId,
+          note: err instanceof Error ? err.message : String(err),
+        };
+      }
+    })
+  );
+  const stopNoteById = new Map(stopResults.map((s) => [s.repoId, s.note]));
+  const abortedSet = new Set(targetRepoIds);
+  const now = Date.now();
+
+  const { card, finalRuns } = await withSkillCardLock(
+    params.skillName,
+    async () => {
+      const latest = await getSkillCard(params.skillName);
+      const baseRuns = latest?.card.pipelineRuns ?? currentRuns;
+      const nextRuns: RepoPipelineRun[] = baseRuns.map((r) => {
+        if (!abortedSet.has(r.repoId)) return r;
+        const startedAt = r.startedAt ?? now;
+        const note = stopNoteById.get(r.repoId);
+        return {
+          ...r,
+          status: "failed",
+          durationMs: r.durationMs || Math.max(1, now - startedAt),
+          lastUpdatedAt: now,
+          logs: [
+            ...r.logs,
+            `[Jenkins] 任务已被用户手动中断${note ? `（${note}）` : ""}，可点击「重跑」重新执行。`,
+          ],
+        };
+      });
+
+      const anyActive = nextRuns.some(
+        (r) => r.status === "running" || r.status === "pending"
+      );
+      const allPassed =
+        !anyActive &&
+        nextRuns.length > 0 &&
+        nextRuns.every((r) => r.status === "success");
+
+      const savedCard = await upsertSkillCard(params.skillName, {
+        pipelineRuns: nextRuns,
+        ...(!anyActive && latest?.card.status === "testing"
+          ? {
+              progress: allPassed ? 90 : 66,
+              status: allPassed ? "test_passed" : "test_failed",
+            }
+          : {}),
+      });
+      return { card: savedCard, finalRuns: nextRuns };
+    }
+  );
+
+  return {
+    card,
+    abortedRepoIds: targetRepoIds,
     pipelineRuns: finalRuns,
   };
 }
@@ -644,7 +873,64 @@ export async function executeDirectSkillJenkinsRuns(params: {
   );
   const wait = params.waitForCompletion === true;
 
-  // 2. Create & trigger a Jenkins job for each selected repository
+  // 2. When non-blocking, route through Redis blocking queue + semaphore so Jenkins isn't flooded
+  if (!wait) {
+    const limit = getJenkinsConcurrencyLimit();
+    const now = Date.now();
+    const queuedRuns: RepoPipelineRun[] = selectedRepos.map((repo) => ({
+      repoId: repo.id,
+      repoName: repo.name,
+      repoUrl: repo.url,
+      status: "pending",
+      durationMs: 0,
+      jenkinsJobName: `ai-skill-run-${params.skillName}-${repo.id}`,
+      startedAt: now,
+      lastUpdatedAt: now,
+      logs: [
+        `[Binary] Built ${binaryTarget} binary with embedded skill "${params.skillName}"`,
+        `[Queue] 已进入 Redis 阻塞队列，等待信号量槽位（并发上限: ${limit}）...`,
+      ],
+    }));
+
+    const card = await withSkillCardLock(params.skillName, () =>
+      upsertSkillCard(params.skillName, {
+        selectedApps: params.apps,
+        selectedRepos: params.repoIds,
+        pipelineRuns: queuedRuns,
+      })
+    );
+
+    await enqueueJenkinsDispatchTasks(
+      selectedRepos.map((repo) => {
+        const prompt = params.taskPrompt?.trim()
+          ? `${params.taskPrompt.trim()} (Target apps: [${params.apps.join(", ")}], repository: ${repo.name})`
+          : `Apply skill ${params.skillName} for apps [${params.apps.join(", ")}] on repository ${repo.name}.`;
+        return {
+          taskId: crypto.randomUUID(),
+          skillName: params.skillName,
+          repoId: repo.id,
+          repoName: repo.name,
+          repoUrl: repo.url,
+          repoBranch: repo.branch,
+          apps: params.apps,
+          jobName: `ai-skill-run-${params.skillName}-${repo.id}`,
+          taskPrompt: prompt,
+          skillContent,
+          binaryTarget,
+          enqueuedAt: now,
+        };
+      })
+    );
+
+    return {
+      skillName: params.skillName,
+      binaryTarget,
+      card,
+      pipelineRuns: queuedRuns,
+    };
+  }
+
+  // 2b. Blocking mode (waitForCompletion === true): execute directly and wait
   const pipelineRuns: RepoPipelineRun[] = await Promise.all(
     selectedRepos.map(async (repo) => {
       const start = Date.now();
@@ -743,12 +1029,31 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
     );
 
     for (const card of testingCards) {
+      const now = Date.now();
+      const cardUpdatedMs = Date.parse(card.updatedAt);
       let changed = false;
+      const completedRepoIds: string[] = [];
       const updatedRuns = await Promise.all(
         card.pipelineRuns.map(async (run) => {
-          if (run.status !== "running") {
+          if (run.status !== "running" && run.status !== "pending") {
             return run;
           }
+
+          // Tasks waiting in our Redis blocking queue for a semaphore permit must NOT be timed out prematurely
+          if (
+            run.status === "pending" &&
+            isTaskPendingInQueue(card.skillName, run.repoId)
+          ) {
+            return run;
+          }
+
+          const startedAt =
+            run.startedAt ??
+            (Number.isFinite(cardUpdatedMs) ? cardUpdatedMs : now);
+          const lastActivityAt =
+            run.lastUpdatedAt ??
+            run.startedAt ??
+            (Number.isFinite(cardUpdatedMs) ? cardUpdatedMs : now);
 
           let buildNumber = run.jenkinsBuildNumber;
           let buildUrl = run.jenkinsBuildUrl;
@@ -761,9 +1066,13 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
               );
               if (queueInfo.cancelled) {
                 changed = true;
+                completedRepoIds.push(run.repoId);
                 return {
                   ...run,
                   status: "failed" as const,
+                  durationMs: Math.max(1, now - startedAt),
+                  startedAt,
+                  lastUpdatedAt: now,
                   logs: [
                     ...run.logs,
                     "[Jenkins] Build was cancelled while waiting in queue.",
@@ -775,21 +1084,71 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
                 buildUrl = queueInfo.buildUrl || buildUrl;
                 changed = true;
               } else {
+                if (now - lastActivityAt >= PIPELINE_NO_RESPONSE_TIMEOUT_MS) {
+                  changed = true;
+                  completedRepoIds.push(run.repoId);
+                  return {
+                    ...run,
+                    status: "failed" as const,
+                    durationMs: Math.max(1, now - startedAt),
+                    startedAt,
+                    lastUpdatedAt: now,
+                    logs: [
+                      ...run.logs,
+                      `[ERROR] 超过 ${Math.round(PIPELINE_NO_RESPONSE_TIMEOUT_MS / 1000)} 秒未开始执行，已自动判定为失败，请点击「重跑」重试。`,
+                    ],
+                  };
+                }
                 if (queueInfo.why) {
                   const whyLine = `[Jenkins] Queued: ${queueInfo.why}`;
                   if (run.logs[run.logs.length - 1] !== whyLine) {
                     changed = true;
-                    return { ...run, logs: [...run.logs, whyLine] };
+                    return {
+                      ...run,
+                      startedAt,
+                      lastUpdatedAt: now,
+                      logs: [...run.logs, whyLine],
+                    };
                   }
                 }
                 return run;
               }
             } catch {
+              if (now - lastActivityAt >= PIPELINE_NO_RESPONSE_TIMEOUT_MS) {
+                changed = true;
+                completedRepoIds.push(run.repoId);
+                return {
+                  ...run,
+                  status: "failed" as const,
+                  durationMs: Math.max(1, now - startedAt),
+                  startedAt,
+                  lastUpdatedAt: now,
+                  logs: [
+                    ...run.logs,
+                    `[ERROR] 超过 ${Math.round(PIPELINE_NO_RESPONSE_TIMEOUT_MS / 1000)} 秒无法获取 Jenkins 队列状态，已自动判定为失败，请点击「重跑」重试。`,
+                  ],
+                };
+              }
               return run;
             }
           }
 
           if (!run.jenkinsJobName || !buildNumber) {
+            if (now - lastActivityAt >= PIPELINE_NO_RESPONSE_TIMEOUT_MS) {
+              changed = true;
+              completedRepoIds.push(run.repoId);
+              return {
+                ...run,
+                status: "failed" as const,
+                durationMs: Math.max(1, now - startedAt),
+                startedAt,
+                lastUpdatedAt: now,
+                logs: [
+                  ...run.logs,
+                  `[ERROR] 超过 ${Math.round(PIPELINE_NO_RESPONSE_TIMEOUT_MS / 1000)} 秒未收到 Jenkins 任务响应，已自动判定为失败，请点击「重跑」重试。`,
+                ],
+              };
+            }
             return run;
           }
 
@@ -805,25 +1164,87 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
                 : []),
               ...(build.consoleText ? build.consoleText.split("\n") : []),
             ];
-            const nextStatus: RepoPipelineRun["status"] = build.building
-              ? "running"
-              : build.result === "SUCCESS"
-                ? "success"
-                : "failed";
-            changed = true;
-            return {
-              ...run,
-              status: nextStatus,
-              durationMs: build.duration || run.durationMs,
-              jenkinsBuildNumber: buildNumber,
-              jenkinsBuildUrl: build.url || buildUrl,
-              logs: nextLogs,
-            };
+
+            if (!build.building) {
+              const nextStatus: RepoPipelineRun["status"] =
+                build.result === "SUCCESS" ? "success" : "failed";
+              changed = true;
+              completedRepoIds.push(run.repoId);
+              return {
+                ...run,
+                status: nextStatus,
+                durationMs: build.duration || Math.max(1, now - startedAt),
+                jenkinsBuildNumber: buildNumber,
+                jenkinsBuildUrl: build.url || buildUrl,
+                startedAt,
+                lastUpdatedAt: now,
+                logs: nextLogs,
+              };
+            }
+
+            const prevLogText = run.logs.join("\n");
+            const nextLogText = nextLogs.join("\n");
+            const logsChanged =
+              nextLogText !== prevLogText ||
+              buildNumber !== run.jenkinsBuildNumber;
+
+            if (logsChanged) {
+              changed = true;
+              return {
+                ...run,
+                status: "running" as const,
+                durationMs: build.duration || run.durationMs,
+                jenkinsBuildNumber: buildNumber,
+                jenkinsBuildUrl: build.url || buildUrl,
+                startedAt,
+                lastUpdatedAt: now,
+                logs: nextLogs,
+              };
+            }
+
+            if (now - lastActivityAt >= PIPELINE_IDLE_LOG_TIMEOUT_MS) {
+              changed = true;
+              completedRepoIds.push(run.repoId);
+              return {
+                ...run,
+                status: "failed" as const,
+                durationMs: build.duration || Math.max(1, now - startedAt),
+                jenkinsBuildNumber: buildNumber,
+                jenkinsBuildUrl: build.url || buildUrl,
+                startedAt,
+                lastUpdatedAt: now,
+                logs: [
+                  ...nextLogs,
+                  `[ERROR] 超过 ${Math.round(PIPELINE_IDLE_LOG_TIMEOUT_MS / 1000)} 秒无任何日志更新，已自动判定为失败，请点击「重跑」重试。`,
+                ],
+              };
+            }
+
+            return run;
           } catch {
+            if (now - lastActivityAt >= PIPELINE_NO_RESPONSE_TIMEOUT_MS) {
+              changed = true;
+              completedRepoIds.push(run.repoId);
+              return {
+                ...run,
+                status: "failed" as const,
+                durationMs: Math.max(1, now - startedAt),
+                startedAt,
+                lastUpdatedAt: now,
+                logs: [
+                  ...run.logs,
+                  `[ERROR] 超过 ${Math.round(PIPELINE_NO_RESPONSE_TIMEOUT_MS / 1000)} 秒无法获取 Jenkins 构建状态，已自动判定为失败，请点击「重跑」重试。`,
+                ],
+              };
+            }
             return run;
           }
         })
       );
+
+      for (const repoId of completedRepoIds) {
+        await releaseJenkinsSemaphorePermit(card.skillName, repoId);
+      }
 
       const allTerminal =
         updatedRuns.length > 0 &&
@@ -833,18 +1254,20 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
       const shouldFinalizeTesting = card.status === "testing" && allTerminal;
 
       if (changed || shouldFinalizeTesting) {
-        if (shouldFinalizeTesting) {
-          const allPassed = updatedRuns.every((r) => r.status === "success");
-          await upsertSkillCard(card.skillName, {
-            pipelineRuns: updatedRuns,
-            progress: allPassed ? 90 : 66,
-            status: allPassed ? "test_passed" : "test_failed",
-          }).catch(() => {});
-        } else {
-          await upsertSkillCard(card.skillName, {
-            pipelineRuns: updatedRuns,
-          }).catch(() => {});
-        }
+        await withSkillCardLock(card.skillName, async () => {
+          if (shouldFinalizeTesting) {
+            const allPassed = updatedRuns.every((r) => r.status === "success");
+            await upsertSkillCard(card.skillName, {
+              pipelineRuns: updatedRuns,
+              progress: allPassed ? 90 : 66,
+              status: allPassed ? "test_passed" : "test_failed",
+            }).catch(() => {});
+          } else {
+            await upsertSkillCard(card.skillName, {
+              pipelineRuns: updatedRuns,
+            }).catch(() => {});
+          }
+        });
       }
     }
   } catch {
