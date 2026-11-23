@@ -2,8 +2,13 @@ import type http from "node:http";
 import { readSkillMarkdown } from "../repositories/skillRepository.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
 import {
+  JenkinsExecuteSchema,
+  parseWithSchema,
+} from "../schemas/apiSchemas.js";
+import {
   executeJenkinsJobWithXml,
   getJenkinsBuildStatus,
+  getJenkinsClusterStatus,
 } from "../services/jenkinsClient.js";
 
 /**
@@ -14,48 +19,34 @@ export async function executeJenkinsXmlHandler(
   req: http.IncomingMessage,
   res: http.ServerResponse
 ): Promise<void> {
-  const body = await readJsonBody(req);
-  const jobName =
-    typeof body.jobName === "string" && body.jobName.trim()
-      ? body.jobName.trim()
-      : process.env.JENKINS_DEFAULT_JOB || "ai-skill-pipeline";
-  const xml = typeof body.xml === "string" ? body.xml : undefined;
-  const repoUrl = typeof body.repoUrl === "string" ? body.repoUrl : undefined;
-  const repoBranch =
-    typeof body.repoBranch === "string" ? body.repoBranch : undefined;
-  const skillName =
-    typeof body.skillName === "string" ? body.skillName : undefined;
-  const taskPrompt =
-    typeof body.taskPrompt === "string" ? body.taskPrompt : undefined;
-  const waitForCompletion = body.waitForCompletion !== false;
-  const timeoutMs =
-    typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
-  const parameters =
-    body.parameters && typeof body.parameters === "object"
-      ? (body.parameters as Record<string, string>)
-      : undefined;
-
-  if (!xml?.trim() && (!repoUrl?.trim() || !skillName?.trim())) {
+  const rawBody = await readJsonBody(req);
+  const parsed = parseWithSchema(JenkinsExecuteSchema, rawBody);
+  if (!parsed.ok) {
     return sendJson(res, 400, {
-      error: "Either `xml` or (`repoUrl` and `skillName`) is required",
+      error: parsed.error,
+      issues: parsed.issues,
     });
   }
 
-  const skillContent = skillName
-    ? await readSkillMarkdown(skillName).catch(() => "")
+  const data = parsed.data;
+  const jobName =
+    data.jobName || process.env.JENKINS_DEFAULT_JOB || "ai-skill-pipeline";
+
+  const skillContent = data.skillName
+    ? await readSkillMarkdown(data.skillName).catch(() => "")
     : "";
 
   const result = await executeJenkinsJobWithXml({
     jobName,
-    xml,
-    repoUrl,
-    repoBranch,
-    skillName,
+    xml: data.xml,
+    repoUrl: data.repoUrl,
+    repoBranch: data.repoBranch,
+    skillName: data.skillName,
     skillContent,
-    taskPrompt,
-    parameters,
-    waitForCompletion,
-    timeoutMs,
+    taskPrompt: data.taskPrompt,
+    parameters: data.parameters,
+    waitForCompletion: data.waitForCompletion !== false,
+    timeoutMs: data.timeoutMs,
   });
 
   sendJson(res, 200, result);
@@ -74,4 +65,12 @@ export async function getJenkinsBuildHandler(
 
   const status = await getJenkinsBuildStatus(jobName, buildNumber);
   sendJson(res, 200, { jobName, buildNumber, ...status });
+}
+
+export async function getJenkinsNodesHandler(
+  res: http.ServerResponse
+): Promise<void> {
+  sendJson(res, 200, {
+    nodes: getJenkinsClusterStatus(),
+  });
 }

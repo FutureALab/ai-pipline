@@ -1,10 +1,19 @@
 import type http from "node:http";
 import { createLogger } from "../config/logger.js";
+import { collectMetricsText, getMetricsContentType } from "../config/metrics.js";
+import {
+  getAuthMeHandler,
+  getOAuthAuthorizeUrlHandler,
+  logoutHandler,
+  oauthLoginHandler,
+  testAlertMailHandler,
+} from "../controllers/authController.js";
 
 const routerLog = createLogger("router");
 import {
   executeJenkinsXmlHandler,
   getJenkinsBuildHandler,
+  getJenkinsNodesHandler,
 } from "../controllers/jenkinsController.js";
 import {
   abortGenerationJobHandler,
@@ -55,6 +64,10 @@ import {
 } from "../controllers/workbenchController.js";
 import { getDbDriver, isDbConnected } from "../db/database.js";
 import { getRedisMode, isRedisConnected } from "../db/redis.js";
+import {
+  extractTokenFromRequest,
+  verifyTokenFromRedis,
+} from "../services/authService.js";
 import { sendCorsPreflight, sendJson } from "./httpUtils.js";
 
 export async function routeRequest(
@@ -78,6 +91,46 @@ export async function routeRequest(
         redisConnected: isRedisConnected(),
         redisMode: getRedisMode(),
       });
+    }
+
+    if (method === "GET" && url.pathname === "/metrics") {
+      const body = await collectMetricsText();
+      res.writeHead(200, {
+        "Content-Type": getMetricsContentType(),
+        "Cache-Control": "no-store",
+      });
+      res.end(body);
+      return;
+    }
+
+    // Auth endpoints (always accessible without global auth gate)
+    if (method === "GET" && url.pathname === "/api/auth/me") {
+      return await getAuthMeHandler(req, res, url);
+    }
+    if (method === "GET" && url.pathname === "/api/auth/oauth/url") {
+      return await getOAuthAuthorizeUrlHandler(res);
+    }
+    if (method === "POST" && url.pathname === "/api/auth/oauth/login") {
+      return await oauthLoginHandler(req, res);
+    }
+    if (method === "POST" && url.pathname === "/api/auth/logout") {
+      return await logoutHandler(req, res, url);
+    }
+
+    // Optional global Redis-backed API auth gate (enable with AUTH_REQUIRED=true)
+    if (process.env.AUTH_REQUIRED === "true" && url.pathname.startsWith("/api/")) {
+      const token = extractTokenFromRequest(req, url);
+      const auth = await verifyTokenFromRedis(token);
+      if (!auth.authenticated) {
+        return sendJson(res, 401, {
+          authenticated: false,
+          error: auth.reason,
+        });
+      }
+    }
+
+    if (method === "POST" && url.pathname === "/api/alerts/mail/test") {
+      return await testAlertMailHandler(req, res);
     }
 
     if (method === "GET" && url.pathname === "/api/traces") {
@@ -179,6 +232,10 @@ export async function routeRequest(
     }
     if (method === "DELETE" && wbSessionMatch) {
       return await closeWorkbenchSessionHandler(res, wbSessionMatch[1]);
+    }
+
+    if (method === "GET" && url.pathname === "/api/jenkins/nodes") {
+      return await getJenkinsNodesHandler(res);
     }
 
     if (method === "POST" && url.pathname === "/api/jenkins/execute") {

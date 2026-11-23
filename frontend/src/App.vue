@@ -1,5 +1,7 @@
 <template>
   <div class="app-shell">
+    <AuthLoginButton @auth-change="onAuthChange" />
+
     <SkillCardGrid
       v-if="viewMode === 'grid'"
       :skills="skills"
@@ -23,7 +25,8 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
-import { fetchSkills, type SkillCardRecord } from "./api";
+import { fetchSkills, type AuthUser, type SkillCardRecord } from "./api";
+import AuthLoginButton from "./components/AuthLoginButton.vue";
 import SkillCardGrid from "./components/SkillCardGrid.vue";
 import SkillWorkflow from "./components/SkillWorkflow.vue";
 
@@ -31,6 +34,14 @@ const viewMode = ref<"grid" | "workflow">("grid");
 const loading = ref(false);
 const skills = ref<SkillCardRecord[]>([]);
 const activeSkillName = ref<string | null>(null);
+const currentUser = ref<AuthUser | null>(null);
+
+function onAuthChange(user: AuthUser | null) {
+  currentUser.value = user;
+  if (user && viewMode.value === "grid") {
+    void loadSkills();
+  }
+}
 
 async function loadSkills() {
   loading.value = true;

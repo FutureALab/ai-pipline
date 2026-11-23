@@ -312,6 +312,19 @@ export async function startJenkinsDispatchWorker(
   queue.startWorker(processQueuedJenkinsTask);
 }
 
+export async function getJenkinsDispatchQueueMetrics() {
+  if (!dispatchQueue) {
+    return {
+      mode: isRedisConnected() ? ("bullmq" as const) : ("memory" as const),
+      waiting: 0,
+      active: 0,
+      completed: 0,
+      failed: 0,
+    };
+  }
+  return await dispatchQueue.getMetrics();
+}
+
 export async function stopJenkinsDispatchWorker(): Promise<void> {
   workerRunning = false;
   notifyMemPermitWaiters();

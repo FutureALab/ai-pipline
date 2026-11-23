@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { createLogger, getLogConfigSummary } from "./config/logger.js";
+import { recordHttpMetric } from "./config/metrics.js";
 import { ensureTelemetryInitialized } from "./config/telemetry.js";
 import { getDbDriver, initDatabase } from "./db/database.js";
 import { getRedisMode, initRedis, isRedisConnected } from "./db/redis.js";
@@ -38,6 +39,8 @@ export async function startServer(port: number = 3000): Promise<http.Server> {
       const statusCode = res.statusCode;
 
       if (method === "OPTIONS") return;
+
+      recordHttpMetric(method, pathname, statusCode, durationMs);
 
       const isQuietPoll =
         method === "GET" &&

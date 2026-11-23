@@ -1,4 +1,8 @@
 import crypto from "node:crypto";
+import {
+  decryptRecordValues,
+  encryptRecordValues,
+} from "../config/crypto.js";
 import { getDb, isMysqlDriver, toDbTimestamp } from "../db/database.js";
 import type { McpServerRow } from "../db/schema.js";
 import type { UserMcpServer } from "../types/skill.js";
@@ -43,7 +47,7 @@ function mapDbRowToMcp(row: McpServerRow): UserMcpServer {
     name: row.name,
     transport: "streamable-http",
     url: row.url,
-    headers: parseHeaders(row.headers),
+    headers: decryptRecordValues(parseHeaders(row.headers)),
     description: row.description ?? "",
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
@@ -113,6 +117,7 @@ export async function createOrUpdateMcpServer(input: {
   }
 
   const headers = parseHeaders(input.headers);
+  const encryptedHeaders = encryptRecordValues(headers);
   const id = crypto.randomUUID();
   const now = toDbTimestamp(new Date().toISOString());
   const db = getDb();
@@ -123,14 +128,14 @@ export async function createOrUpdateMcpServer(input: {
     name,
     transport: "streamable-http",
     url,
-    headers: JSON.stringify(headers),
+    headers: JSON.stringify(encryptedHeaders),
     description,
     created_at: now,
     updated_at: now,
   };
   const update = {
     url,
-    headers: JSON.stringify(headers),
+    headers: JSON.stringify(encryptedHeaders),
     description,
     updated_at: now,
   };

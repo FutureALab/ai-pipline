@@ -1,3 +1,4 @@
+import { decryptSecret, encryptSecret } from "./config/crypto.js";
 import { createLogger, getLogConfigSummary } from "./config/logger.js";
 import { getEmbeddedSkills } from "./repositories/embeddedSkills.js";
 import { listSkillsInDefaultDir } from "./repositories/skillStorage.js";
@@ -31,6 +32,8 @@ function printUsage(): void {
   ai-pipeline generate --prompt "<prompt>" [--name <skill-name>] [--scope global|project] [--cwd <dir>] [--model <provider/model>]
   ai-pipeline list [--scope global|project] [--cwd <dir>]
   ai-pipeline serve [--port 3000]
+  ai-pipeline encrypt <plaintext>
+  ai-pipeline decrypt <ENC(...)>
 `);
 }
 
@@ -175,6 +178,28 @@ async function main(): Promise<void> {
     case "serve": {
       const port = Number(getArg(args, "--port") || process.env.PORT || 3000);
       await startServer(port);
+      break;
+    }
+
+    case "encrypt": {
+      const plaintext = args[0];
+      if (!plaintext) {
+        log.error("Missing plaintext argument for encrypt");
+        printUsage();
+        process.exit(1);
+      }
+      process.stdout.write(`${encryptSecret(plaintext)}\n`);
+      break;
+    }
+
+    case "decrypt": {
+      const ciphertext = args[0];
+      if (!ciphertext) {
+        log.error("Missing ciphertext argument for decrypt");
+        printUsage();
+        process.exit(1);
+      }
+      process.stdout.write(`${decryptSecret(ciphertext)}\n`);
       break;
     }
 

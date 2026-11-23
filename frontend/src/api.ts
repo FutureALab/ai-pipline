@@ -116,19 +116,92 @@ export interface RepoCatalogItem {
   branch: string;
 }
 
+export interface AuthUser {
+  userId: string;
+  username: string;
+  nickname?: string;
+  email?: string;
+  avatar?: string;
+  roles: string[];
+  provider: string;
+  expiresAt?: number;
+}
+
+const AUTH_TOKEN_STORAGE_KEY = "ai_pipeline_auth_token";
+
+export function getStoredAuthToken(): string {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredAuthToken(token: string | null): void {
+  try {
+    if (token && token.trim()) {
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token.trim());
+    } else {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = getStoredAuthToken();
   const res = await fetch(url, {
+    ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
-    ...init,
   });
   const data = (await res.json()) as T & { error?: string };
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`);
   }
   return data;
+}
+
+export function fetchCurrentUser(): Promise<{
+  authenticated: boolean;
+  user: AuthUser;
+}> {
+  return request("/api/auth/me");
+}
+
+export function fetchOAuthAuthorizeConfig(): Promise<{
+  configured: boolean;
+  providerName: string;
+  authorizeUrl: string | null;
+  state: string;
+}> {
+  return request("/api/auth/oauth/url");
+}
+
+export function loginWithOAuth(payload: {
+  token?: string;
+  code?: string;
+  state?: string;
+  redirectUri?: string;
+}): Promise<{
+  authenticated: boolean;
+  token: string;
+  user: AuthUser;
+}> {
+  return request("/api/auth/oauth/login", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function logoutAuth(): Promise<{ ok: boolean }> {
+  return request("/api/auth/logout", {
+    method: "POST",
+  });
 }
 
 export function fetchSkills(): Promise<{ skills: SkillCardRecord[] }> {

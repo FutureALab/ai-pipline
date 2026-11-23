@@ -776,6 +776,7 @@ export async function abortPipelineTestRepos(params: {
           jobName: run.jenkinsJobName,
           buildNumber: run.jenkinsBuildNumber,
           queueUrl: run.jenkinsQueueUrl,
+          buildUrl: run.jenkinsBuildUrl,
         });
         return { repoId: run.repoId, note: res.detail };
       } catch (err) {
@@ -1269,7 +1270,8 @@ export async function syncRunningJenkinsLogsOnce(): Promise<void> {
           try {
             const build = await getJenkinsBuildStatus(
               run.jenkinsJobName,
-              buildNumber
+              buildNumber,
+              buildUrl
             );
             const nextLogs = [
               `[Jenkins] Job: ${run.jenkinsJobName} (#${buildNumber})`,

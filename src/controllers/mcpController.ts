@@ -5,6 +5,7 @@ import {
   listMcpServersByOwner,
 } from "../repositories/mcpRepository.js";
 import { readJsonBody, sendJson } from "../routes/httpUtils.js";
+import { CreateMcpSchema, parseWithSchema } from "../schemas/apiSchemas.js";
 
 export async function listMcpsHandler(
   res: http.ServerResponse,
@@ -23,43 +24,29 @@ export async function createMcpHandler(
   res: http.ServerResponse
 ): Promise<void> {
   const body = await readJsonBody(req);
-  const owner = typeof body.owner === "string" ? body.owner.trim() : "";
-  const name = typeof body.name === "string" ? body.name.trim() : "";
-  const url = typeof body.url === "string" ? body.url.trim() : "";
-  const description =
-    typeof body.description === "string" ? body.description.trim() : "";
-
-  let headers: Record<string, string> = {};
-  if (body.headers && typeof body.headers === "object" && !Array.isArray(body.headers)) {
-    for (const [k, v] of Object.entries(body.headers as Record<string, unknown>)) {
-      if (typeof v === "string") headers[k] = v;
-    }
-  } else if (typeof body.headers === "string" && body.headers.trim()) {
+  let normalizedHeaders = body.headers;
+  if (typeof body.headers === "string" && body.headers.trim()) {
     try {
-      const parsed = JSON.parse(body.headers);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-          if (typeof v === "string") headers[k] = v;
-        }
-      }
+      normalizedHeaders = JSON.parse(body.headers);
     } catch {
       return sendJson(res, 400, { error: "`headers` must be valid JSON object" });
     }
+  } else if (typeof body.headers === "string") {
+    normalizedHeaders = {};
   }
 
-  if (!owner || !name || !url) {
+  const parsed = parseWithSchema(CreateMcpSchema, {
+    ...body,
+    headers: normalizedHeaders,
+  });
+  if (!parsed.ok) {
     return sendJson(res, 400, {
-      error: "`owner`, `name`, and Streamable HTTP `url` are required",
+      error: parsed.error,
+      issues: parsed.issues,
     });
   }
 
-  const mcp = await createOrUpdateMcpServer({
-    owner,
-    name,
-    url,
-    headers,
-    description,
-  });
+  const mcp = await createOrUpdateMcpServer(parsed.data);
   sendJson(res, 201, { mcp });
 }
 

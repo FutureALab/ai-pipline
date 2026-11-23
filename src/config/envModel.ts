@@ -2,6 +2,7 @@ import {
   discoverAuthStorage,
   ModelRegistry,
 } from "@oh-my-pi/pi-coding-agent";
+import { decryptIfEncrypted } from "./crypto.js";
 
 export type OpenAIApiMode = "chat" | "responses";
 
@@ -51,9 +52,9 @@ export async function fetchOpenAIAvailableModels(params: {
       ? process.env.OPENAI_RESPONSES_API_KEY
       : process.env.OPENAI_CHAT_API_KEY;
   const apiKey =
-    params.apiKey?.trim() ||
-    modeKey?.trim() ||
-    process.env.OPENAI_API_KEY?.trim() ||
+    decryptIfEncrypted(params.apiKey) ||
+    decryptIfEncrypted(modeKey) ||
+    decryptIfEncrypted(process.env.OPENAI_API_KEY) ||
     "";
 
   if (!apiKey || apiKey === PLACEHOLDER_KEY) {
@@ -159,9 +160,9 @@ export async function resolveOpenAIEnvSessionOptions(
       ? process.env.OPENAI_RESPONSES_API_KEY
       : process.env.OPENAI_CHAT_API_KEY;
   const apiKey =
-    override?.apiKey?.trim() ||
-    modeKey?.trim() ||
-    process.env.OPENAI_API_KEY?.trim() ||
+    decryptIfEncrypted(override?.apiKey) ||
+    decryptIfEncrypted(modeKey) ||
+    decryptIfEncrypted(process.env.OPENAI_API_KEY) ||
     "";
 
   if (!apiKey || apiKey === PLACEHOLDER_KEY) {

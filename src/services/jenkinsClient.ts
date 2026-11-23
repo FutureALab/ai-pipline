@@ -1,12 +1,16 @@
 import { execFileSync } from "node:child_process";
+import { decryptIfEncrypted } from "../config/crypto.js";
+import {
+  JenkinsRoundRobinRouter,
+  type JenkinsNodeConfig,
+  type JenkinsNodeStatusSnapshot,
+} from "./jenkinsCircuitBreaker.js";
 
-export interface JenkinsConfig {
-  baseUrl: string;
-  username: string;
-  apiToken: string;
-}
+export type JenkinsConfig = JenkinsNodeConfig;
 
 let cachedDockerToken: string | null = null;
+let routerInstance: JenkinsRoundRobinRouter | null = null;
+let routerEnvSignature: string | null = null;
 
 function tryReadLocalDockerJenkinsToken(): string {
   if (cachedDockerToken) return cachedDockerToken;
@@ -61,6 +65,8 @@ export interface JenkinsExecutionRequest {
 
 export interface JenkinsExecutionResult {
   jobName: string;
+  jenkinsNodeId?: string;
+  jenkinsBaseUrl?: string;
   buildNumber?: number;
   buildUrl?: string;
   queueUrl?: string;
@@ -70,23 +76,123 @@ export interface JenkinsExecutionResult {
   xml: string;
 }
 
-export function getJenkinsConfig(): JenkinsConfig {
-  const baseUrl = (process.env.JENKINS_URL || "http://localhost:8080")
-    .trim()
-    .replace(/\/+$/, "");
+function resolveDefaultCredentials(): { username: string; apiToken: string } {
   const username = (process.env.JENKINS_USER || "admin").trim();
   const apiToken =
-    (process.env.JENKINS_API_TOKEN || "").trim() ||
+    decryptIfEncrypted(process.env.JENKINS_API_TOKEN) ||
     tryReadLocalDockerJenkinsToken() ||
-    (process.env.JENKINS_PASSWORD || "").trim();
+    decryptIfEncrypted(process.env.JENKINS_PASSWORD);
 
   if (!apiToken) {
     throw new Error(
       "JENKINS_API_TOKEN is not configured in .env and local Docker Jenkins container is not initialized. Run `bun run jenkins:up` to start and auto-configure Jenkins."
     );
   }
+  return { username, apiToken };
+}
 
-  return { baseUrl, username, apiToken };
+function loadConfiguredJenkinsNodes(): JenkinsNodeConfig[] {
+  const rawJson = process.env.JENKINS_NODES?.trim();
+  if (rawJson) {
+    const parsed = JSON.parse(rawJson) as Array<{
+      id?: string;
+      baseUrl?: string;
+      url?: string;
+      username?: string;
+      apiToken?: string;
+      password?: string;
+    }>;
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const defaultUser = (process.env.JENKINS_USER || "admin").trim();
+      const defaultToken =
+        decryptIfEncrypted(process.env.JENKINS_API_TOKEN) ||
+        decryptIfEncrypted(process.env.JENKINS_PASSWORD);
+      return parsed
+        .map((entry, idx) => {
+          const baseUrl = (entry.baseUrl || entry.url || "")
+            .trim()
+            .replace(/\/+$/, "");
+          if (!baseUrl) return null;
+          const apiToken =
+            decryptIfEncrypted(entry.apiToken) ||
+            decryptIfEncrypted(entry.password) ||
+            defaultToken ||
+            tryReadLocalDockerJenkinsToken();
+          if (!apiToken) {
+            throw new Error(`Missing apiToken/password for Jenkins node #${idx + 1} (${baseUrl})`);
+          }
+          return {
+            id: entry.id?.trim() || `jenkins-${idx + 1}`,
+            baseUrl,
+            username: entry.username?.trim() || defaultUser,
+            apiToken,
+          };
+        })
+        .filter((n): n is JenkinsNodeConfig => n !== null);
+    }
+  }
+
+  const rawUrls = process.env.JENKINS_URLS?.trim();
+  if (rawUrls) {
+    const urls = rawUrls
+      .split(",")
+      .map((u) => u.trim().replace(/\/+$/, ""))
+      .filter(Boolean);
+    if (urls.length > 0) {
+      const { username, apiToken } = resolveDefaultCredentials();
+      return urls.map((baseUrl, idx) => ({
+        id: `jenkins-${idx + 1}`,
+        baseUrl,
+        username,
+        apiToken,
+      }));
+    }
+  }
+
+  const baseUrl = (process.env.JENKINS_URL || "http://localhost:8080")
+    .trim()
+    .replace(/\/+$/, "");
+  const { username, apiToken } = resolveDefaultCredentials();
+  return [{ id: "jenkins-1", baseUrl, username, apiToken }];
+}
+
+function getJenkinsRouter(): JenkinsRoundRobinRouter {
+  const sig = [
+    process.env.JENKINS_NODES || "",
+    process.env.JENKINS_URLS || "",
+    process.env.JENKINS_URL || "",
+    process.env.JENKINS_CB_BACKOFF_MS || "",
+    process.env.JENKINS_CB_HALF_OPEN_DIVISOR || "",
+  ].join("|");
+
+  if (!routerInstance || routerEnvSignature !== sig) {
+    const nodes = loadConfiguredJenkinsNodes();
+    const backoffMs = Number(process.env.JENKINS_CB_BACKOFF_MS || 3000);
+    const halfOpenTrafficDivisor = Number(
+      process.env.JENKINS_CB_HALF_OPEN_DIVISOR || 3
+    );
+    routerInstance = new JenkinsRoundRobinRouter(nodes, {
+      backoffMs: Number.isFinite(backoffMs) && backoffMs > 0 ? backoffMs : 3000,
+      halfOpenTrafficDivisor:
+        Number.isFinite(halfOpenTrafficDivisor) && halfOpenTrafficDivisor >= 1
+          ? halfOpenTrafficDivisor
+          : 3,
+    });
+    routerEnvSignature = sig;
+  }
+  return routerInstance;
+}
+
+export function getJenkinsConfig(): JenkinsConfig {
+  return getJenkinsRouter().getNodes()[0];
+}
+
+export function getJenkinsClusterStatus(): JenkinsNodeStatusSnapshot[] {
+  try {
+    return getJenkinsRouter().getStatusSnapshots();
+  } catch {
+    return [];
+  }
 }
 
 function escapeXml(value: string): string {
@@ -102,8 +208,6 @@ function escapeXml(value: string): string {
  * Build a standard Jenkins Pipeline `config.xml` (<flow-definition>) that:
  * 1. Clones the target git repository
  * 2. Executes the Skill directly using the pre-compiled `ai-pipeline` binary
- *    (which embeds built-in skills + the DB-bundled skill with all scripts/references/assets)
- *    so Jenkins results match Creative Mode & local pipeline tests identically.
  */
 export function buildJenkinsPipelineXml(
   options: JenkinsPipelineXmlOptions
@@ -129,9 +233,6 @@ export function buildJenkinsPipelineXml(
         stage('Prepare Skill Fallback') {
             steps {
                 sh '''
-                    # If the compiled ai-pipeline binary embeds the skill, it will materialize
-                    # the full skill package (SKILL.md + scripts + references + assets) automatically.
-                    # Only write fallback SKILL.md when no directory exists yet.
                     SKILL_DIR="\${HOME}/.omp/agent/skills/${options.skillName}"
                     if [ ! -f "\${SKILL_DIR}/SKILL.md" ] && [ -n "${skillB64}" ]; then
                         mkdir -p "\${SKILL_DIR}"
@@ -267,33 +368,49 @@ export async function resolveJenkinsQueueItem(queueUrl: string): Promise<{
   buildUrl?: string;
   why?: string;
 }> {
-  const cfg = getJenkinsConfig();
+  const router = getJenkinsRouter();
+  const matchedBreaker = router.findNodeByUrl(queueUrl);
+  const cfg = matchedBreaker?.config ?? getJenkinsConfig();
   const normalizedQueue = queueUrl.replace(/\/+$/, "");
-  const res = await fetch(`${normalizedQueue}/api/json`, {
-    headers: buildAuthHeaders(cfg),
-  });
-  if (!res.ok) {
-    return { cancelled: false };
+  try {
+    const res = await fetch(`${normalizedQueue}/api/json`, {
+      headers: buildAuthHeaders(cfg),
+    });
+    if (!res.ok) {
+      if (res.status >= 500) {
+        matchedBreaker?.recordFailure(new Error(`HTTP ${res.status}`));
+      }
+      return { cancelled: false };
+    }
+    matchedBreaker?.recordSuccess();
+    const data = (await res.json()) as {
+      cancelled?: boolean;
+      why?: string;
+      executable?: { number?: number; url?: string };
+    };
+    return {
+      cancelled: Boolean(data.cancelled),
+      buildNumber: data.executable?.number,
+      buildUrl: data.executable?.url,
+      why: data.why,
+    };
+  } catch (err) {
+    matchedBreaker?.recordFailure(err);
+    throw err;
   }
-  const data = (await res.json()) as {
-    cancelled?: boolean;
-    why?: string;
-    executable?: { number?: number; url?: string };
-  };
-  return {
-    cancelled: Boolean(data.cancelled),
-    buildNumber: data.executable?.number,
-    buildUrl: data.executable?.url,
-    why: data.why,
-  };
 }
 
 export async function abortJenkinsJob(params: {
   jobName?: string;
   buildNumber?: number;
   queueUrl?: string;
+  buildUrl?: string;
 }): Promise<{ aborted: boolean; detail: string }> {
-  const cfg = getJenkinsConfig();
+  const router = getJenkinsRouter();
+  const matchedBreaker =
+    router.findNodeByUrl(params.buildUrl) ??
+    router.findNodeByUrl(params.queueUrl);
+  const cfg = matchedBreaker?.config ?? getJenkinsConfig();
   const authHeaders = buildAuthHeaders(cfg);
   const crumbHeaders = await fetchJenkinsCrumb(cfg);
   const headers = { ...authHeaders, ...crumbHeaders };
@@ -308,7 +425,6 @@ export async function abortJenkinsJob(params: {
         detail: `Stopped Jenkins build ${params.jobName} #${params.buildNumber}`,
       };
     }
-    // Fallback to /term if /stop didn't accept
     const termRes = await fetch(
       `${cfg.baseUrl}/job/${encodedJob}/${params.buildNumber}/term`,
       { method: "POST", headers }
@@ -348,7 +464,8 @@ export async function abortJenkinsJob(params: {
 
 export async function getJenkinsBuildStatus(
   jobName: string,
-  buildNumber: number
+  buildNumber: number,
+  buildUrl?: string
 ): Promise<{
   building: boolean;
   result: string | null;
@@ -356,66 +473,64 @@ export async function getJenkinsBuildStatus(
   url: string;
   consoleText: string;
 }> {
-  const cfg = getJenkinsConfig();
+  const router = getJenkinsRouter();
+  const matchedBreaker = router.findNodeByUrl(buildUrl);
+  const cfg = matchedBreaker?.config ?? getJenkinsConfig();
   const encodedJob = encodeURIComponent(jobName);
   const headers = buildAuthHeaders(cfg);
 
-  const [statusRes, logRes] = await Promise.all([
-    fetch(`${cfg.baseUrl}/job/${encodedJob}/${buildNumber}/api/json`, {
-      headers,
-    }),
-    fetch(`${cfg.baseUrl}/job/${encodedJob}/${buildNumber}/consoleText`, {
-      headers,
-    }),
-  ]);
+  try {
+    const [statusRes, logRes] = await Promise.all([
+      fetch(`${cfg.baseUrl}/job/${encodedJob}/${buildNumber}/api/json`, {
+        headers,
+      }),
+      fetch(`${cfg.baseUrl}/job/${encodedJob}/${buildNumber}/consoleText`, {
+        headers,
+      }),
+    ]);
 
-  if (!statusRes.ok) {
-    throw new Error(
-      `Failed to query Jenkins build #${buildNumber}: ${statusRes.status} ${statusRes.statusText}`
-    );
+    if (!statusRes.ok) {
+      const err = new Error(
+        `Failed to query Jenkins build #${buildNumber}: ${statusRes.status} ${statusRes.statusText}`
+      );
+      if (statusRes.status >= 500) {
+        matchedBreaker?.recordFailure(err);
+      }
+      throw err;
+    }
+
+    matchedBreaker?.recordSuccess();
+    const statusData = (await statusRes.json()) as {
+      building: boolean;
+      result: string | null;
+      duration: number;
+      url: string;
+    };
+    const consoleText = logRes.ok ? await logRes.text() : "";
+
+    return {
+      building: statusData.building,
+      result: statusData.result,
+      duration: statusData.duration,
+      url: statusData.url,
+      consoleText,
+    };
+  } catch (err) {
+    if (err instanceof TypeError) {
+      matchedBreaker?.recordFailure(err);
+    }
+    throw err;
   }
-
-  const statusData = (await statusRes.json()) as {
-    building: boolean;
-    result: string | null;
-    duration: number;
-    url: string;
-  };
-  const consoleText = logRes.ok ? await logRes.text() : "";
-
-  return {
-    building: statusData.building,
-    result: statusData.result,
-    duration: statusData.duration,
-    url: statusData.url,
-    consoleText,
-  };
 }
 
-/**
- * Create or update a Jenkins job with the given config.xml, trigger execution,
- * optionally wait for completion, and return status + console logs.
- */
-export async function executeJenkinsJobWithXml(
-  req: JenkinsExecutionRequest
-): Promise<JenkinsExecutionResult> {
-  const start = Date.now();
-  const cfg = getJenkinsConfig();
+async function triggerJobOnNode(
+  cfg: JenkinsConfig,
+  req: JenkinsExecutionRequest,
+  xml: string
+): Promise<{ queueUrl?: string }> {
   const encodedJob = encodeURIComponent(req.jobName);
   const authHeaders = buildAuthHeaders(cfg);
   const crumbHeaders = await fetchJenkinsCrumb(cfg);
-
-  const xml =
-    req.xml?.trim() ||
-    buildJenkinsPipelineXml({
-      repoUrl: req.repoUrl || "",
-      repoBranch: req.repoBranch,
-      skillName: req.skillName || "custom-skill",
-      skillContentB64: req.skillContent
-        ? Buffer.from(req.skillContent, "utf-8").toString("base64")
-        : "",
-      taskPrompt: req.taskPrompt,
-    });
 
   // 1. Check whether job exists
   const checkRes = await fetch(`${cfg.baseUrl}/job/${encodedJob}/api/json`, {
@@ -492,7 +607,38 @@ export async function executeJenkinsJobWithXml(
     );
   }
 
-  const queueUrl = triggerRes.headers.get("location") || undefined;
+  return {
+    queueUrl: triggerRes.headers.get("location") || undefined,
+  };
+}
+
+/**
+ * Create or update a Jenkins job with the given config.xml, trigger execution
+ * across configured Jenkins nodes using Round-Robin + 3s Backoff Circuit Breaker,
+ * optionally wait for completion, and return status + console logs.
+ */
+export async function executeJenkinsJobWithXml(
+  req: JenkinsExecutionRequest
+): Promise<JenkinsExecutionResult> {
+  const start = Date.now();
+  const xml =
+    req.xml?.trim() ||
+    buildJenkinsPipelineXml({
+      repoUrl: req.repoUrl || "",
+      repoBranch: req.repoBranch,
+      skillName: req.skillName || "custom-skill",
+      skillContentB64: req.skillContent
+        ? Buffer.from(req.skillContent, "utf-8").toString("base64")
+        : "",
+      taskPrompt: req.taskPrompt,
+    });
+
+  const router = getJenkinsRouter();
+  const { result: triggerOut, node: cfg } = await router.executeWithFailover(
+    (nodeCfg) => triggerJobOnNode(nodeCfg, req, xml)
+  );
+
+  const queueUrl = triggerOut.queueUrl;
   const wait = req.waitForCompletion !== false;
   const timeoutMs = req.timeoutMs ?? 180_000;
 
@@ -510,12 +656,15 @@ export async function executeJenkinsJobWithXml(
     }
     return {
       jobName: req.jobName,
+      jenkinsNodeId: cfg.id,
+      jenkinsBaseUrl: cfg.baseUrl,
       buildNumber,
       buildUrl,
       queueUrl,
       status: "queued",
       durationMs: Date.now() - start,
       logs: [
+        `[Jenkins] Selected node: ${cfg.id} (${cfg.baseUrl})`,
         `[Jenkins] Job "${req.jobName}" triggered${buildNumber ? ` (#${buildNumber})` : " (queued)"}`,
         ...(buildUrl ? [`[Jenkins] Build URL: ${buildUrl}`] : []),
         ...(queueUrl ? [`[Jenkins] Queue URL: ${queueUrl}`] : []),
@@ -527,14 +676,19 @@ export async function executeJenkinsJobWithXml(
   if (!queueUrl) {
     return {
       jobName: req.jobName,
+      jenkinsNodeId: cfg.id,
+      jenkinsBaseUrl: cfg.baseUrl,
       status: "queued",
       durationMs: Date.now() - start,
-      logs: [`[Jenkins] Job "${req.jobName}" triggered`],
+      logs: [
+        `[Jenkins] Selected node: ${cfg.id} (${cfg.baseUrl})`,
+        `[Jenkins] Job "${req.jobName}" triggered`,
+      ],
       xml,
     };
   }
 
-  // 3. Poll queue -> build number -> completion
+  // 3. Poll queue -> build number -> completion on the selected Jenkins node
   const { buildNumber, buildUrl } = await pollQueueForBuildNumber(
     cfg,
     queueUrl,
@@ -547,7 +701,7 @@ export async function executeJenkinsJobWithXml(
   let consoleText = "";
 
   while (Date.now() < deadline) {
-    const build = await getJenkinsBuildStatus(req.jobName, buildNumber);
+    const build = await getJenkinsBuildStatus(req.jobName, buildNumber, buildUrl);
     consoleText = build.consoleText;
     await req.onLogUpdate?.({
       jobName: req.jobName,
@@ -567,6 +721,8 @@ export async function executeJenkinsJobWithXml(
 
   return {
     jobName: req.jobName,
+    jenkinsNodeId: cfg.id,
+    jenkinsBaseUrl: cfg.baseUrl,
     buildNumber,
     buildUrl,
     queueUrl,

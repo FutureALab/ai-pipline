@@ -7,6 +7,10 @@ import { Pool as GaussPool } from "gaussdb-nodejs";
 import { Kysely, MysqlDialect, PostgresDialect } from "kysely";
 import { createPool as createMysqlPool, type Pool as MysqlPool } from "mysql2";
 import { Pool as PgPool } from "pg";
+import {
+  decryptConnectionUrl,
+  decryptIfEncrypted,
+} from "../config/crypto.js";
 import { createLogger } from "../config/logger.js";
 import {
   buildResourceSummary,
@@ -181,7 +185,7 @@ export async function queryDb<T extends Record<string, unknown> = Record<string,
 // ============================================================================
 
 function buildPgConfig() {
-  const connectionString = process.env.DATABASE_URL?.trim();
+  const connectionString = decryptConnectionUrl(process.env.DATABASE_URL);
   if (connectionString && /^postgres(ql)?:\/\//i.test(connectionString)) {
     return {
       connectionString,
@@ -194,7 +198,7 @@ function buildPgConfig() {
     host: process.env.PGHOST?.trim() || "localhost",
     port: Number(process.env.PGPORT || 5432),
     user: process.env.PGUSER?.trim() || "postgres",
-    password: process.env.PGPASSWORD ?? "postgres",
+    password: decryptIfEncrypted(process.env.PGPASSWORD) || "postgres",
     database: process.env.PGDATABASE?.trim() || "ai_pipeline",
     max: 10,
     idleTimeoutMillis: 30_000,
@@ -203,11 +207,11 @@ function buildPgConfig() {
 }
 
 function buildGaussConfig() {
+  const decryptedDbUrl = decryptConnectionUrl(process.env.DATABASE_URL);
   const rawUrl =
-    process.env.GAUSS_URL?.trim() ||
-    (process.env.DATABASE_URL?.trim() &&
-    /^(gaussdb|opengauss):\/\//i.test(process.env.DATABASE_URL.trim())
-      ? process.env.DATABASE_URL.trim()
+    decryptConnectionUrl(process.env.GAUSS_URL) ||
+    (decryptedDbUrl && /^(gaussdb|opengauss):\/\//i.test(decryptedDbUrl)
+      ? decryptedDbUrl
       : undefined);
 
   if (rawUrl) {
@@ -225,7 +229,7 @@ function buildGaussConfig() {
     host: process.env.GAUSSHOST?.trim() || "127.0.0.1",
     port: Number(process.env.GAUSSPORT || 8000),
     user: process.env.GAUSSUSER?.trim() || "gaussdb",
-    password: process.env.GAUSSPASSWORD ?? "",
+    password: decryptIfEncrypted(process.env.GAUSSPASSWORD),
     database: process.env.GAUSSDATABASE?.trim() || "ai_pipeline",
     max: 10,
     idleTimeoutMillis: 30_000,
@@ -235,11 +239,11 @@ function buildGaussConfig() {
 }
 
 function buildMysqlConfig() {
+  const decryptedDbUrl = decryptConnectionUrl(process.env.DATABASE_URL);
   const rawUrl =
-    process.env.MYSQL_URL?.trim() ||
-    (process.env.DATABASE_URL?.trim() &&
-    /^mysql2?:\/\//i.test(process.env.DATABASE_URL.trim())
-      ? process.env.DATABASE_URL.trim()
+    decryptConnectionUrl(process.env.MYSQL_URL) ||
+    (decryptedDbUrl && /^mysql2?:\/\//i.test(decryptedDbUrl)
+      ? decryptedDbUrl
       : undefined);
 
   if (rawUrl) {
@@ -248,7 +252,7 @@ function buildMysqlConfig() {
       host: parsed.hostname || "127.0.0.1",
       port: Number(parsed.port || 3306),
       user: decodeURIComponent(parsed.username || "root"),
-      password: decodeURIComponent(parsed.password || ""),
+      password: decryptIfEncrypted(decodeURIComponent(parsed.password || "")),
       database: parsed.pathname.replace(/^\//, "") || "ai_pipeline",
       connectionLimit: 10,
       connectTimeout: 5_000,
@@ -260,7 +264,7 @@ function buildMysqlConfig() {
     host: process.env.MYSQL_HOST?.trim() || "127.0.0.1",
     port: Number(process.env.MYSQL_PORT || 3306),
     user: process.env.MYSQL_USER?.trim() || "root",
-    password: process.env.MYSQL_PASSWORD ?? "root",
+    password: decryptIfEncrypted(process.env.MYSQL_PASSWORD) || "root",
     database: process.env.MYSQL_DATABASE?.trim() || "ai_pipeline",
     connectionLimit: 10,
     connectTimeout: 5_000,

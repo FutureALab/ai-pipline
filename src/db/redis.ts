@@ -4,12 +4,16 @@ import Redis, {
   type ClusterOptions,
   type RedisOptions,
 } from "ioredis";
+import {
+  decryptConnectionUrl,
+  decryptIfEncrypted,
+} from "../config/crypto.js";
 import { createLogger } from "../config/logger.js";
 
 const log = createLogger("redis");
 
 export type RedisClient = Redis | Cluster;
-export type RedisMode = "cluster" | "standalone" | "disabled";
+export type RedisMode = "sentinel" | "cluster" | "standalone" | "disabled";
 
 let redisClient: RedisClient | null = null;
 let redisReady = false;
@@ -31,8 +35,8 @@ export function getRedisClient(): RedisClient {
 }
 
 /**
- * Hash-tag key prefix required by BullMQ and multi-key operations on Redis Cluster.
- * Defaults to `{ai_pipeline}` so all queue keys land on the same hash slot.
+ * Hash-tag key prefix compatible with Redis Sentinel, Cluster, and Standalone.
+ * Defaults to `{ai_pipeline}` so BullMQ and multi-key ops stay slot-safe.
  */
 export function getRedisKeyPrefix(): string {
   const raw = process.env.REDIS_KEY_PREFIX?.trim();
@@ -40,9 +44,13 @@ export function getRedisKeyPrefix(): string {
   return raw.includes("{") && raw.includes("}") ? raw : `{${raw}}`;
 }
 
-function parseClusterNodes(): ClusterNode[] {
-  const raw = process.env.REDIS_CLUSTER_NODES?.trim();
-  if (!raw) return [];
+interface HostPort {
+  host: string;
+  port: number;
+}
+
+function parseHostPortList(raw: string | undefined, defaultPort: number): HostPort[] {
+  if (!raw?.trim()) return [];
   return raw
     .split(",")
     .map((entry) => entry.trim())
@@ -51,12 +59,20 @@ function parseClusterNodes(): ClusterNode[] {
       const cleaned = entry.replace(/^rediss?:\/\//i, "");
       const lastColon = cleaned.lastIndexOf(":");
       if (lastColon === -1) {
-        return { host: cleaned, port: 6379 };
+        return { host: cleaned, port: defaultPort };
       }
       const host = cleaned.slice(0, lastColon) || "127.0.0.1";
-      const port = Number(cleaned.slice(lastColon + 1)) || 6379;
+      const port = Number(cleaned.slice(lastColon + 1)) || defaultPort;
       return { host, port };
     });
+}
+
+function parseSentinelNodes(): HostPort[] {
+  return parseHostPortList(process.env.REDIS_SENTINELS, 26379);
+}
+
+function parseClusterNodes(): ClusterNode[] {
+  return parseHostPortList(process.env.REDIS_CLUSTER_NODES, 7001);
 }
 
 function parseNatMap(): ClusterOptions["natMap"] | undefined {
@@ -70,16 +86,18 @@ function parseNatMap(): ClusterOptions["natMap"] | undefined {
   }
 }
 
-function resolveConfiguredMode(): "cluster" | "standalone" {
+function resolveConfiguredMode(): "sentinel" | "cluster" | "standalone" {
   const envMode = process.env.REDIS_MODE?.trim().toLowerCase();
+  if (envMode === "sentinel") return "sentinel";
   if (envMode === "cluster") return "cluster";
   if (envMode === "standalone") return "standalone";
+  if (parseSentinelNodes().length > 0) return "sentinel";
   if (parseClusterNodes().length > 0) return "cluster";
   return "standalone";
 }
 
 function buildBaseRedisOptions(forBlocking: boolean): RedisOptions {
-  const password = process.env.REDIS_PASSWORD?.trim() || undefined;
+  const password = decryptIfEncrypted(process.env.REDIS_PASSWORD) || undefined;
   const username = process.env.REDIS_USERNAME?.trim() || undefined;
   return {
     username,
@@ -88,6 +106,37 @@ function buildBaseRedisOptions(forBlocking: boolean): RedisOptions {
     maxRetriesPerRequest: forBlocking ? null : 2,
     enableReadyCheck: !forBlocking,
   };
+}
+
+function buildSentinelClient(forBlocking: boolean): Redis {
+  const sentinels = parseSentinelNodes();
+  const effectiveSentinels: HostPort[] =
+    sentinels.length > 0 ? sentinels : [{ host: "127.0.0.1", port: 26379 }];
+  const masterName = process.env.REDIS_SENTINEL_MASTER?.trim() || "mymaster";
+  const sentinelPassword =
+    decryptIfEncrypted(process.env.REDIS_SENTINEL_PASSWORD) || undefined;
+  const roleRaw = process.env.REDIS_SENTINEL_ROLE?.trim().toLowerCase();
+  const role: "master" | "slave" = roleRaw === "slave" ? "slave" : "master";
+
+  const options: RedisOptions = {
+    ...buildBaseRedisOptions(forBlocking),
+    sentinels: effectiveSentinels,
+    name: masterName,
+    role,
+    sentinelPassword,
+    db: Number(process.env.REDIS_DB || 0),
+    lazyConnect: !forBlocking,
+    sentinelRetryStrategy: (times: number) => {
+      if (!forBlocking && times > 3) return null;
+      return Math.min(times * 200, 2_000);
+    },
+    retryStrategy: (times: number) => {
+      if (!forBlocking && times > 3) return null;
+      return Math.min(times * 200, 2_000);
+    },
+  };
+
+  return new Redis(options);
 }
 
 function buildClusterClient(forBlocking: boolean): Cluster {
@@ -119,7 +168,7 @@ function buildClusterClient(forBlocking: boolean): Cluster {
 }
 
 function buildStandaloneClient(forBlocking: boolean): Redis {
-  const redisUrl = process.env.REDIS_URL?.trim();
+  const redisUrl = decryptConnectionUrl(process.env.REDIS_URL);
   const baseOptions: RedisOptions = {
     ...buildBaseRedisOptions(forBlocking),
     lazyConnect: !forBlocking,
@@ -142,17 +191,18 @@ function buildStandaloneClient(forBlocking: boolean): Redis {
 }
 
 /**
- * Create a dedicated Redis/Cluster connection for blocking commands (BLPOP, BullMQ Worker)
+ * Create a dedicated Redis connection for blocking commands (BLPOP, BullMQ Queue/Worker)
  * so the shared command connection is never blocked.
- * Note: `ioredis` Cluster does not support `.duplicate()`, so a fresh Cluster instance is created.
  */
 export function createBlockingRedisClient(): RedisClient | null {
   if (!redisReady || !redisClient) return null;
 
-  const client =
-    activeMode === "cluster"
-      ? buildClusterClient(true)
-      : buildStandaloneClient(true);
+  const client: RedisClient =
+    activeMode === "sentinel"
+      ? buildSentinelClient(true)
+      : activeMode === "cluster"
+        ? buildClusterClient(true)
+        : buildStandaloneClient(true);
 
   client.on("error", (err: Error) => {
     log.warn({ err, mode: activeMode }, "Blocking Redis connection warning");
@@ -162,14 +212,14 @@ export function createBlockingRedisClient(): RedisClient | null {
 }
 
 /**
- * Create a BullMQ-compatible Redis/Cluster connection (`maxRetriesPerRequest: null`).
+ * Create a BullMQ-compatible Redis connection (`maxRetriesPerRequest: null`).
  */
 export function createBullMQConnection(): RedisClient | null {
   return createBlockingRedisClient();
 }
 
 /**
- * Initialize Redis connection on startup (supports Redis Cluster and Standalone).
+ * Initialize Redis connection on startup (supports Sentinel, Cluster, and Standalone).
  */
 export async function initRedis(): Promise<boolean> {
   if (redisReady && redisClient) return true;
@@ -182,9 +232,11 @@ export async function initRedis(): Promise<boolean> {
 
   const mode = resolveConfiguredMode();
   const client: RedisClient =
-    mode === "cluster"
-      ? buildClusterClient(false)
-      : buildStandaloneClient(false);
+    mode === "sentinel"
+      ? buildSentinelClient(false)
+      : mode === "cluster"
+        ? buildClusterClient(false)
+        : buildStandaloneClient(false);
 
   client.on("error", (err: Error) => {
     if (redisReady) {
@@ -202,6 +254,12 @@ export async function initRedis(): Promise<boolean> {
       {
         mode,
         prefix: getRedisKeyPrefix(),
+        ...(mode === "sentinel"
+          ? {
+              master: process.env.REDIS_SENTINEL_MASTER?.trim() || "mymaster",
+              sentinels: parseSentinelNodes(),
+            }
+          : {}),
         ...(mode === "cluster" ? { nodes: parseClusterNodes() } : {}),
       },
       `Redis (${mode}) connected and ready`
