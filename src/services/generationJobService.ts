@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
 import type { OpenAIOverrideConfig } from "../config/envModel.js";
-import { isDbConnected, queryDb } from "../db/database.js";
+import { dbNow, getDb, isDbConnected, isMysqlDriver } from "../db/database.js";
 import { getMcpServersByIdsForOwner } from "../repositories/mcpRepository.js";
 import {
   listSkillFiles,
@@ -88,36 +88,42 @@ function persistJobToDb(job: InternalJob): void {
   if (!isDbConnected()) return;
   const snap = toSnapshot(job);
   const safePayload = sanitizePayloadForDb(job.payload);
-  void queryDb(
-    `INSERT INTO generation_jobs (
-       job_id, skill_name, status, started_at, ended_at, elapsed_ms,
-       timeout_ms, payload, streamed_content, error_message, result, updated_at
-     )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, NOW())
-     ON CONFLICT (job_id)
-     DO UPDATE SET
-       skill_name = EXCLUDED.skill_name,
-       status = EXCLUDED.status,
-       ended_at = EXCLUDED.ended_at,
-       elapsed_ms = EXCLUDED.elapsed_ms,
-       streamed_content = EXCLUDED.streamed_content,
-       error_message = EXCLUDED.error_message,
-       result = EXCLUDED.result,
-       updated_at = NOW()`,
-    [
-      snap.jobId,
-      snap.result?.skillName ?? job.payload.skillName ?? null,
-      snap.status,
-      snap.startedAt,
-      snap.endedAt ?? null,
-      snap.elapsedMs,
-      snap.timeoutMs,
-      JSON.stringify(safePayload),
-      snap.streamedContent,
-      snap.errorMessage ?? null,
-      snap.result ? JSON.stringify(snap.result) : null,
-    ]
-  ).catch(() => { });
+  const db = getDb();
+  const now = dbNow();
+
+  const values = {
+    job_id: snap.jobId,
+    skill_name: snap.result?.skillName ?? job.payload.skillName ?? null,
+    status: snap.status,
+    started_at: snap.startedAt,
+    ended_at: snap.endedAt ?? null,
+    elapsed_ms: snap.elapsedMs,
+    timeout_ms: snap.timeoutMs,
+    payload: JSON.stringify(safePayload),
+    streamed_content: snap.streamedContent,
+    error_message: snap.errorMessage ?? null,
+    result: snap.result ? JSON.stringify(snap.result) : null,
+    updated_at: now,
+  };
+  const update = {
+    skill_name: values.skill_name,
+    status: values.status,
+    ended_at: values.ended_at,
+    elapsed_ms: values.elapsed_ms,
+    streamed_content: values.streamed_content,
+    error_message: values.error_message,
+    result: values.result,
+    updated_at: now,
+  };
+
+  const query = isMysqlDriver()
+    ? db.insertInto("generation_jobs").values(values).onDuplicateKeyUpdate(update)
+    : db
+        .insertInto("generation_jobs")
+        .values(values)
+        .onConflict((oc) => oc.column("job_id").doUpdateSet(update));
+
+  void query.execute().catch(() => {});
 }
 
 export function startGenerationJob(

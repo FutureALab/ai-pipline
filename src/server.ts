@@ -3,7 +3,7 @@ import http from "node:http";
 import { createLogger, getLogConfigSummary } from "./config/logger.js";
 import { ensureTelemetryInitialized } from "./config/telemetry.js";
 import { getDbDriver, initDatabase } from "./db/database.js";
-import { initRedis, isRedisConnected } from "./db/redis.js";
+import { getRedisMode, initRedis, isRedisConnected } from "./db/redis.js";
 import { routeRequest } from "./routes/router.js";
 import {
   initJenkinsPipelineQueueWorker,
@@ -70,6 +70,7 @@ export async function startServer(port: number = 3000): Promise<http.Server> {
         url: `http://localhost:${port}`,
         dbDriver: getDbDriver(),
         redisConnected: isRedisConnected(),
+        redisMode: getRedisMode(),
         bootMs: Date.now() - bootStart,
       },
       `Skill Pipeline API listening on http://localhost:${port}`

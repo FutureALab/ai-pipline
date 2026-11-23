@@ -3,10 +3,11 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { Pool } from "pg";
+import { Pool as GaussPool } from "gaussdb-nodejs";
+import { Kysely, MysqlDialect, PostgresDialect } from "kysely";
+import { createPool as createMysqlPool, type Pool as MysqlPool } from "mysql2";
+import { Pool as PgPool } from "pg";
 import { createLogger } from "../config/logger.js";
-
-const dbLog = createLogger("db");
 import {
   buildResourceSummary,
   enrichSkillFileEntry,
@@ -25,10 +26,13 @@ import type {
   SkillFileEncoding,
   SkillFileEntry,
 } from "../types/skill.js";
+import { BunSqliteDialect } from "./bunSqliteDialect.js";
+import type { DatabaseSchema } from "./schema.js";
 
+const dbLog = createLogger("db");
 const execFileAsync = promisify(execFile);
 
-export type DbDriver = "postgres" | "sqlite";
+export type DbDriver = "postgres" | "mysql" | "gauss" | "sqlite";
 
 export const INITIAL_APPS: CatalogAppRow[] = [
   { id: "app-gateway", name: "API Gateway", env: "prod" },
@@ -54,57 +58,98 @@ export const INITIAL_REPOS: CatalogRepoRow[] = [
   { id: "repo-12", name: "audit-log-collector", url: "https://git.example.com/org/audit-log-collector.git", branch: "main" },
 ];
 
-let pgPool: Pool | null = null;
+let kyselyDb: Kysely<DatabaseSchema> | null = null;
+let pgPool: PgPool | null = null;
+let gaussPool: GaussPool | null = null;
+let mysqlPool: MysqlPool | null = null;
 let sqliteDb: BunSqliteDatabase | null = null;
 let activeDriver: DbDriver | null = null;
 
-function buildPgConfig() {
-  const connectionString = process.env.DATABASE_URL?.trim();
-  if (connectionString) {
-    return {
-      connectionString,
-      max: 10,
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 3_000,
-    };
-  }
-  return {
-    host: process.env.PGHOST?.trim() || "localhost",
-    port: Number(process.env.PGPORT || 5432),
-    user: process.env.PGUSER?.trim() || "postgres",
-    password: process.env.PGPASSWORD ?? "postgres",
-    database: process.env.PGDATABASE?.trim() || "ai_pipeline",
-    max: 10,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 3_000,
-  };
-}
-
 export function isDbConnected(): boolean {
-  return activeDriver !== null;
+  return activeDriver !== null && kyselyDb !== null;
 }
 
 export function getDbDriver(): DbDriver | null {
   return activeDriver;
 }
 
+export function isMysqlDriver(): boolean {
+  return activeDriver === "mysql";
+}
+
 /**
- * Execute a parameterized SQL query against the active database (PostgreSQL or SQLite).
- * Converts PostgreSQL `$1, $2` placeholders and `::jsonb` casts automatically for SQLite.
+ * Returns the active Kysely query builder instance (supports PostgreSQL, MySQL, GaussDB, SQLite).
+ */
+export function getDb(): Kysely<DatabaseSchema> {
+  if (!kyselyDb) {
+    throw new Error("Database is not initialized. Call initDatabase() first.");
+  }
+  return kyselyDb;
+}
+
+/**
+ * Cross-dialect boolean normalizer (SQLite/MySQL use 0/1; PG/GaussDB use boolean).
+ */
+export function toDbBool(val: boolean): boolean | number {
+  return activeDriver === "sqlite" || activeDriver === "mysql"
+    ? val
+      ? 1
+      : 0
+    : val;
+}
+
+/**
+ * Cross-dialect current timestamp value for inserts/updates.
+ */
+export function dbNow(): Date | string {
+  return activeDriver === "sqlite" ? new Date().toISOString() : new Date();
+}
+
+/**
+ * Convert an ISO date string or Date into a driver-safe timestamp parameter.
+ */
+export function toDbTimestamp(val: Date | string): Date | string {
+  if (activeDriver === "sqlite") {
+    return val instanceof Date ? val.toISOString() : val;
+  }
+  return val instanceof Date ? val : new Date(val);
+}
+
+/**
+ * Legacy raw parameterized SQL helper kept for compatibility.
+ * Prefer `getDb()` (Kysely) for all new queries.
  */
 export async function queryDb<T extends Record<string, unknown> = Record<string, unknown>>(
-  sql: string,
+  sqlText: string,
   params: unknown[] = []
 ): Promise<{ rows: T[] }> {
   if (activeDriver === "postgres" && pgPool) {
-    const res = await pgPool.query<T>(sql, params);
+    const res = await pgPool.query<T>(sqlText, params);
     return { rows: res.rows };
   }
 
+  if (activeDriver === "gauss" && gaussPool) {
+    const res = await gaussPool.query<T>(sqlText, params);
+    return { rows: res.rows };
+  }
+
+  if (activeDriver === "mysql" && mysqlPool) {
+    const mysqlParams: unknown[] = [];
+    const convertedSql = sqlText
+      .replace(/::jsonb/gi, "")
+      .replace(/\$(\d+)/g, (_m, idxStr: string) => {
+        const idx = Number(idxStr) - 1;
+        const val = params[idx];
+        mysqlParams.push(typeof val === "boolean" ? (val ? 1 : 0) : (val ?? null));
+        return "?";
+      });
+    const [rows] = await mysqlPool.promise().query(convertedSql, mysqlParams);
+    return { rows: Array.isArray(rows) ? (rows as T[]) : [] };
+  }
+
   if (activeDriver === "sqlite" && sqliteDb) {
-    // Convert $1, $2... -> ? (preserving parameter order even if reused)
     const sqliteParams: unknown[] = [];
-    const convertedSql = sql
+    const convertedSql = sqlText
       .replace(/::jsonb/gi, "")
       .replace(/NOW\(\)/gi, "CURRENT_TIMESTAMP")
       .replace(/\$(\d+)/g, (_m, idxStr: string) => {
@@ -130,6 +175,102 @@ export async function queryDb<T extends Record<string, unknown> = Record<string,
 
   throw new Error("Database is not initialized. Call initDatabase() first.");
 }
+
+// ============================================================================
+// Driver configuration builders
+// ============================================================================
+
+function buildPgConfig() {
+  const connectionString = process.env.DATABASE_URL?.trim();
+  if (connectionString && /^postgres(ql)?:\/\//i.test(connectionString)) {
+    return {
+      connectionString,
+      max: 10,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 3_000,
+    };
+  }
+  return {
+    host: process.env.PGHOST?.trim() || "localhost",
+    port: Number(process.env.PGPORT || 5432),
+    user: process.env.PGUSER?.trim() || "postgres",
+    password: process.env.PGPASSWORD ?? "postgres",
+    database: process.env.PGDATABASE?.trim() || "ai_pipeline",
+    max: 10,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 3_000,
+  };
+}
+
+function buildGaussConfig() {
+  const rawUrl =
+    process.env.GAUSS_URL?.trim() ||
+    (process.env.DATABASE_URL?.trim() &&
+    /^(gaussdb|opengauss):\/\//i.test(process.env.DATABASE_URL.trim())
+      ? process.env.DATABASE_URL.trim()
+      : undefined);
+
+  if (rawUrl) {
+    const normalizedUrl = rawUrl.replace(/^(gaussdb|opengauss):\/\//i, "postgresql://");
+    return {
+      connectionString: normalizedUrl,
+      max: 10,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+      sha256Iterations: "server" as const,
+    };
+  }
+
+  return {
+    host: process.env.GAUSSHOST?.trim() || "127.0.0.1",
+    port: Number(process.env.GAUSSPORT || 8000),
+    user: process.env.GAUSSUSER?.trim() || "gaussdb",
+    password: process.env.GAUSSPASSWORD ?? "",
+    database: process.env.GAUSSDATABASE?.trim() || "ai_pipeline",
+    max: 10,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 5_000,
+    sha256Iterations: "server" as const,
+  };
+}
+
+function buildMysqlConfig() {
+  const rawUrl =
+    process.env.MYSQL_URL?.trim() ||
+    (process.env.DATABASE_URL?.trim() &&
+    /^mysql2?:\/\//i.test(process.env.DATABASE_URL.trim())
+      ? process.env.DATABASE_URL.trim()
+      : undefined);
+
+  if (rawUrl) {
+    const parsed = new URL(rawUrl.replace(/^mysql2:\/\//i, "mysql://"));
+    return {
+      host: parsed.hostname || "127.0.0.1",
+      port: Number(parsed.port || 3306),
+      user: decodeURIComponent(parsed.username || "root"),
+      password: decodeURIComponent(parsed.password || ""),
+      database: parsed.pathname.replace(/^\//, "") || "ai_pipeline",
+      connectionLimit: 10,
+      connectTimeout: 5_000,
+      charset: "utf8mb4",
+    };
+  }
+
+  return {
+    host: process.env.MYSQL_HOST?.trim() || "127.0.0.1",
+    port: Number(process.env.MYSQL_PORT || 3306),
+    user: process.env.MYSQL_USER?.trim() || "root",
+    password: process.env.MYSQL_PASSWORD ?? "root",
+    database: process.env.MYSQL_DATABASE?.trim() || "ai_pipeline",
+    connectionLimit: 10,
+    connectTimeout: 5_000,
+    charset: "utf8mb4",
+  };
+}
+
+// ============================================================================
+// Multi-dialect DDL schemas
+// ============================================================================
 
 const PG_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS skills (
@@ -243,6 +384,190 @@ CREATE INDEX IF NOT EXISTS idx_ai_trace_spans_trace_id ON ai_trace_spans (trace_
 CREATE INDEX IF NOT EXISTS idx_ai_trace_spans_created_at ON ai_trace_spans (created_at DESC);
 `;
 
+const GAUSS_SCHEMA_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS skills (
+    skill_name TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    creator TEXT NOT NULL DEFAULT 'Admin',
+    is_builtin BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    current_step SMALLINT NOT NULL DEFAULT 1,
+    progress SMALLINT NOT NULL DEFAULT 33,
+    status TEXT NOT NULL DEFAULT 'draft',
+    selected_apps JSONB NOT NULL DEFAULT '[]'::jsonb,
+    selected_repos JSONB NOT NULL DEFAULT '[]'::jsonb,
+    selected_mcps JSONB NOT NULL DEFAULT '[]'::jsonb,
+    pipeline_runs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
+    has_scripts BOOLEAN NOT NULL DEFAULT FALSE,
+    resource_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    skill_md TEXT NOT NULL DEFAULT ''
+  )`,
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    name TEXT NOT NULL,
+    transport TEXT NOT NULL DEFAULT 'streamable-http',
+    url TEXT NOT NULL,
+    headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (owner, name)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_mcp_servers_owner ON mcp_servers (owner)`,
+  `CREATE TABLE IF NOT EXISTS skill_files (
+    skill_name TEXT NOT NULL REFERENCES skills(skill_name) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'other',
+    mime_type TEXT NOT NULL DEFAULT 'text/plain',
+    encoding TEXT NOT NULL DEFAULT 'utf-8',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    is_executable BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (skill_name, file_path)
+  )`,
+  `CREATE TABLE IF NOT EXISTS catalog_apps (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    env TEXT NOT NULL DEFAULT 'prod',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
+  `CREATE TABLE IF NOT EXISTS catalog_repos (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    branch TEXT NOT NULL DEFAULT 'main',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
+  `CREATE TABLE IF NOT EXISTS generation_jobs (
+    job_id TEXT PRIMARY KEY,
+    skill_name TEXT,
+    status TEXT NOT NULL,
+    started_at BIGINT NOT NULL,
+    ended_at BIGINT,
+    elapsed_ms INTEGER NOT NULL DEFAULT 0,
+    timeout_ms INTEGER NOT NULL DEFAULT 120000,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    streamed_content TEXT NOT NULL DEFAULT '',
+    error_message TEXT,
+    result JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
+  `CREATE TABLE IF NOT EXISTS ai_trace_spans (
+    id BIGSERIAL PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    parent_span_id TEXT,
+    name TEXT NOT NULL,
+    kind INTEGER NOT NULL DEFAULT 0,
+    start_time_ms DOUBLE PRECISION NOT NULL,
+    end_time_ms DOUBLE PRECISION NOT NULL,
+    duration_ms DOUBLE PRECISION NOT NULL,
+    status JSONB NOT NULL DEFAULT '{}'::jsonb,
+    attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    events JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_ai_trace_spans_trace_id ON ai_trace_spans (trace_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_ai_trace_spans_created_at ON ai_trace_spans (created_at DESC)`,
+];
+
+const MYSQL_SCHEMA_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS skills (
+    skill_name VARCHAR(255) PRIMARY KEY,
+    description TEXT NOT NULL,
+    creator VARCHAR(255) NOT NULL DEFAULT 'Admin',
+    is_builtin TINYINT(1) NOT NULL DEFAULT 0,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    current_step TINYINT NOT NULL DEFAULT 1,
+    progress SMALLINT NOT NULL DEFAULT 33,
+    status VARCHAR(64) NOT NULL DEFAULT 'draft',
+    selected_apps JSON NOT NULL,
+    selected_repos JSON NOT NULL,
+    selected_mcps JSON NOT NULL,
+    pipeline_runs JSON NOT NULL,
+    frontmatter JSON NOT NULL,
+    has_scripts TINYINT(1) NOT NULL DEFAULT 0,
+    resource_summary JSON NOT NULL,
+    skill_md LONGTEXT NOT NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id VARCHAR(64) PRIMARY KEY,
+    owner VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    transport VARCHAR(64) NOT NULL DEFAULT 'streamable-http',
+    url TEXT NOT NULL,
+    headers JSON NOT NULL,
+    description TEXT NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_mcp_servers_owner_name (owner, name),
+    KEY idx_mcp_servers_owner (owner)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS skill_files (
+    skill_name VARCHAR(255) NOT NULL,
+    file_path VARCHAR(512) NOT NULL,
+    content LONGTEXT NOT NULL,
+    category VARCHAR(64) NOT NULL DEFAULT 'other',
+    mime_type VARCHAR(128) NOT NULL DEFAULT 'text/plain',
+    encoding VARCHAR(32) NOT NULL DEFAULT 'utf-8',
+    size_bytes INT NOT NULL DEFAULT 0,
+    is_executable TINYINT(1) NOT NULL DEFAULT 0,
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (skill_name, file_path),
+    CONSTRAINT fk_skill_files_skill_name
+      FOREIGN KEY (skill_name) REFERENCES skills(skill_name) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS catalog_apps (
+    id VARCHAR(128) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    env VARCHAR(64) NOT NULL DEFAULT 'prod',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS catalog_repos (
+    id VARCHAR(128) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    url TEXT NOT NULL,
+    branch VARCHAR(128) NOT NULL DEFAULT 'main',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS generation_jobs (
+    job_id VARCHAR(64) PRIMARY KEY,
+    skill_name VARCHAR(255),
+    status VARCHAR(64) NOT NULL,
+    started_at BIGINT NOT NULL,
+    ended_at BIGINT,
+    elapsed_ms INT NOT NULL DEFAULT 0,
+    timeout_ms INT NOT NULL DEFAULT 120000,
+    payload JSON NOT NULL,
+    streamed_content LONGTEXT NOT NULL,
+    error_message TEXT,
+    result JSON,
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS ai_trace_spans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    trace_id VARCHAR(64) NOT NULL,
+    span_id VARCHAR(64) NOT NULL,
+    parent_span_id VARCHAR(64),
+    name VARCHAR(255) NOT NULL,
+    kind INT NOT NULL DEFAULT 0,
+    start_time_ms DOUBLE NOT NULL,
+    end_time_ms DOUBLE NOT NULL,
+    duration_ms DOUBLE NOT NULL,
+    status JSON NOT NULL,
+    attributes JSON NOT NULL,
+    events JSON NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    KEY idx_ai_trace_spans_trace_id (trace_id),
+    KEY idx_ai_trace_spans_created_at (created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+];
+
 const SQLITE_SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
 
@@ -343,9 +668,12 @@ CREATE TABLE IF NOT EXISTS ai_trace_spans (
 CREATE INDEX IF NOT EXISTS idx_ai_trace_spans_trace_id ON ai_trace_spans (trace_id);
 `;
 
+// ============================================================================
+// Connection helpers & startup sync (via Kysely)
+// ============================================================================
+
 async function tryAutoStartLocalPostgres(): Promise<boolean> {
   try {
-    // 1. Look for any existing local postgres container (e.g. postgres:15-alpine)
     const { stdout } = await execFileAsync(
       "docker",
       ["ps", "-a", "--format", "{{.Names}}\t{{.Image}}"],
@@ -369,7 +697,6 @@ async function tryAutoStartLocalPostgres(): Promise<boolean> {
       return true;
     }
 
-    // 2. Fallback: try docker compose up -d postgres
     dbLog.info("Attempting `docker compose up -d postgres`...");
     await execFileAsync("docker", ["compose", "up", "-d", "postgres"], {
       timeout: 15_000,
@@ -381,23 +708,38 @@ async function tryAutoStartLocalPostgres(): Promise<boolean> {
   }
 }
 
-async function seedCatalogData(): Promise<void> {
-  for (const app of INITIAL_APPS) {
-    await queryDb(
-      `INSERT INTO catalog_apps (id, name, env)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (id) DO NOTHING`,
-      [app.id, app.name, app.env]
-    );
+async function connectPostgres(): Promise<PgPool | null> {
+  const candidate = new PgPool(buildPgConfig());
+  try {
+    await candidate.query("SELECT 1");
+    return candidate;
+  } catch {
+    await candidate.end().catch(() => {});
+    return null;
   }
+}
 
-  for (const repo of INITIAL_REPOS) {
-    await queryDb(
-      `INSERT INTO catalog_repos (id, name, url, branch)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (id) DO NOTHING`,
-      [repo.id, repo.name, repo.url, repo.branch]
-    );
+async function connectGauss(): Promise<GaussPool | null> {
+  const candidate = new GaussPool(buildGaussConfig());
+  try {
+    await candidate.query("SELECT 1");
+    return candidate;
+  } catch (err) {
+    dbLog.warn({ err }, "GaussDB connection attempt failed");
+    await candidate.end().catch(() => {});
+    return null;
+  }
+}
+
+async function connectMysql(): Promise<MysqlPool | null> {
+  const candidate = createMysqlPool(buildMysqlConfig());
+  try {
+    await candidate.promise().query("SELECT 1");
+    return candidate;
+  } catch (err) {
+    dbLog.warn({ err }, "MySQL connection attempt failed");
+    await candidate.promise().end().catch(() => {});
+    return null;
   }
 }
 
@@ -434,13 +776,89 @@ function applySqliteMigrations(db: BunSqliteDatabase): void {
   ]);
 }
 
-/**
- * Step 1 of startup skill sync:
- * Load built-in skills from `resource/builtin-skills/` into the database
- * (`skills` + `skill_files`), preserving complete directory resources.
- * If `resource/builtin-skills/` is missing or empty, existing DB records are kept intact.
- */
+async function initSqliteFallback(): Promise<void> {
+  const sqlitePath = path.resolve(
+    process.cwd(),
+    process.env.SQLITE_PATH?.trim() || "data/ai-pipeline.sqlite"
+  );
+  await fs.mkdir(path.dirname(sqlitePath), { recursive: true });
+  sqliteDb = new BunSqliteDatabase(sqlitePath);
+  sqliteDb.exec(SQLITE_SCHEMA_SQL);
+  applySqliteMigrations(sqliteDb);
+  kyselyDb = new Kysely<DatabaseSchema>({
+    dialect: new BunSqliteDialect(sqliteDb),
+  });
+  activeDriver = "sqlite";
+  dbLog.warn(
+    { sqlitePath },
+    "Primary SQL database unavailable; initialized SQLite fallback via Kysely"
+  );
+}
+
+function resolvePreferredDriver(): "postgres" | "mysql" | "gauss" | "sqlite" | "auto" {
+  const raw = process.env.DB_DRIVER?.trim().toLowerCase();
+  if (raw === "postgres" || raw === "postgresql" || raw === "pg") return "postgres";
+  if (raw === "mysql" || raw === "mysql2") return "mysql";
+  if (raw === "gauss" || raw === "gaussdb" || raw === "opengauss") return "gauss";
+  if (raw === "sqlite") return "sqlite";
+
+  const dbUrl = process.env.DATABASE_URL?.trim().toLowerCase() ?? "";
+  if (dbUrl.startsWith("mysql://") || dbUrl.startsWith("mysql2://")) return "mysql";
+  if (dbUrl.startsWith("gaussdb://") || dbUrl.startsWith("opengauss://")) return "gauss";
+  if (process.env.GAUSS_URL?.trim() || process.env.GAUSSHOST?.trim()) return "gauss";
+  if (process.env.MYSQL_URL?.trim() || process.env.MYSQL_HOST?.trim()) return "mysql";
+
+  return "auto";
+}
+
+async function seedCatalogData(): Promise<void> {
+  const db = getDb();
+
+  for (const app of INITIAL_APPS) {
+    if (isMysqlDriver()) {
+      await db
+        .insertInto("catalog_apps")
+        .ignore()
+        .values({ id: app.id, name: app.name, env: app.env })
+        .execute();
+    } else {
+      await db
+        .insertInto("catalog_apps")
+        .values({ id: app.id, name: app.name, env: app.env })
+        .onConflict((oc) => oc.column("id").doNothing())
+        .execute();
+    }
+  }
+
+  for (const repo of INITIAL_REPOS) {
+    if (isMysqlDriver()) {
+      await db
+        .insertInto("catalog_repos")
+        .ignore()
+        .values({
+          id: repo.id,
+          name: repo.name,
+          url: repo.url,
+          branch: repo.branch,
+        })
+        .execute();
+    } else {
+      await db
+        .insertInto("catalog_repos")
+        .values({
+          id: repo.id,
+          name: repo.name,
+          url: repo.url,
+          branch: repo.branch,
+        })
+        .onConflict((oc) => oc.column("id").doNothing())
+        .execute();
+    }
+  }
+}
+
 async function ingestBuiltinSkillsToDb(): Promise<Set<string>> {
+  const db = getDb();
   const builtinNames = new Set<string>();
   const builtinRoot = path.resolve(process.cwd(), "resource", "builtin-skills");
   const entries = await fs
@@ -460,82 +878,111 @@ async function ingestBuiltinSkillsToDb(): Promise<Set<string>> {
     const frontmatter = parseSkillFrontmatter(skillMd.content);
     const desc = extractDescriptionFromMarkdown(skillMd.content);
     const { summary, hasScripts } = buildResourceSummary(files);
+    const now = dbNow();
 
-    await queryDb(
-      `INSERT INTO skills (
-         skill_name, description, creator, is_builtin, current_step, progress, status,
-         frontmatter, has_scripts, resource_summary, skill_md
-       )
-       VALUES ($1, $2, 'Built-in', $3, 3, 100, 'published', $4::jsonb, $5, $6::jsonb, $7)
-       ON CONFLICT (skill_name)
-       DO UPDATE SET
-         description = EXCLUDED.description,
-         is_builtin = EXCLUDED.is_builtin,
-         frontmatter = EXCLUDED.frontmatter,
-         has_scripts = EXCLUDED.has_scripts,
-         resource_summary = EXCLUDED.resource_summary,
-         skill_md = EXCLUDED.skill_md`,
-      [
-        skillName,
-        desc,
-        true,
-        JSON.stringify(frontmatter),
-        hasScripts,
-        JSON.stringify(summary),
-        skillMd.content,
-      ]
-    );
+    const skillValues = {
+      skill_name: skillName,
+      description: desc,
+      creator: "Built-in",
+      is_builtin: toDbBool(true),
+      created_at: now,
+      updated_at: now,
+      current_step: 3,
+      progress: 100,
+      status: "published",
+      selected_apps: "[]",
+      selected_repos: "[]",
+      selected_mcps: "[]",
+      pipeline_runs: "[]",
+      frontmatter: JSON.stringify(frontmatter),
+      has_scripts: toDbBool(hasScripts),
+      resource_summary: JSON.stringify(summary),
+      skill_md: skillMd.content,
+    };
 
-    await queryDb(`DELETE FROM skill_files WHERE skill_name = $1`, [skillName]);
+    const skillUpdate = {
+      description: desc,
+      is_builtin: toDbBool(true),
+      frontmatter: JSON.stringify(frontmatter),
+      has_scripts: toDbBool(hasScripts),
+      resource_summary: JSON.stringify(summary),
+      skill_md: skillMd.content,
+    };
+
+    if (isMysqlDriver()) {
+      await db
+        .insertInto("skills")
+        .values(skillValues)
+        .onDuplicateKeyUpdate(skillUpdate)
+        .execute();
+    } else {
+      await db
+        .insertInto("skills")
+        .values(skillValues)
+        .onConflict((oc) => oc.column("skill_name").doUpdateSet(skillUpdate))
+        .execute();
+    }
+
+    await db
+      .deleteFrom("skill_files")
+      .where("skill_name", "=", skillName)
+      .execute();
+
     for (const file of files) {
-      await queryDb(
-        `INSERT INTO skill_files (
-           skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable, updated_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-         ON CONFLICT (skill_name, file_path)
-         DO UPDATE SET
-           content = EXCLUDED.content,
-           category = EXCLUDED.category,
-           mime_type = EXCLUDED.mime_type,
-           encoding = EXCLUDED.encoding,
-           size_bytes = EXCLUDED.size_bytes,
-           is_executable = EXCLUDED.is_executable,
-           updated_at = NOW()`,
-        [
-          skillName,
-          file.path,
-          file.content,
-          file.category,
-          file.mimeType,
-          file.encoding,
-          file.sizeBytes,
-          file.isExecutable,
-        ]
-      );
+      const fileValues = {
+        skill_name: skillName,
+        file_path: file.path,
+        content: file.content,
+        category: file.category ?? "other",
+        mime_type: file.mimeType ?? "text/plain",
+        encoding: file.encoding ?? "utf-8",
+        size_bytes: file.sizeBytes ?? 0,
+        is_executable: toDbBool(Boolean(file.isExecutable)),
+        updated_at: now,
+      };
+      const fileUpdate = {
+        content: fileValues.content,
+        category: fileValues.category,
+        mime_type: fileValues.mime_type,
+        encoding: fileValues.encoding,
+        size_bytes: fileValues.size_bytes,
+        is_executable: fileValues.is_executable,
+        updated_at: now,
+      };
+
+      if (isMysqlDriver()) {
+        await db
+          .insertInto("skill_files")
+          .values(fileValues)
+          .onDuplicateKeyUpdate(fileUpdate)
+          .execute();
+      } else {
+        await db
+          .insertInto("skill_files")
+          .values(fileValues)
+          .onConflict((oc) =>
+            oc.columns(["skill_name", "file_path"]).doUpdateSet(fileUpdate)
+          )
+          .execute();
+      }
     }
   }
 
   return builtinNames;
 }
 
-/**
- * Step 2 of startup skill sync:
- * Import any disk-only skills that are not yet in the database.
- * Uses ON CONFLICT DO NOTHING so the database always remains the source of truth.
- */
 async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
+  const db = getDb();
   const diskSkills = await listSkillsInDefaultDir("global");
   for (const disk of diskSkills) {
     if (builtinNames.has(disk.skillName)) continue;
 
-    const existing = await queryDb<{ skill_name: string }>(
-      `SELECT skill_name FROM skills WHERE skill_name = $1`,
-      [disk.skillName]
-    );
-    if (existing.rows.length > 0) {
-      continue;
-    }
+    const existing = await db
+      .selectFrom("skills")
+      .select("skill_name")
+      .where("skill_name", "=", disk.skillName)
+      .executeTakeFirst();
+    if (existing) continue;
 
     const skillDir = path.join(resolveDefaultSkillsRoot("global"), disk.skillName);
     const files = await readSkillDirectoryFiles(skillDir);
@@ -544,76 +991,90 @@ async function syncDiskSkillsToDb(builtinNames: Set<string>): Promise<void> {
     const frontmatter = parseSkillFrontmatter(mdContent);
     const desc = extractDescriptionFromMarkdown(mdContent, "System AI Skill");
     const { summary, hasScripts } = buildResourceSummary(files);
+    const now = dbNow();
 
-    await queryDb(
-      `INSERT INTO skills (
-         skill_name, description, creator, is_builtin, current_step, progress, status,
-         frontmatter, has_scripts, resource_summary, skill_md
-       )
-       VALUES ($1, $2, 'System', $3, 1, 33, 'draft', $4::jsonb, $5, $6::jsonb, $7)
-       ON CONFLICT (skill_name) DO NOTHING`,
-      [
-        disk.skillName,
-        desc,
-        false,
-        JSON.stringify(frontmatter),
-        hasScripts,
-        JSON.stringify(summary),
-        mdContent,
-      ]
-    );
+    const skillValues = {
+      skill_name: disk.skillName,
+      description: desc,
+      creator: "System",
+      is_builtin: toDbBool(false),
+      created_at: now,
+      updated_at: now,
+      current_step: 1,
+      progress: 33,
+      status: "draft",
+      selected_apps: "[]",
+      selected_repos: "[]",
+      selected_mcps: "[]",
+      pipeline_runs: "[]",
+      frontmatter: JSON.stringify(frontmatter),
+      has_scripts: toDbBool(hasScripts),
+      resource_summary: JSON.stringify(summary),
+      skill_md: mdContent,
+    };
+
+    if (isMysqlDriver()) {
+      await db.insertInto("skills").ignore().values(skillValues).execute();
+    } else {
+      await db
+        .insertInto("skills")
+        .values(skillValues)
+        .onConflict((oc) => oc.column("skill_name").doNothing())
+        .execute();
+    }
 
     for (const file of files) {
-      await queryDb(
-        `INSERT INTO skill_files (
-           skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (skill_name, file_path) DO NOTHING`,
-        [
-          disk.skillName,
-          file.path,
-          file.content,
-          file.category,
-          file.mimeType,
-          file.encoding,
-          file.sizeBytes,
-          file.isExecutable,
-        ]
-      );
+      const fileValues = {
+        skill_name: disk.skillName,
+        file_path: file.path,
+        content: file.content,
+        category: file.category ?? "other",
+        mime_type: file.mimeType ?? "text/plain",
+        encoding: file.encoding ?? "utf-8",
+        size_bytes: file.sizeBytes ?? 0,
+        is_executable: toDbBool(Boolean(file.isExecutable)),
+        updated_at: now,
+      };
+      if (isMysqlDriver()) {
+        await db.insertInto("skill_files").ignore().values(fileValues).execute();
+      } else {
+        await db
+          .insertInto("skill_files")
+          .values(fileValues)
+          .onConflict((oc) => oc.columns(["skill_name", "file_path"]).doNothing())
+          .execute();
+      }
     }
   }
 }
 
-/**
- * Step 3 of startup skill sync:
- * Restore all skills (built-in + user-created) from the database to the agent
- * skill directories (~/.omp/agent/skills and ~/.pi/agent/skills), so skills
- * remain available even if `resource/builtin-skills/` is deleted.
- */
 export async function restoreSkillsFromDbToAgentDirs(): Promise<number> {
-  const skillRows = await queryDb<{ skill_name: string; skill_md: string }>(
-    `SELECT skill_name, skill_md FROM skills ORDER BY skill_name ASC`
-  );
-  if (skillRows.rows.length === 0) return 0;
+  const db = getDb();
+  const skillRows = await db
+    .selectFrom("skills")
+    .select(["skill_name", "skill_md"])
+    .orderBy("skill_name", "asc")
+    .execute();
+  if (skillRows.length === 0) return 0;
 
-  const fileRows = await queryDb<{
-    skill_name: string;
-    file_path: string;
-    content: string;
-    category: string;
-    mime_type: string;
-    encoding: string;
-    size_bytes: number;
-    is_executable: boolean | number;
-  }>(
-    `SELECT skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable
-     FROM skill_files
-     ORDER BY skill_name ASC, file_path ASC`
-  );
+  const fileRows = await db
+    .selectFrom("skill_files")
+    .select([
+      "skill_name",
+      "file_path",
+      "content",
+      "category",
+      "mime_type",
+      "encoding",
+      "size_bytes",
+      "is_executable",
+    ])
+    .orderBy("skill_name", "asc")
+    .orderBy("file_path", "asc")
+    .execute();
 
   const filesBySkill = new Map<string, SkillFileEntry[]>();
-  for (const row of fileRows.rows) {
+  for (const row of fileRows) {
     const list = filesBySkill.get(row.skill_name) ?? [];
     list.push({
       path: row.file_path,
@@ -630,7 +1091,7 @@ export async function restoreSkillsFromDbToAgentDirs(): Promise<number> {
   const targetRoots = resolveAllGlobalSkillRoots();
   let restoredCount = 0;
 
-  for (const skill of skillRows.rows) {
+  for (const skill of skillRows) {
     let files = filesBySkill.get(skill.skill_name) ?? [];
     if (files.length === 0 && skill.skill_md) {
       files = [enrichSkillFileEntry({ path: "SKILL.md", content: skill.skill_md })];
@@ -650,55 +1111,75 @@ export async function restoreSkillsFromDbToAgentDirs(): Promise<number> {
   return restoredCount;
 }
 
-async function connectPostgres(): Promise<Pool | null> {
-  const candidate = new Pool(buildPgConfig());
-  try {
-    await candidate.query("SELECT 1");
-    return candidate;
-  } catch {
-    await candidate.end().catch(() => {});
-    return null;
-  }
-}
-
 /**
- * Initialize database (PostgreSQL primary with auto-start; SQLite fallback).
- * No JSON metadata files are used.
+ * Initialize database using Kysely with multi-dialect support:
+ * PostgreSQL (`pg`), MySQL (`mysql2`), GaussDB/openGauss (`gaussdb-nodejs`), and SQLite (`bun:sqlite`).
  */
 export async function initDatabase(): Promise<DbDriver> {
-  if (activeDriver) return activeDriver;
+  if (activeDriver && kyselyDb) return activeDriver;
 
-  // 1. Try PostgreSQL directly
-  let connectedPool = await connectPostgres();
+  const preferred = resolvePreferredDriver();
+  const allowFallback = process.env.DB_ALLOW_SQLITE_FALLBACK !== "false";
 
-  // 2. If PostgreSQL is unreachable, try auto-starting local container (e.g. 15-alpine)
-  if (!connectedPool) {
-    const started = await tryAutoStartLocalPostgres();
-    if (started) {
-      connectedPool = await connectPostgres();
+  if (preferred === "sqlite") {
+    await initSqliteFallback();
+  } else if (preferred === "mysql") {
+    const pool = await connectMysql();
+    if (pool) {
+      mysqlPool = pool;
+      activeDriver = "mysql";
+      for (const stmt of MYSQL_SCHEMA_STATEMENTS) {
+        await mysqlPool.promise().query(stmt);
+      }
+      kyselyDb = new Kysely<DatabaseSchema>({
+        dialect: new MysqlDialect({ pool: mysqlPool as never }),
+      });
+      dbLog.info("MySQL connected via mysql2 and Kysely schema initialized");
+    } else if (allowFallback) {
+      await initSqliteFallback();
+    } else {
+      throw new Error("MySQL connection failed and SQLite fallback is disabled");
     }
-  }
-
-  if (connectedPool) {
-    pgPool = connectedPool;
-    activeDriver = "postgres";
-    await pgPool.query(PG_SCHEMA_SQL);
-    dbLog.info("PostgreSQL connected and schema initialized");
+  } else if (preferred === "gauss") {
+    const pool = await connectGauss();
+    if (pool) {
+      gaussPool = pool;
+      activeDriver = "gauss";
+      for (const stmt of GAUSS_SCHEMA_STATEMENTS) {
+        await gaussPool.query(stmt);
+      }
+      kyselyDb = new Kysely<DatabaseSchema>({
+        dialect: new PostgresDialect({ pool: gaussPool as never }),
+      });
+      dbLog.info("GaussDB connected via gaussdb-nodejs and Kysely schema initialized");
+    } else if (allowFallback) {
+      await initSqliteFallback();
+    } else {
+      throw new Error("GaussDB connection failed and SQLite fallback is disabled");
+    }
   } else {
-    // 3. Fallback to SQLite (bun:sqlite)
-    const sqlitePath = path.resolve(
-      process.cwd(),
-      process.env.SQLITE_PATH?.trim() || "data/ai-pipeline.sqlite"
-    );
-    await fs.mkdir(path.dirname(sqlitePath), { recursive: true });
-    sqliteDb = new BunSqliteDatabase(sqlitePath);
-    sqliteDb.exec(SQLITE_SCHEMA_SQL);
-    applySqliteMigrations(sqliteDb);
-    activeDriver = "sqlite";
-    dbLog.warn(
-      { sqlitePath },
-      "PostgreSQL unavailable; initialized SQLite fallback database"
-    );
+    // PostgreSQL ("postgres" or "auto")
+    let connectedPool = await connectPostgres();
+    if (!connectedPool && preferred === "auto") {
+      const started = await tryAutoStartLocalPostgres();
+      if (started) {
+        connectedPool = await connectPostgres();
+      }
+    }
+
+    if (connectedPool) {
+      pgPool = connectedPool;
+      activeDriver = "postgres";
+      await pgPool.query(PG_SCHEMA_SQL);
+      kyselyDb = new Kysely<DatabaseSchema>({
+        dialect: new PostgresDialect({ pool: pgPool }),
+      });
+      dbLog.info("PostgreSQL connected via pg and Kysely schema initialized");
+    } else if (allowFallback) {
+      await initSqliteFallback();
+    } else {
+      throw new Error("PostgreSQL connection failed and SQLite fallback is disabled");
+    }
   }
 
   if (process.env.DB_INIT_SEED !== "false") {
@@ -708,13 +1189,25 @@ export async function initDatabase(): Promise<DbDriver> {
   await syncDiskSkillsToDb(builtinNames);
   await restoreSkillsFromDbToAgentDirs();
 
-  return activeDriver;
+  return activeDriver!;
 }
 
 export async function closeDatabase(): Promise<void> {
+  if (kyselyDb) {
+    await kyselyDb.destroy().catch(() => {});
+    kyselyDb = null;
+  }
   if (pgPool) {
     await pgPool.end().catch(() => {});
     pgPool = null;
+  }
+  if (gaussPool) {
+    await gaussPool.end().catch(() => {});
+    gaussPool = null;
+  }
+  if (mysqlPool) {
+    await mysqlPool.promise().end().catch(() => {});
+    mysqlPool = null;
   }
   if (sqliteDb) {
     try {

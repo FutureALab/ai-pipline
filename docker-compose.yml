@@ -17,19 +17,123 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    container_name: ai-pipeline-redis
+  mysql:
+    image: mysql:8.0
+    container_name: ai-pipeline-mysql
+    profiles: ["mysql"]
     restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ai_pipeline}
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${MYSQL_PORT:-3306}:3306"
     volumes:
-      - redis_data:/data
+      - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  redis-node-1:
+    image: redis:7-alpine
+    container_name: ai-pipeline-redis-1
+    restart: unless-stopped
+    command: >
+      redis-server
+      --port 7001
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7001
+      --cluster-announce-bus-port 17001
+      --appendonly yes
+    ports:
+      - "7001:7001"
+      - "17001:17001"
+    volumes:
+      - redis_node_1_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7001", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+  redis-node-2:
+    image: redis:7-alpine
+    container_name: ai-pipeline-redis-2
+    restart: unless-stopped
+    command: >
+      redis-server
+      --port 7002
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7002
+      --cluster-announce-bus-port 17002
+      --appendonly yes
+    ports:
+      - "7002:7002"
+      - "17002:17002"
+    volumes:
+      - redis_node_2_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7002", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis-node-3:
+    image: redis:7-alpine
+    container_name: ai-pipeline-redis-3
+    restart: unless-stopped
+    command: >
+      redis-server
+      --port 7003
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 127.0.0.1
+      --cluster-announce-port 7003
+      --cluster-announce-bus-port 17003
+      --appendonly yes
+    ports:
+      - "7003:7003"
+      - "17003:17003"
+    volumes:
+      - redis_node_3_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7003", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis-cluster-init:
+    image: redis:7-alpine
+    container_name: ai-pipeline-redis-cluster-init
+    depends_on:
+      redis-node-1:
+        condition: service_healthy
+      redis-node-2:
+        condition: service_healthy
+      redis-node-3:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if redis-cli -h redis-node-1 -p 7001 cluster info | grep -q "cluster_state:ok"; then
+          echo "Redis Cluster already initialized."
+        else
+          redis-cli --cluster create \
+            redis-node-1:7001 \
+            redis-node-2:7002 \
+            redis-node-3:7003 \
+            --cluster-replicas 0 --cluster-yes
+        fi
 
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
@@ -80,5 +184,8 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
+  mysql_data:
+  redis_node_1_data:
+  redis_node_2_data:
+  redis_node_3_data:
   jenkins_home:

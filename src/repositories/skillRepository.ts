@@ -1,7 +1,14 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { queryDb } from "../db/database.js";
+import {
+  dbNow,
+  getDb,
+  isMysqlDriver,
+  toDbBool,
+  toDbTimestamp,
+} from "../db/database.js";
+import type { SkillRow } from "../db/schema.js";
 import type {
   CatalogAppRow,
   CatalogRepoRow,
@@ -38,22 +45,26 @@ function resolveSafeSkillFilePath(skillName: string, relativePath: string): stri
 
 export async function readSkillMarkdown(skillName: string): Promise<string> {
   const normalized = normalizeSkillName(skillName);
+  const db = getDb();
 
   // 1. Database is the primary source of truth
-  const res = await queryDb<{ content: string }>(
-    `SELECT content FROM skill_files WHERE skill_name = $1 AND file_path = 'SKILL.md'`,
-    [normalized]
-  );
-  if (res.rows[0]?.content !== undefined) {
-    return res.rows[0].content;
+  const fileRow = await db
+    .selectFrom("skill_files")
+    .select("content")
+    .where("skill_name", "=", normalized)
+    .where("file_path", "=", "SKILL.md")
+    .executeTakeFirst();
+  if (fileRow?.content !== undefined) {
+    return fileRow.content;
   }
 
-  const skillRow = await queryDb<{ skill_md: string }>(
-    `SELECT skill_md FROM skills WHERE skill_name = $1`,
-    [normalized]
-  );
-  if (skillRow.rows[0]?.skill_md) {
-    return skillRow.rows[0].skill_md;
+  const skillRow = await db
+    .selectFrom("skills")
+    .select("skill_md")
+    .where("skill_name", "=", normalized)
+    .executeTakeFirst();
+  if (skillRow?.skill_md) {
+    return skillRow.skill_md;
   }
 
   // 2. Fallback to disk if not yet in DB
@@ -71,16 +82,14 @@ export async function readSkillMarkdown(skillName: string): Promise<string> {
 
 export async function syncSkillMetadata(skillName: string): Promise<void> {
   const normalized = normalizeSkillName(skillName);
-  const res = await queryDb<{
-    file_path: string;
-    content: string;
-    category: string;
-  }>(
-    `SELECT file_path, content, category FROM skill_files WHERE skill_name = $1`,
-    [normalized]
-  );
+  const db = getDb();
+  const rows = await db
+    .selectFrom("skill_files")
+    .select(["file_path", "content", "category"])
+    .where("skill_name", "=", normalized)
+    .execute();
 
-  const files: SkillFileEntry[] = res.rows.map((r) => ({
+  const files: SkillFileEntry[] = rows.map((r) => ({
     path: r.file_path,
     content: r.content,
     category: r.category as SkillFileCategory,
@@ -91,31 +100,61 @@ export async function syncSkillMetadata(skillName: string): Promise<void> {
   const frontmatter = skillMd ? parseSkillFrontmatter(skillMd.content) : null;
 
   if (skillMd && frontmatter) {
-    await queryDb(
-      `UPDATE skills
-       SET frontmatter = $2::jsonb,
-           has_scripts = $3,
-           resource_summary = $4::jsonb,
-           skill_md = $5,
-           updated_at = NOW()
-       WHERE skill_name = $1`,
-      [
-        normalized,
-        JSON.stringify(frontmatter),
-        hasScripts,
-        JSON.stringify(summary),
-        skillMd.content,
-      ]
-    );
+    await db
+      .updateTable("skills")
+      .set({
+        frontmatter: JSON.stringify(frontmatter),
+        has_scripts: toDbBool(hasScripts),
+        resource_summary: JSON.stringify(summary),
+        skill_md: skillMd.content,
+        updated_at: dbNow(),
+      })
+      .where("skill_name", "=", normalized)
+      .execute();
   } else {
-    await queryDb(
-      `UPDATE skills
-       SET has_scripts = $2,
-           resource_summary = $3::jsonb,
-           updated_at = NOW()
-       WHERE skill_name = $1`,
-      [normalized, hasScripts, JSON.stringify(summary)]
-    );
+    await db
+      .updateTable("skills")
+      .set({
+        has_scripts: toDbBool(hasScripts),
+        resource_summary: JSON.stringify(summary),
+        updated_at: dbNow(),
+      })
+      .where("skill_name", "=", normalized)
+      .execute();
+  }
+}
+
+async function ensureSkillRowExists(normalizedSkillName: string): Promise<void> {
+  const db = getDb();
+  const now = dbNow();
+  const stub = {
+    skill_name: normalizedSkillName,
+    description: "",
+    creator: "Admin",
+    is_builtin: toDbBool(false),
+    created_at: now,
+    updated_at: now,
+    current_step: 1,
+    progress: 33,
+    status: "draft",
+    selected_apps: "[]",
+    selected_repos: "[]",
+    selected_mcps: "[]",
+    pipeline_runs: "[]",
+    frontmatter: "{}",
+    has_scripts: toDbBool(false),
+    resource_summary: "{}",
+    skill_md: "",
+  };
+
+  if (isMysqlDriver()) {
+    await db.insertInto("skills").ignore().values(stub).execute();
+  } else {
+    await db
+      .insertInto("skills")
+      .values(stub)
+      .onConflict((oc) => oc.column("skill_name").doNothing())
+      .execute();
   }
 }
 
@@ -123,31 +162,44 @@ async function upsertSkillFileRow(
   normalizedSkillName: string,
   entry: Required<SkillFileEntry>
 ): Promise<void> {
-  await queryDb(
-    `INSERT INTO skill_files (
-       skill_name, file_path, content, category, mime_type, encoding, size_bytes, is_executable, updated_at
-     )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-     ON CONFLICT (skill_name, file_path)
-     DO UPDATE SET
-       content = EXCLUDED.content,
-       category = EXCLUDED.category,
-       mime_type = EXCLUDED.mime_type,
-       encoding = EXCLUDED.encoding,
-       size_bytes = EXCLUDED.size_bytes,
-       is_executable = EXCLUDED.is_executable,
-       updated_at = NOW()`,
-    [
-      normalizedSkillName,
-      entry.path,
-      entry.content,
-      entry.category,
-      entry.mimeType,
-      entry.encoding,
-      entry.sizeBytes,
-      entry.isExecutable,
-    ]
-  );
+  const db = getDb();
+  const now = dbNow();
+  const values = {
+    skill_name: normalizedSkillName,
+    file_path: entry.path,
+    content: entry.content,
+    category: entry.category,
+    mime_type: entry.mimeType,
+    encoding: entry.encoding,
+    size_bytes: entry.sizeBytes,
+    is_executable: toDbBool(entry.isExecutable),
+    updated_at: now,
+  };
+  const update = {
+    content: entry.content,
+    category: entry.category,
+    mime_type: entry.mimeType,
+    encoding: entry.encoding,
+    size_bytes: entry.sizeBytes,
+    is_executable: toDbBool(entry.isExecutable),
+    updated_at: now,
+  };
+
+  if (isMysqlDriver()) {
+    await db
+      .insertInto("skill_files")
+      .values(values)
+      .onDuplicateKeyUpdate(update)
+      .execute();
+  } else {
+    await db
+      .insertInto("skill_files")
+      .values(values)
+      .onConflict((oc) =>
+        oc.columns(["skill_name", "file_path"]).doUpdateSet(update)
+      )
+      .execute();
+  }
 }
 
 export async function writeSkillFile(
@@ -166,10 +218,7 @@ export async function writeSkillFile(
     await fs.chmod(filePath, 0o755).catch(() => {});
   }
 
-  await queryDb(
-    `INSERT INTO skills (skill_name) VALUES ($1) ON CONFLICT (skill_name) DO NOTHING`,
-    [normalized]
-  );
+  await ensureSkillRowExists(normalized);
   await upsertSkillFileRow(normalized, enriched);
   await syncSkillMetadata(normalized);
 
@@ -185,10 +234,11 @@ export async function deleteSkillFile(
   const filePath = resolveSafeSkillFilePath(normalized, relPath);
 
   await fs.rm(filePath, { force: true }).catch(() => {});
-  await queryDb(
-    `DELETE FROM skill_files WHERE skill_name = $1 AND file_path = $2`,
-    [normalized, relPath]
-  );
+  await getDb()
+    .deleteFrom("skill_files")
+    .where("skill_name", "=", normalized)
+    .where("file_path", "=", relPath)
+    .execute();
   await syncSkillMetadata(normalized);
 }
 
@@ -199,25 +249,25 @@ export async function replaceSkillFiles(
   const normalized = normalizeSkillName(skillName);
   const enrichedFiles = files.map((f) => enrichSkillFileEntry(f));
   const nextPaths = new Set(enrichedFiles.map((f) => f.path));
+  const db = getDb();
 
-  await queryDb(
-    `INSERT INTO skills (skill_name) VALUES ($1) ON CONFLICT (skill_name) DO NOTHING`,
-    [normalized]
-  );
+  await ensureSkillRowExists(normalized);
 
   // Remove stale files from disk and DB
-  const existingDb = await queryDb<{ file_path: string }>(
-    `SELECT file_path FROM skill_files WHERE skill_name = $1`,
-    [normalized]
-  );
-  for (const row of existingDb.rows) {
+  const existingDb = await db
+    .selectFrom("skill_files")
+    .select("file_path")
+    .where("skill_name", "=", normalized)
+    .execute();
+  for (const row of existingDb) {
     if (!nextPaths.has(row.file_path)) {
       const target = resolveSafeSkillFilePath(normalized, row.file_path);
       await fs.rm(target, { force: true }).catch(() => {});
-      await queryDb(
-        `DELETE FROM skill_files WHERE skill_name = $1 AND file_path = $2`,
-        [normalized, row.file_path]
-      );
+      await db
+        .deleteFrom("skill_files")
+        .where("skill_name", "=", normalized)
+        .where("file_path", "=", row.file_path)
+        .execute();
     }
   }
 
@@ -236,25 +286,25 @@ export async function replaceSkillFiles(
 
 export async function listSkillFiles(skillName: string): Promise<SkillFileEntry[]> {
   const normalized = normalizeSkillName(skillName);
+  const db = getDb();
 
   // 1. Database is the primary source of truth
-  const dbFiles = await queryDb<{
-    file_path: string;
-    content: string;
-    category: string;
-    mime_type: string;
-    encoding: string;
-    size_bytes: number;
-    is_executable: boolean | number;
-  }>(
-    `SELECT file_path, content, category, mime_type, encoding, size_bytes, is_executable
-     FROM skill_files
-     WHERE skill_name = $1`,
-    [normalized]
-  );
+  const dbFiles = await db
+    .selectFrom("skill_files")
+    .select([
+      "file_path",
+      "content",
+      "category",
+      "mime_type",
+      "encoding",
+      "size_bytes",
+      "is_executable",
+    ])
+    .where("skill_name", "=", normalized)
+    .execute();
 
-  if (dbFiles.rows.length > 0) {
-    const results: SkillFileEntry[] = dbFiles.rows.map((row) => ({
+  if (dbFiles.length > 0) {
+    const results: SkillFileEntry[] = dbFiles.map((row) => ({
       path: row.file_path,
       content: row.content,
       category: (row.category as SkillFileCategory) || undefined,
@@ -272,12 +322,13 @@ export async function listSkillFiles(skillName: string): Promise<SkillFileEntry[
   }
 
   // 2. Fallback to skills.skill_md if skill_files has no rows yet
-  const skillRow = await queryDb<{ skill_md: string }>(
-    `SELECT skill_md FROM skills WHERE skill_name = $1`,
-    [normalized]
-  );
-  if (skillRow.rows[0]?.skill_md) {
-    return [enrichSkillFileEntry({ path: "SKILL.md", content: skillRow.rows[0].skill_md })];
+  const skillRow = await db
+    .selectFrom("skills")
+    .select("skill_md")
+    .where("skill_name", "=", normalized)
+    .executeTakeFirst();
+  if (skillRow?.skill_md) {
+    return [enrichSkillFileEntry({ path: "SKILL.md", content: skillRow.skill_md })];
   }
 
   // 3. Fallback to disk
@@ -360,31 +411,12 @@ export async function buildSkillZipBuffer(skillName: string): Promise<Buffer> {
   return Buffer.concat([...localParts, ...centralParts, eocd]);
 }
 
-type DbSkillRow = {
-  skill_name: string;
-  description: string;
-  creator: string;
-  is_builtin: boolean | number;
-  created_at: Date | string;
-  updated_at: Date | string;
-  current_step: number;
-  progress: number;
-  status: SkillLifecycleStatus;
-  selected_apps: string[] | string;
-  selected_repos: string[] | string;
-  selected_mcps: string[] | string | null;
-  pipeline_runs: RepoPipelineRun[] | string;
-  frontmatter: Record<string, unknown> | string | null;
-  has_scripts: boolean | number | null;
-  resource_summary: SkillResourceSummary | string | null;
-};
-
-function parseJsonArray<T>(val: T[] | string | null | undefined): T[] {
-  if (Array.isArray(val)) return val;
+function parseJsonArray<T>(val: unknown): T[] {
+  if (Array.isArray(val)) return val as T[];
   if (typeof val === "string") {
     try {
       const parsed = JSON.parse(val);
-      return Array.isArray(parsed) ? parsed : [];
+      return Array.isArray(parsed) ? (parsed as T[]) : [];
     } catch {
       return [];
     }
@@ -392,11 +424,8 @@ function parseJsonArray<T>(val: T[] | string | null | undefined): T[] {
   return [];
 }
 
-function parseJsonObject<T extends object>(
-  val: T | string | null | undefined,
-  fallback: T
-): T {
-  if (val && typeof val === "object" && !Array.isArray(val)) return val;
+function parseJsonObject<T extends object>(val: unknown, fallback: T): T {
+  if (val && typeof val === "object" && !Array.isArray(val)) return val as T;
   if (typeof val === "string") {
     try {
       const parsed = JSON.parse(val);
@@ -419,9 +448,11 @@ const DEFAULT_RESOURCE_SUMMARY: SkillResourceSummary = {
   other: 0,
 };
 
-function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
+type SelectedSkillRow = Omit<SkillRow, "skill_md">;
+
+function mapDbRowToCard(row: SelectedSkillRow): SkillCardRecord {
   const resourceSummary = parseJsonObject<SkillResourceSummary>(
-    row.resource_summary as SkillResourceSummary | string | null | undefined,
+    row.resource_summary,
     { ...DEFAULT_RESOURCE_SUMMARY }
   );
   return {
@@ -432,7 +463,7 @@ function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
     updatedAt: new Date(row.updated_at).toISOString(),
     currentStep: (row.current_step as 1 | 2 | 3) || 1,
     progress: row.progress ?? 33,
-    status: row.status ?? "draft",
+    status: (row.status as SkillLifecycleStatus) ?? "draft",
     selectedApps: parseJsonArray<string>(row.selected_apps),
     selectedRepos: parseJsonArray<string>(row.selected_repos),
     selectedMcps: parseJsonArray<string>(row.selected_mcps),
@@ -443,11 +474,24 @@ function mapDbRowToCard(row: DbSkillRow): SkillCardRecord {
   };
 }
 
-const SKILL_SELECT_COLUMNS = `
-  skill_name, description, creator, is_builtin, created_at, updated_at,
-  current_step, progress, status, selected_apps, selected_repos, selected_mcps,
-  pipeline_runs, frontmatter, has_scripts, resource_summary
-`;
+const SKILL_SELECT_COLUMNS = [
+  "skill_name",
+  "description",
+  "creator",
+  "is_builtin",
+  "created_at",
+  "updated_at",
+  "current_step",
+  "progress",
+  "status",
+  "selected_apps",
+  "selected_repos",
+  "selected_mcps",
+  "pipeline_runs",
+  "frontmatter",
+  "has_scripts",
+  "resource_summary",
+] as const;
 
 export async function deleteSkillCompletely(skillName: string): Promise<{
   skillName: string;
@@ -458,15 +502,12 @@ export async function deleteSkillCompletely(skillName: string): Promise<{
     throw new Error("Invalid skill name");
   }
 
+  const db = getDb();
   // 1. Delete from database tables
-  await queryDb(`DELETE FROM skill_files WHERE skill_name = $1`, [normalized]);
-  await queryDb(`DELETE FROM skills WHERE skill_name = $1`, [normalized]);
+  await db.deleteFrom("skill_files").where("skill_name", "=", normalized).execute();
+  await db.deleteFrom("skills").where("skill_name", "=", normalized).execute();
 
-  // 2. Remove from all disk locations:
-  //    - resource/builtin-skills/<name>, resource/skills/<name>, resource/<name>
-  //    - ~/.pi/agent/skills/<name>, ~/.pi/skills/<name>
-  //    - ~/.omp/agent/skills/<name>
-  //    - project .omp/skills/<name>, .pi/skills/<name>
+  // 2. Remove from all disk locations
   const cwd = process.cwd();
   const home = os.homedir();
   const candidateRoots = new Set<string>([
@@ -489,7 +530,6 @@ export async function deleteSkillCompletely(skillName: string): Promise<{
   for (const root of candidateRoots) {
     const absRoot = path.resolve(root);
     const targetDir = path.resolve(absRoot, normalized);
-    // Safety guard: targetDir must be a direct child of absRoot and not equal to absRoot
     if (
       targetDir === absRoot ||
       path.dirname(targetDir) !== absRoot ||
@@ -513,45 +553,46 @@ export async function deleteSkillCompletely(skillName: string): Promise<{
 }
 
 export async function listCatalogApps(): Promise<CatalogAppRow[]> {
-  const res = await queryDb<CatalogAppRow & Record<string, unknown>>(
-    `SELECT id, name, env FROM catalog_apps ORDER BY id ASC`
-  );
-  return res.rows;
+  return await getDb()
+    .selectFrom("catalog_apps")
+    .select(["id", "name", "env"])
+    .orderBy("id", "asc")
+    .execute();
 }
 
 export async function listCatalogRepos(): Promise<CatalogRepoRow[]> {
-  const res = await queryDb<CatalogRepoRow & Record<string, unknown>>(
-    `SELECT id, name, url, branch FROM catalog_repos ORDER BY id ASC`
-  );
-  return res.rows;
+  return await getDb()
+    .selectFrom("catalog_repos")
+    .select(["id", "name", "url", "branch"])
+    .orderBy("id", "asc")
+    .execute();
 }
 
 /**
  * List user-created skills (built-in skills with `is_builtin = true` are hidden from UI).
  */
 export async function listSkillCards(): Promise<SkillCardRecord[]> {
-  const res = await queryDb<DbSkillRow>(
-    `SELECT ${SKILL_SELECT_COLUMNS}
-     FROM skills
-     WHERE is_builtin = $1
-     ORDER BY updated_at DESC`,
-    [false]
-  );
-  return res.rows.map(mapDbRowToCard);
+  const rows = await getDb()
+    .selectFrom("skills")
+    .select(SKILL_SELECT_COLUMNS)
+    .where("is_builtin", "=", toDbBool(false))
+    .orderBy("updated_at", "desc")
+    .execute();
+  return rows.map(mapDbRowToCard);
 }
 
 export async function getSkillCard(
   skillName: string
 ): Promise<{ card: SkillCardRecord; content: string } | null> {
   const normalized = normalizeSkillName(skillName);
-  const res = await queryDb<DbSkillRow>(
-    `SELECT ${SKILL_SELECT_COLUMNS}
-     FROM skills WHERE skill_name = $1`,
-    [normalized]
-  );
-  if (res.rows.length === 0) return null;
+  const row = await getDb()
+    .selectFrom("skills")
+    .select(SKILL_SELECT_COLUMNS)
+    .where("skill_name", "=", normalized)
+    .executeTakeFirst();
+  if (!row) return null;
 
-  const card = mapDbRowToCard(res.rows[0]);
+  const card = mapDbRowToCard(row);
   const content = await readSkillMarkdown(normalized).catch(() => "");
   return { card, content };
 }
@@ -561,26 +602,23 @@ export async function upsertSkillCard(
   patch: Partial<SkillCardRecord> & { isBuiltin?: boolean }
 ): Promise<SkillCardRecord> {
   const normalized = normalizeSkillName(skillName);
+  const db = getDb();
 
-  const existingRes = await queryDb<DbSkillRow>(
-    `SELECT ${SKILL_SELECT_COLUMNS}
-     FROM skills WHERE skill_name = $1`,
-    [normalized]
-  );
-  const existing = existingRes.rows[0]
-    ? mapDbRowToCard(existingRes.rows[0])
-    : undefined;
-  const existingBuiltin = existingRes.rows[0]
-    ? Boolean(existingRes.rows[0].is_builtin)
-    : false;
-  const now = new Date().toISOString();
+  const existingRow = await db
+    .selectFrom("skills")
+    .select(SKILL_SELECT_COLUMNS)
+    .where("skill_name", "=", normalized)
+    .executeTakeFirst();
+  const existing = existingRow ? mapDbRowToCard(existingRow) : undefined;
+  const existingBuiltin = existingRow ? Boolean(existingRow.is_builtin) : false;
+  const nowIso = new Date().toISOString();
 
   const next: SkillCardRecord = {
     skillName: normalized,
     description: patch.description ?? existing?.description ?? "自定义 AI Skill",
     creator: patch.creator ?? existing?.creator ?? "Admin",
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
+    createdAt: existing?.createdAt ?? nowIso,
+    updatedAt: nowIso,
     currentStep: patch.currentStep ?? existing?.currentStep ?? 1,
     progress: patch.progress ?? existing?.progress ?? 33,
     status: patch.status ?? existing?.status ?? "draft",
@@ -594,48 +632,57 @@ export async function upsertSkillCard(
       patch.resourceSummary ?? existing?.resourceSummary ?? { ...DEFAULT_RESOURCE_SUMMARY },
   };
 
-  await queryDb(
-    `INSERT INTO skills (
-       skill_name, description, creator, is_builtin, created_at, updated_at,
-       current_step, progress, status, selected_apps, selected_repos, selected_mcps,
-       pipeline_runs, frontmatter, has_scripts, resource_summary
-     )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16::jsonb)
-     ON CONFLICT (skill_name)
-     DO UPDATE SET
-       description = EXCLUDED.description,
-       creator = EXCLUDED.creator,
-       is_builtin = EXCLUDED.is_builtin,
-       updated_at = EXCLUDED.updated_at,
-       current_step = EXCLUDED.current_step,
-       progress = EXCLUDED.progress,
-       status = EXCLUDED.status,
-       selected_apps = EXCLUDED.selected_apps,
-       selected_repos = EXCLUDED.selected_repos,
-       selected_mcps = EXCLUDED.selected_mcps,
-       pipeline_runs = EXCLUDED.pipeline_runs,
-       frontmatter = EXCLUDED.frontmatter,
-       has_scripts = EXCLUDED.has_scripts,
-       resource_summary = EXCLUDED.resource_summary`,
-    [
-      next.skillName,
-      next.description,
-      next.creator,
-      patch.isBuiltin ?? existingBuiltin,
-      next.createdAt,
-      next.updatedAt,
-      next.currentStep,
-      next.progress,
-      next.status,
-      JSON.stringify(next.selectedApps),
-      JSON.stringify(next.selectedRepos),
-      JSON.stringify(next.selectedMcps ?? []),
-      JSON.stringify(next.pipelineRuns),
-      JSON.stringify(next.frontmatter ?? {}),
-      next.hasScripts ?? false,
-      JSON.stringify(next.resourceSummary ?? DEFAULT_RESOURCE_SUMMARY),
-    ]
-  );
+  const isBuiltinVal = toDbBool(patch.isBuiltin ?? existingBuiltin);
+  const values = {
+    skill_name: next.skillName,
+    description: next.description,
+    creator: next.creator,
+    is_builtin: isBuiltinVal,
+    created_at: toDbTimestamp(next.createdAt),
+    updated_at: toDbTimestamp(next.updatedAt),
+    current_step: next.currentStep,
+    progress: next.progress,
+    status: next.status,
+    selected_apps: JSON.stringify(next.selectedApps),
+    selected_repos: JSON.stringify(next.selectedRepos),
+    selected_mcps: JSON.stringify(next.selectedMcps ?? []),
+    pipeline_runs: JSON.stringify(next.pipelineRuns),
+    frontmatter: JSON.stringify(next.frontmatter ?? {}),
+    has_scripts: toDbBool(next.hasScripts ?? false),
+    resource_summary: JSON.stringify(next.resourceSummary ?? DEFAULT_RESOURCE_SUMMARY),
+    skill_md: "",
+  };
+
+  const update = {
+    description: values.description,
+    creator: values.creator,
+    is_builtin: values.is_builtin,
+    updated_at: values.updated_at,
+    current_step: values.current_step,
+    progress: values.progress,
+    status: values.status,
+    selected_apps: values.selected_apps,
+    selected_repos: values.selected_repos,
+    selected_mcps: values.selected_mcps,
+    pipeline_runs: values.pipeline_runs,
+    frontmatter: values.frontmatter,
+    has_scripts: values.has_scripts,
+    resource_summary: values.resource_summary,
+  };
+
+  if (isMysqlDriver()) {
+    await db
+      .insertInto("skills")
+      .values(values)
+      .onDuplicateKeyUpdate(update)
+      .execute();
+  } else {
+    await db
+      .insertInto("skills")
+      .values(values)
+      .onConflict((oc) => oc.column("skill_name").doUpdateSet(update))
+      .execute();
+  }
 
   return next;
 }

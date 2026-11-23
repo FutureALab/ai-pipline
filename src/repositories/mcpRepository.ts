@@ -1,18 +1,7 @@
 import crypto from "node:crypto";
-import { queryDb } from "../db/database.js";
+import { getDb, isMysqlDriver, toDbTimestamp } from "../db/database.js";
+import type { McpServerRow } from "../db/schema.js";
 import type { UserMcpServer } from "../types/skill.js";
-
-type DbMcpRow = {
-  id: string;
-  owner: string;
-  name: string;
-  transport: string;
-  url: string;
-  headers: Record<string, string> | string | null;
-  description: string;
-  created_at: Date | string;
-  updated_at: Date | string;
-};
 
 function normalizeOwner(owner: string | undefined): string {
   const cleaned = (owner ?? "").trim();
@@ -22,12 +11,10 @@ function normalizeOwner(owner: string | undefined): string {
   return cleaned;
 }
 
-function parseHeaders(
-  raw: Record<string, string> | string | null | undefined
-): Record<string, string> {
+function parseHeaders(raw: unknown): Record<string, string> {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(raw)) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
       if (typeof v === "string") out[k] = v;
     }
     return out;
@@ -49,7 +36,7 @@ function parseHeaders(
   return {};
 }
 
-function mapDbRowToMcp(row: DbMcpRow): UserMcpServer {
+function mapDbRowToMcp(row: McpServerRow): UserMcpServer {
   return {
     id: row.id,
     owner: row.owner,
@@ -67,14 +54,23 @@ export async function listMcpServersByOwner(
   owner: string
 ): Promise<UserMcpServer[]> {
   const normalizedOwner = normalizeOwner(owner);
-  const res = await queryDb<DbMcpRow>(
-    `SELECT id, owner, name, transport, url, headers, description, created_at, updated_at
-     FROM mcp_servers
-     WHERE owner = $1
-     ORDER BY updated_at DESC`,
-    [normalizedOwner]
-  );
-  return res.rows.map(mapDbRowToMcp);
+  const rows = await getDb()
+    .selectFrom("mcp_servers")
+    .select([
+      "id",
+      "owner",
+      "name",
+      "transport",
+      "url",
+      "headers",
+      "description",
+      "created_at",
+      "updated_at",
+    ])
+    .where("owner", "=", normalizedOwner)
+    .orderBy("updated_at", "desc")
+    .execute();
+  return rows.map(mapDbRowToMcp);
 }
 
 export async function getMcpServersByIdsForOwner(
@@ -118,29 +114,58 @@ export async function createOrUpdateMcpServer(input: {
 
   const headers = parseHeaders(input.headers);
   const id = crypto.randomUUID();
-  const now = new Date().toISOString();
+  const now = toDbTimestamp(new Date().toISOString());
+  const db = getDb();
 
-  await queryDb(
-    `INSERT INTO mcp_servers (
-       id, owner, name, transport, url, headers, description, created_at, updated_at
-     )
-     VALUES ($1, $2, $3, 'streamable-http', $4, $5::jsonb, $6, $7, $8)
-     ON CONFLICT (owner, name)
-     DO UPDATE SET
-       url = EXCLUDED.url,
-       headers = EXCLUDED.headers,
-       description = EXCLUDED.description,
-       updated_at = EXCLUDED.updated_at`,
-    [id, owner, name, url, JSON.stringify(headers), description, now, now]
-  );
+  const values = {
+    id,
+    owner,
+    name,
+    transport: "streamable-http",
+    url,
+    headers: JSON.stringify(headers),
+    description,
+    created_at: now,
+    updated_at: now,
+  };
+  const update = {
+    url,
+    headers: JSON.stringify(headers),
+    description,
+    updated_at: now,
+  };
 
-  const res = await queryDb<DbMcpRow>(
-    `SELECT id, owner, name, transport, url, headers, description, created_at, updated_at
-     FROM mcp_servers
-     WHERE owner = $1 AND name = $2`,
-    [owner, name]
-  );
-  return mapDbRowToMcp(res.rows[0]);
+  if (isMysqlDriver()) {
+    await db
+      .insertInto("mcp_servers")
+      .values(values)
+      .onDuplicateKeyUpdate(update)
+      .execute();
+  } else {
+    await db
+      .insertInto("mcp_servers")
+      .values(values)
+      .onConflict((oc) => oc.columns(["owner", "name"]).doUpdateSet(update))
+      .execute();
+  }
+
+  const row = await db
+    .selectFrom("mcp_servers")
+    .select([
+      "id",
+      "owner",
+      "name",
+      "transport",
+      "url",
+      "headers",
+      "description",
+      "created_at",
+      "updated_at",
+    ])
+    .where("owner", "=", owner)
+    .where("name", "=", name)
+    .executeTakeFirstOrThrow();
+  return mapDbRowToMcp(row);
 }
 
 export async function deleteMcpServerForOwner(
@@ -148,15 +173,19 @@ export async function deleteMcpServerForOwner(
   owner: string
 ): Promise<boolean> {
   const normalizedOwner = normalizeOwner(owner);
-  const existing = await queryDb<{ id: string }>(
-    `SELECT id FROM mcp_servers WHERE id = $1 AND owner = $2`,
-    [id, normalizedOwner]
-  );
-  if (existing.rows.length === 0) return false;
+  const db = getDb();
+  const existing = await db
+    .selectFrom("mcp_servers")
+    .select("id")
+    .where("id", "=", id)
+    .where("owner", "=", normalizedOwner)
+    .executeTakeFirst();
+  if (!existing) return false;
 
-  await queryDb(`DELETE FROM mcp_servers WHERE id = $1 AND owner = $2`, [
-    id,
-    normalizedOwner,
-  ]);
+  await db
+    .deleteFrom("mcp_servers")
+    .where("id", "=", id)
+    .where("owner", "=", normalizedOwner)
+    .execute();
   return true;
 }

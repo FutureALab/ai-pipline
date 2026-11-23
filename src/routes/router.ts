@@ -54,7 +54,7 @@ import {
   submitWorkbenchQuestionAnswerHandler,
 } from "../controllers/workbenchController.js";
 import { getDbDriver, isDbConnected } from "../db/database.js";
-import { isRedisConnected } from "../db/redis.js";
+import { getRedisMode, isRedisConnected } from "../db/redis.js";
 import { sendCorsPreflight, sendJson } from "./httpUtils.js";
 
 export async function routeRequest(
@@ -76,6 +76,7 @@ export async function routeRequest(
         dbConnected: isDbConnected(),
         dbDriver: getDbDriver(),
         redisConnected: isRedisConnected(),
+        redisMode: getRedisMode(),
       });
     }
 

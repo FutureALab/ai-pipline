@@ -12,7 +12,7 @@ import {
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
-import { isDbConnected, queryDb } from "../db/database.js";
+import { getDb, isDbConnected } from "../db/database.js";
 
 export type AgentTelemetryConfig = NonNullable<
   CreateAgentSessionOptions["telemetry"]
@@ -92,26 +92,23 @@ class LocalTraceSpanProcessor implements SpanProcessor {
     }
 
     if (isDbConnected()) {
-      void queryDb(
-        `INSERT INTO ai_trace_spans (
-           trace_id, span_id, parent_span_id, name, kind,
-           start_time_ms, end_time_ms, duration_ms, status, attributes, events
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb)`,
-        [
-          record.traceId,
-          record.spanId,
-          record.parentSpanId ?? null,
-          record.name,
-          record.kind,
-          record.startTimeMs,
-          record.endTimeMs,
-          record.durationMs,
-          JSON.stringify(record.status),
-          JSON.stringify(record.attributes),
-          JSON.stringify(record.events),
-        ]
-      ).catch(() => {});
+      void getDb()
+        .insertInto("ai_trace_spans")
+        .values({
+          trace_id: record.traceId,
+          span_id: record.spanId,
+          parent_span_id: record.parentSpanId ?? null,
+          name: record.name,
+          kind: record.kind,
+          start_time_ms: record.startTimeMs,
+          end_time_ms: record.endTimeMs,
+          duration_ms: record.durationMs,
+          status: JSON.stringify(record.status),
+          attributes: JSON.stringify(record.attributes),
+          events: JSON.stringify(record.events),
+        })
+        .execute()
+        .catch(() => {});
     }
   }
 
@@ -194,12 +191,12 @@ type DbSpanRow = {
   start_time_ms: number;
   end_time_ms: number;
   duration_ms: number;
-  status: RecordedSpan["status"] | string;
-  attributes: Record<string, unknown> | string;
-  events: RecordedSpan["events"] | string;
+  status: unknown;
+  attributes: unknown;
+  events: unknown;
 };
 
-function parseJsonValue<T>(val: T | string | null | undefined, fallback: T): T {
+function parseJsonValue<T>(val: unknown, fallback: T): T {
   if (val === null || val === undefined) return fallback;
   if (typeof val === "string") {
     try {
@@ -208,7 +205,7 @@ function parseJsonValue<T>(val: T | string | null | undefined, fallback: T): T {
       return fallback;
     }
   }
-  return val;
+  return val as T;
 }
 
 function mapDbSpanRow(row: DbSpanRow): RecordedSpan {
@@ -234,15 +231,25 @@ export async function getRecentSpans(
   limit: number = 100
 ): Promise<RecordedSpan[]> {
   if (isDbConnected()) {
-    const res = await queryDb<DbSpanRow>(
-      `SELECT trace_id, span_id, parent_span_id, name, kind,
-              start_time_ms, end_time_ms, duration_ms, status, attributes, events
-       FROM ai_trace_spans
-       ORDER BY id DESC
-       LIMIT $1`,
-      [limit]
-    );
-    return res.rows.map(mapDbSpanRow);
+    const rows = await getDb()
+      .selectFrom("ai_trace_spans")
+      .select([
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "name",
+        "kind",
+        "start_time_ms",
+        "end_time_ms",
+        "duration_ms",
+        "status",
+        "attributes",
+        "events",
+      ])
+      .orderBy("id", "desc")
+      .limit(limit)
+      .execute();
+    return rows.map(mapDbSpanRow);
   }
 
   if (recentSpans.length > 0) {
@@ -270,15 +277,25 @@ export async function getSpansByTraceId(
   traceId: string
 ): Promise<RecordedSpan[]> {
   if (isDbConnected()) {
-    const res = await queryDb<DbSpanRow>(
-      `SELECT trace_id, span_id, parent_span_id, name, kind,
-              start_time_ms, end_time_ms, duration_ms, status, attributes, events
-       FROM ai_trace_spans
-       WHERE trace_id = $1
-       ORDER BY start_time_ms ASC`,
-      [traceId]
-    );
-    return res.rows.map(mapDbSpanRow);
+    const rows = await getDb()
+      .selectFrom("ai_trace_spans")
+      .select([
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "name",
+        "kind",
+        "start_time_ms",
+        "end_time_ms",
+        "duration_ms",
+        "status",
+        "attributes",
+        "events",
+      ])
+      .where("trace_id", "=", traceId)
+      .orderBy("start_time_ms", "asc")
+      .execute();
+    return rows.map(mapDbSpanRow);
   }
 
   return (await getRecentSpans(MAX_IN_MEMORY_SPANS))

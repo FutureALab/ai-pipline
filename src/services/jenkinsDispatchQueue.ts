@@ -1,17 +1,18 @@
-import type Redis from "ioredis";
 import { createLogger } from "../config/logger.js";
+import { BlockingQueue } from "../db/blockingQueue.js";
 import {
   createBlockingRedisClient,
   getRedisClient,
   isRedisConnected,
+  type RedisClient,
 } from "../db/redis.js";
 
 const queueLog = createLogger("jenkins-queue");
 
-const REDIS_QUEUE_KEY = "ai_pipeline:jenkins:dispatch_queue";
-const REDIS_SEMAPHORE_KEY = "ai_pipeline:jenkins:semaphore";
-const REDIS_ACTIVE_PERMITS_KEY = "ai_pipeline:jenkins:active_permits";
-const REDIS_ABORTED_SET_KEY = "ai_pipeline:jenkins:aborted_tasks";
+// Hash-tagged keys ensure all semaphore/abort keys map to the same Redis Cluster slot
+const REDIS_SEMAPHORE_KEY = "{ai_pipeline:jenkins}:semaphore";
+const REDIS_ACTIVE_PERMITS_KEY = "{ai_pipeline:jenkins}:active_permits";
+const REDIS_ABORTED_SET_KEY = "{ai_pipeline:jenkins}:aborted_tasks";
 
 export interface JenkinsQueuedTask {
   taskId: string;
@@ -41,28 +42,28 @@ export function buildJenkinsTaskKey(skillName: string, repoId: string): string {
   return `${skillName}::${repoId}`;
 }
 
-// In-memory fallback state (used when Redis is disabled or unavailable)
-const memQueue: JenkinsQueuedTask[] = [];
+// Track pending/aborted tasks and in-memory semaphore fallback
 const memPendingKeys = new Set<string>();
 const memActivePermits = new Map<string, string>();
 const memAbortedKeys = new Set<string>();
 let memAvailablePermits = getJenkinsConcurrencyLimit();
-let memWaiters: Array<() => void> = [];
+let memPermitWaiters: Array<() => void> = [];
 
+let dispatchQueue: BlockingQueue<JenkinsQueuedTask> | null = null;
 let taskExecutor: JenkinsTaskExecutor | null = null;
 let workerRunning = false;
-let blockingClient: Redis | null = null;
+let semaphoreBlockingClient: RedisClient | null = null;
 let redisSemaphoreInitialized = false;
 
-function notifyMemWorker(): void {
-  const waiters = memWaiters;
-  memWaiters = [];
+function notifyMemPermitWaiters(): void {
+  const waiters = memPermitWaiters;
+  memPermitWaiters = [];
   for (const resolve of waiters) {
     resolve();
   }
 }
 
-function waitForMemSignal(timeoutMs = 1500): Promise<void> {
+function waitForMemPermit(timeoutMs = 1500): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
     const done = () => {
@@ -73,8 +74,23 @@ function waitForMemSignal(timeoutMs = 1500): Promise<void> {
     };
     const timer = setTimeout(done, timeoutMs);
     timer.unref?.();
-    memWaiters.push(done);
+    memPermitWaiters.push(done);
   });
+}
+
+function getOrCreateDispatchQueue(): BlockingQueue<JenkinsQueuedTask> {
+  if (!dispatchQueue) {
+    dispatchQueue = new BlockingQueue<JenkinsQueuedTask>({
+      name: "jenkins-dispatch",
+      concurrency: getJenkinsConcurrencyLimit(),
+      defaultJobOptions: {
+        attempts: 1,
+        removeOnComplete: 200,
+        removeOnFail: 200,
+      },
+    });
+  }
+  return dispatchQueue;
 }
 
 async function initRedisSemaphorePool(): Promise<void> {
@@ -82,7 +98,7 @@ async function initRedisSemaphorePool(): Promise<void> {
   const redis = getRedisClient();
   const limit = getJenkinsConcurrencyLimit();
 
-  // Reset permit pool & stale active permits on server boot to match current JENKINS_CONCURRENCY_SEMAPHORE
+  // All 3 keys share hash tag `{ai_pipeline:jenkins}`, safe for Redis Cluster pipeline
   const pipeline = redis.pipeline();
   pipeline.del(REDIS_SEMAPHORE_KEY);
   pipeline.del(REDIS_ACTIVE_PERMITS_KEY);
@@ -94,9 +110,34 @@ async function initRedisSemaphorePool(): Promise<void> {
   await pipeline.exec();
   redisSemaphoreInitialized = true;
   queueLog.info(
-    { limit, queueKey: REDIS_QUEUE_KEY, semaphoreKey: REDIS_SEMAPHORE_KEY },
-    "Initialized Redis blocking queue & semaphore pool for Jenkins dispatch"
+    { limit, semaphoreKey: REDIS_SEMAPHORE_KEY },
+    "Initialized Redis Cluster semaphore pool for BullMQ Jenkins dispatch"
   );
+}
+
+async function acquireSemaphorePermit(): Promise<string | null> {
+  if (isRedisConnected()) {
+    await initRedisSemaphorePool();
+    if (!semaphoreBlockingClient) {
+      semaphoreBlockingClient = createBlockingRedisClient();
+    }
+    if (semaphoreBlockingClient) {
+      while (workerRunning) {
+        const res = await semaphoreBlockingClient.blpop(REDIS_SEMAPHORE_KEY, 2);
+        if (res) return res[1];
+      }
+      return null;
+    }
+  }
+
+  while (workerRunning) {
+    if (memAvailablePermits > 0) {
+      memAvailablePermits -= 1;
+      return `mem-permit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    }
+    await waitForMemPermit(1000);
+  }
+  return null;
 }
 
 export function isTaskPendingInQueue(
@@ -126,27 +167,25 @@ export async function enqueueJenkinsDispatchTasks(
   if (isRedisConnected()) {
     await initRedisSemaphorePool();
     const redis = getRedisClient();
-    const pipeline = redis.pipeline();
-    for (const task of tasks) {
-      const key = buildJenkinsTaskKey(task.skillName, task.repoId);
-      pipeline.srem(REDIS_ABORTED_SET_KEY, key);
-      pipeline.rpush(REDIS_QUEUE_KEY, JSON.stringify(task));
-    }
-    await pipeline.exec();
-    queueLog.info(
-      { count: tasks.length, concurrencyLimit },
-      "Enqueued Jenkins tasks into Redis blocking queue"
-    );
-    return { mode: "redis", concurrencyLimit };
+    const keys = tasks.map((t) => buildJenkinsTaskKey(t.skillName, t.repoId));
+    await redis.srem(REDIS_ABORTED_SET_KEY, ...keys).catch(() => {});
   }
 
-  memQueue.push(...tasks);
-  notifyMemWorker();
-  queueLog.info(
-    { count: tasks.length, concurrencyLimit },
-    "Enqueued Jenkins tasks into in-memory blocking queue (Redis unavailable)"
+  const queue = getOrCreateDispatchQueue();
+  const mode = await queue.enqueueBulk(
+    tasks.map((task) => ({
+      name: "dispatch-jenkins",
+      data: task,
+      opts: { jobId: task.taskId },
+    }))
   );
-  return { mode: "memory", concurrencyLimit };
+
+  const normalizedMode = mode === "bullmq" ? "redis" : "memory";
+  queueLog.info(
+    { count: tasks.length, concurrencyLimit, mode: normalizedMode },
+    `Enqueued Jenkins tasks into ${mode === "bullmq" ? "BullMQ (Redis)" : "in-memory"} blocking queue`
+  );
+  return { mode: normalizedMode, concurrencyLimit };
 }
 
 export async function markJenkinsTasksAborted(
@@ -164,7 +203,6 @@ export async function markJenkinsTasksAborted(
     await redis.sadd(REDIS_ABORTED_SET_KEY, ...keys).catch(() => {});
   }
 
-  // Also release any semaphore permit held by these aborted tasks
   for (const repoId of repoIds) {
     await releaseJenkinsSemaphorePermit(skillName, repoId);
   }
@@ -200,133 +238,61 @@ export async function releaseJenkinsSemaphorePermit(
     memActivePermits.delete(key);
     const limit = getJenkinsConcurrencyLimit();
     memAvailablePermits = Math.min(limit, memAvailablePermits + 1);
-    notifyMemWorker();
+    notifyMemPermitWaiters();
   }
 }
 
-async function runRedisWorkerLoop(): Promise<void> {
-  await initRedisSemaphorePool();
-  blockingClient = createBlockingRedisClient();
-  if (!blockingClient) {
-    queueLog.warn(
-      "Could not create blocking Redis client; falling back to in-memory queue loop"
-    );
-    await runMemoryWorkerLoop();
+async function processQueuedJenkinsTask(task: JenkinsQueuedTask): Promise<void> {
+  const key = buildJenkinsTaskKey(task.skillName, task.repoId);
+  memPendingKeys.delete(key);
+
+  // Skip immediately if aborted while waiting in queue
+  if (isRedisConnected()) {
+    const redis = getRedisClient();
+    const isAborted =
+      memAbortedKeys.has(key) ||
+      (await redis.sismember(REDIS_ABORTED_SET_KEY, key)) === 1;
+    if (isAborted) {
+      memAbortedKeys.delete(key);
+      await redis.srem(REDIS_ABORTED_SET_KEY, key).catch(() => {});
+      queueLog.info({ key }, "Skipped aborted queued Jenkins task");
+      return;
+    }
+  } else if (memAbortedKeys.has(key)) {
+    memAbortedKeys.delete(key);
+    queueLog.info({ key }, "Skipped aborted queued Jenkins task");
     return;
   }
 
-  const redis = getRedisClient();
-  queueLog.info(
-    { concurrencyLimit: getJenkinsConcurrencyLimit() },
-    "Jenkins Redis BLPOP dispatch worker started"
-  );
+  // Acquire semaphore permit (blocks until a Jenkins build slot is free)
+  const permit = await acquireSemaphorePermit();
+  if (!permit) return;
 
-  while (workerRunning) {
-    try {
-      // 1. Block until a semaphore permit is available (enforces JENKINS_CONCURRENCY_SEMAPHORE)
-      const permitRes = await blockingClient.blpop(REDIS_SEMAPHORE_KEY, 2);
-      if (!permitRes) {
-        continue;
-      }
-      const permit = permitRes[1];
-
-      // 2. Block until a task arrives in the FIFO queue
-      const taskRes = await blockingClient.blpop(REDIS_QUEUE_KEY, 2);
-      if (!taskRes) {
-        // Queue is idle; return the permit immediately
-        await redis.rpush(REDIS_SEMAPHORE_KEY, permit);
-        continue;
-      }
-
-      let task: JenkinsQueuedTask;
-      try {
-        task = JSON.parse(taskRes[1]) as JenkinsQueuedTask;
-      } catch {
-        await redis.rpush(REDIS_SEMAPHORE_KEY, permit);
-        continue;
-      }
-
-      const key = buildJenkinsTaskKey(task.skillName, task.repoId);
-      memPendingKeys.delete(key);
-
-      // 3. Skip if the user aborted this task while it was waiting in the queue
-      const isAborted =
-        memAbortedKeys.has(key) ||
-        (await redis.sismember(REDIS_ABORTED_SET_KEY, key)) === 1;
-      if (isAborted) {
-        memAbortedKeys.delete(key);
-        await redis.srem(REDIS_ABORTED_SET_KEY, key).catch(() => {});
-        await redis.rpush(REDIS_SEMAPHORE_KEY, permit);
-        queueLog.info({ key }, "Skipped aborted queued Jenkins task");
-        continue;
-      }
-
-      // 4. Bind permit to this active task (released when Jenkins build completes/fails/aborts)
-      const prevPermit = await redis.hget(REDIS_ACTIVE_PERMITS_KEY, key);
-      await redis.hset(REDIS_ACTIVE_PERMITS_KEY, key, permit);
-      if (prevPermit && prevPermit !== permit) {
-        await redis.rpush(REDIS_SEMAPHORE_KEY, prevPermit);
-      }
-
-      // 5. Dispatch asynchronously so the worker can immediately fill remaining permits up to N
-      const executor = taskExecutor;
-      if (executor) {
-        void executor(task).catch(async (err) => {
-          queueLog.error(
-            { err, key },
-            "Jenkins queued task executor failed; releasing permit"
-          );
-          await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
-        });
-      } else {
-        await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
-      }
-    } catch (err) {
-      if (!workerRunning) break;
-      queueLog.warn({ err }, "Jenkins Redis BLPOP worker transient error");
-      await new Promise((r) => setTimeout(r, 1000));
+  if (isRedisConnected()) {
+    const redis = getRedisClient();
+    const prevPermit = await redis.hget(REDIS_ACTIVE_PERMITS_KEY, key);
+    await redis.hset(REDIS_ACTIVE_PERMITS_KEY, key, permit);
+    if (prevPermit && prevPermit !== permit) {
+      await redis.rpush(REDIS_SEMAPHORE_KEY, prevPermit);
     }
+  } else {
+    memActivePermits.set(key, permit);
   }
-}
 
-async function runMemoryWorkerLoop(): Promise<void> {
-  memAvailablePermits = getJenkinsConcurrencyLimit();
-  queueLog.info(
-    { concurrencyLimit: memAvailablePermits },
-    "Jenkins in-memory blocking dispatch worker started"
-  );
+  const executor = taskExecutor;
+  if (!executor) {
+    await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
+    return;
+  }
 
-  while (workerRunning) {
-    if (memQueue.length === 0 || memAvailablePermits <= 0) {
-      await waitForMemSignal(1000);
-      continue;
-    }
-
-    const task = memQueue.shift();
-    if (!task) continue;
-    const key = buildJenkinsTaskKey(task.skillName, task.repoId);
-    memPendingKeys.delete(key);
-
-    if (memAbortedKeys.has(key)) {
-      memAbortedKeys.delete(key);
-      continue;
-    }
-
-    memAvailablePermits -= 1;
-    memActivePermits.set(key, `mem-permit-${Date.now()}`);
-
-    const executor = taskExecutor;
-    if (executor) {
-      void executor(task).catch(async (err) => {
-        queueLog.error(
-          { err, key },
-          "Jenkins memory-queued task executor failed; releasing permit"
-        );
-        await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
-      });
-    } else {
-      await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
-    }
+  try {
+    await executor(task);
+  } catch (err) {
+    queueLog.error(
+      { err, key },
+      "Jenkins queued task executor failed; releasing permit"
+    );
+    await releaseJenkinsSemaphorePermit(task.skillName, task.repoId);
   }
 }
 
@@ -336,19 +302,27 @@ export async function startJenkinsDispatchWorker(
   taskExecutor = executor;
   if (workerRunning) return;
   workerRunning = true;
+  memAvailablePermits = getJenkinsConcurrencyLimit();
 
   if (isRedisConnected()) {
-    void runRedisWorkerLoop();
-  } else {
-    void runMemoryWorkerLoop();
+    await initRedisSemaphorePool();
   }
+
+  const queue = getOrCreateDispatchQueue();
+  queue.startWorker(processQueuedJenkinsTask);
 }
 
 export async function stopJenkinsDispatchWorker(): Promise<void> {
   workerRunning = false;
-  notifyMemWorker();
-  if (blockingClient) {
-    await blockingClient.quit().catch(() => blockingClient?.disconnect());
-    blockingClient = null;
+  notifyMemPermitWaiters();
+  if (dispatchQueue) {
+    await dispatchQueue.close();
+    dispatchQueue = null;
+  }
+  if (semaphoreBlockingClient) {
+    await semaphoreBlockingClient
+      .quit()
+      .catch(() => semaphoreBlockingClient?.disconnect());
+    semaphoreBlockingClient = null;
   }
 }

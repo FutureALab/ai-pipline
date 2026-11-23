@@ -8,7 +8,8 @@
 - **运行时与包管理**：Bun (`bun >= 1.3`) + Node.js ESM (`"type": "module"`, TypeScript `ES2022` / `bundler`)
 - **AI Agent SDK**：`@oh-my-pi/pi-coding-agent`（固定版本 `18.22.1`，以匹配 macOS ARM64 原生模块 `@oh-my-pi/pi-natives-darwin-arm64@18.22.1`）
 - **后端 HTTP**：Node 原生 `node:http` 无框架分层架构（`routes` -> `controllers` -> `services` -> `repositories` -> `db`）
-- **数据库**：PostgreSQL（使用 `pg` 连接池，启动时通过 `src/db/postgres.ts` 自动建表与初始化种子数据）
+- **数据库与 SQL 工具**：基于 `kysely` SQL-first 查询构建器，支持 PostgreSQL (`pg`)、MySQL (`mysql2`)、GaussDB/openGauss (`gaussdb-nodejs`) 与 SQLite (`bun:sqlite`) 多方言自动建表与切换（`src/db/database.ts` + `src/db/schema.ts`）
+- **缓存与阻塞队列**：Redis 集群（`ioredis` `Cluster` / 单机兼容）+ `bullmq` 分布式阻塞队列（`src/db/redis.ts` + `src/db/blockingQueue.ts` + `src/services/jenkinsDispatchQueue.ts`）
 - **遥测与可观测性**：OpenTelemetry (`@opentelemetry/sdk-trace-node`, `@opentelemetry/exporter-trace-otlp-proto`)，接入 `createAgentSession({ telemetry })`
 - **前端**：Vue 3 (`<script setup lang="ts">`) + Vite + Element Plus + `@element-plus/icons-vue` + `marked` + `highlight.js`
 
