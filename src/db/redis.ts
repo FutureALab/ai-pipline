@@ -12,45 +12,78 @@ import { createLogger } from "../config/logger.js";
 
 const log = createLogger("redis");
 
+export const DEFAULT_REDIS_NAME = "primary";
+
 export type RedisClient = Redis | Cluster;
 export type RedisMode = "sentinel" | "cluster" | "standalone" | "disabled";
 
-let redisClient: RedisClient | null = null;
-let redisReady = false;
-let activeMode: RedisMode = "disabled";
-
-export function isRedisConnected(): boolean {
-  return redisReady && redisClient !== null;
-}
-
-export function getRedisMode(): RedisMode {
-  return activeMode;
-}
-
-export function getRedisClient(): RedisClient {
-  if (!redisClient) {
-    throw new Error("Redis client is not initialized");
-  }
-  return redisClient;
-}
-
-/**
- * Hash-tag key prefix compatible with Redis Sentinel, Cluster, and Standalone.
- * Defaults to `{ai_pipeline}` so BullMQ and multi-key ops stay slot-safe.
- */
-export function getRedisKeyPrefix(): string {
-  const raw = process.env.REDIS_KEY_PREFIX?.trim();
-  if (!raw) return "{ai_pipeline}";
-  return raw.includes("{") && raw.includes("}") ? raw : `{${raw}}`;
-}
-
-interface HostPort {
+export interface HostPort {
   host: string;
   port: number;
 }
 
-function parseHostPortList(raw: string | undefined, defaultPort: number): HostPort[] {
-  if (!raw?.trim()) return [];
+export interface RedisInstanceConfig {
+  /** Unique logical name (e.g. "primary", "sso", "dept-order-cache"). */
+  name: string;
+  mode?: "sentinel" | "cluster" | "standalone";
+  // Sentinel options
+  sentinels?: HostPort[] | string;
+  masterName?: string;
+  sentinelPassword?: string;
+  role?: "master" | "slave";
+  sentinelNatMap?: ClusterOptions["natMap"];
+  // Cluster options
+  clusterNodes?: HostPort[] | string;
+  natMap?: ClusterOptions["natMap"];
+  // Standalone options
+  url?: string;
+  host?: string;
+  port?: number;
+  // Common options (all secrets support Jasypt ENC(...))
+  username?: string;
+  password?: string;
+  db?: number;
+  keyPrefix?: string;
+  allowFallback?: boolean;
+}
+
+export interface RedisInstanceStatus {
+  name: string;
+  mode: RedisMode;
+  connected: boolean;
+  keyPrefix: string;
+}
+
+interface RedisInstanceEntry {
+  name: string;
+  config: RedisInstanceConfig;
+  mode: RedisMode;
+  keyPrefix: string;
+  client: RedisClient | null;
+  ready: boolean;
+}
+
+const instances = new Map<string, RedisInstanceEntry>();
+
+function normalizeKeyPrefix(raw?: string): string {
+  const cleaned = raw?.trim();
+  if (!cleaned) return "{ai_pipeline}";
+  return cleaned.includes("{") && cleaned.includes("}") ? cleaned : `{${cleaned}}`;
+}
+
+function parseHostPortList(
+  raw: HostPort[] | string | undefined,
+  defaultPort: number
+): HostPort[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw
+      .filter((n) => n && typeof n.host === "string" && n.host.trim())
+      .map((n) => ({
+        host: n.host.trim(),
+        port: Number(n.port) || defaultPort,
+      }));
+  }
   return raw
     .split(",")
     .map((entry) => entry.trim())
@@ -67,17 +100,8 @@ function parseHostPortList(raw: string | undefined, defaultPort: number): HostPo
     });
 }
 
-function parseSentinelNodes(): HostPort[] {
-  return parseHostPortList(process.env.REDIS_SENTINELS, 26379);
-}
-
-function parseClusterNodes(): ClusterNode[] {
-  return parseHostPortList(process.env.REDIS_CLUSTER_NODES, 7001);
-}
-
-function parseNatMap(): ClusterOptions["natMap"] | undefined {
-  const raw = process.env.REDIS_CLUSTER_NAT_MAP?.trim();
-  if (!raw) return undefined;
+function parseNatMap(raw: string | undefined): ClusterOptions["natMap"] | undefined {
+  if (!raw?.trim()) return undefined;
   try {
     return JSON.parse(raw) as ClusterOptions["natMap"];
   } catch (err) {
@@ -86,19 +110,22 @@ function parseNatMap(): ClusterOptions["natMap"] | undefined {
   }
 }
 
-function resolveConfiguredMode(): "sentinel" | "cluster" | "standalone" {
-  const envMode = process.env.REDIS_MODE?.trim().toLowerCase();
-  if (envMode === "sentinel") return "sentinel";
-  if (envMode === "cluster") return "cluster";
-  if (envMode === "standalone") return "standalone";
-  if (parseSentinelNodes().length > 0) return "sentinel";
-  if (parseClusterNodes().length > 0) return "cluster";
+function resolveInstanceMode(cfg: RedisInstanceConfig): "sentinel" | "cluster" | "standalone" {
+  const mode = cfg.mode?.toLowerCase();
+  if (mode === "sentinel") return "sentinel";
+  if (mode === "cluster") return "cluster";
+  if (mode === "standalone") return "standalone";
+  if (parseHostPortList(cfg.sentinels, 26379).length > 0) return "sentinel";
+  if (parseHostPortList(cfg.clusterNodes, 7001).length > 0) return "cluster";
   return "standalone";
 }
 
-function buildBaseRedisOptions(forBlocking: boolean): RedisOptions {
-  const password = decryptIfEncrypted(process.env.REDIS_PASSWORD) || undefined;
-  const username = process.env.REDIS_USERNAME?.trim() || undefined;
+function buildBaseRedisOptions(
+  cfg: RedisInstanceConfig,
+  forBlocking: boolean
+): RedisOptions {
+  const password = decryptIfEncrypted(cfg.password) || undefined;
+  const username = cfg.username?.trim() || undefined;
   return {
     username,
     password,
@@ -108,69 +135,101 @@ function buildBaseRedisOptions(forBlocking: boolean): RedisOptions {
   };
 }
 
-function buildSentinelClient(forBlocking: boolean): Redis {
-  const sentinels = parseSentinelNodes();
-  const effectiveSentinels: HostPort[] =
-    sentinels.length > 0 ? sentinels : [{ host: "127.0.0.1", port: 26379 }];
-  const masterName = process.env.REDIS_SENTINEL_MASTER?.trim() || "mymaster";
-  const sentinelPassword =
-    decryptIfEncrypted(process.env.REDIS_SENTINEL_PASSWORD) || undefined;
-  const roleRaw = process.env.REDIS_SENTINEL_ROLE?.trim().toLowerCase();
-  const role: "master" | "slave" = roleRaw === "slave" ? "slave" : "master";
+function buildEffectiveSentinelNatMap(
+  sentinels: HostPort[],
+  explicitNatMap?: ClusterOptions["natMap"]
+): ClusterOptions["natMap"] | undefined {
+  const isLocalSentinel = sentinels.some(
+    (s) => s.host === "127.0.0.1" || s.host === "localhost"
+  );
+  if (!explicitNatMap && !isLocalSentinel) {
+    return undefined;
+  }
 
-  const options: RedisOptions = {
-    ...buildBaseRedisOptions(forBlocking),
-    sentinels: effectiveSentinels,
-    name: masterName,
-    role,
-    sentinelPassword,
-    db: Number(process.env.REDIS_DB || 0),
-    lazyConnect: !forBlocking,
-    sentinelRetryStrategy: (times: number) => {
-      if (!forBlocking && times > 3) return null;
-      return Math.min(times * 200, 2_000);
-    },
-    retryStrategy: (times: number) => {
-      if (!forBlocking && times > 3) return null;
-      return Math.min(times * 200, 2_000);
-    },
+  return (key: string) => {
+    if (typeof explicitNatMap === "function") {
+      const mapped = explicitNatMap(key);
+      if (mapped) return mapped;
+    } else if (explicitNatMap && typeof explicitNatMap === "object") {
+      const mapped = explicitNatMap[key];
+      if (mapped) return mapped;
+    }
+
+    if (isLocalSentinel) {
+      if (key === "redis-master:6379") {
+        return { host: "127.0.0.1", port: Number(process.env.REDIS_PORT || 6379) };
+      }
+      if (key === "redis-replica:6379") {
+        return { host: "127.0.0.1", port: 6380 };
+      }
+    }
+    return null;
   };
-
-  return new Redis(options);
 }
 
-function buildClusterClient(forBlocking: boolean): Cluster {
-  const nodes = parseClusterNodes();
-  const effectiveNodes: ClusterNode[] =
-    nodes.length > 0
-      ? nodes
-      : [
-          {
-            host: process.env.REDIS_HOST?.trim() || "127.0.0.1",
-            port: Number(process.env.REDIS_PORT || 7001),
-          },
-        ];
+function buildClientFromConfig(
+  cfg: RedisInstanceConfig,
+  mode: "sentinel" | "cluster" | "standalone",
+  forBlocking: boolean
+): RedisClient {
+  if (mode === "sentinel") {
+    const sentinels = parseHostPortList(cfg.sentinels, 26379);
+    const effectiveSentinels: HostPort[] =
+      sentinels.length > 0 ? sentinels : [{ host: "127.0.0.1", port: 26379 }];
+    const masterName = cfg.masterName?.trim() || "mymaster";
+    const sentinelPassword = decryptIfEncrypted(cfg.sentinelPassword) || undefined;
+    const role: "master" | "slave" = cfg.role === "slave" ? "slave" : "master";
+    const natMap = buildEffectiveSentinelNatMap(
+      effectiveSentinels,
+      cfg.sentinelNatMap ?? cfg.natMap
+    );
 
-  const natMap = parseNatMap();
-  const options: ClusterOptions = {
-    lazyConnect: !forBlocking,
-    scaleReads: "master",
-    enableReadyCheck: true,
-    clusterRetryStrategy: (times: number) => {
-      if (!forBlocking && times > 3) return null;
-      return Math.min(times * 200, 2_000);
-    },
-    redisOptions: buildBaseRedisOptions(forBlocking),
-    ...(natMap ? { natMap } : {}),
-  };
+    return new Redis({
+      ...buildBaseRedisOptions(cfg, forBlocking),
+      sentinels: effectiveSentinels,
+      name: masterName,
+      role,
+      sentinelPassword,
+      ...(natMap ? { natMap } : {}),
+      db: Number(cfg.db ?? 0),
+      lazyConnect: !forBlocking,
+      sentinelRetryStrategy: (times: number) => {
+        if (!forBlocking && times > 3) return null;
+        return Math.min(times * 200, 2_000);
+      },
+      retryStrategy: (times: number) => {
+        if (!forBlocking && times > 3) return null;
+        return Math.min(times * 200, 2_000);
+      },
+    });
+  }
 
-  return new Cluster(effectiveNodes, options);
-}
+  if (mode === "cluster") {
+    const nodes = parseHostPortList(cfg.clusterNodes, 7001);
+    const effectiveNodes: ClusterNode[] =
+      nodes.length > 0
+        ? nodes
+        : [{ host: cfg.host?.trim() || "127.0.0.1", port: Number(cfg.port || 7001) }];
 
-function buildStandaloneClient(forBlocking: boolean): Redis {
-  const redisUrl = decryptConnectionUrl(process.env.REDIS_URL);
+    const options: ClusterOptions = {
+      lazyConnect: !forBlocking,
+      scaleReads: "master",
+      enableReadyCheck: true,
+      clusterRetryStrategy: (times: number) => {
+        if (!forBlocking && times > 3) return null;
+        return Math.min(times * 200, 2_000);
+      },
+      redisOptions: buildBaseRedisOptions(cfg, forBlocking),
+      ...(cfg.natMap ? { natMap: cfg.natMap } : {}),
+    };
+
+    return new Cluster(effectiveNodes, options);
+  }
+
+  // Standalone
+  const redisUrl = decryptConnectionUrl(cfg.url);
   const baseOptions: RedisOptions = {
-    ...buildBaseRedisOptions(forBlocking),
+    ...buildBaseRedisOptions(cfg, forBlocking),
     lazyConnect: !forBlocking,
     retryStrategy: (times: number) => {
       if (!forBlocking && times > 3) return null;
@@ -184,112 +243,219 @@ function buildStandaloneClient(forBlocking: boolean): Redis {
 
   return new Redis({
     ...baseOptions,
-    host: process.env.REDIS_HOST?.trim() || "127.0.0.1",
-    port: Number(process.env.REDIS_PORT || 6379),
+    host: cfg.host?.trim() || "127.0.0.1",
+    port: Number(cfg.port || 6379),
+    db: Number(cfg.db ?? 0),
+  });
+}
+
+function buildPrimaryConfigFromEnv(): RedisInstanceConfig {
+  const modeEnv = process.env.REDIS_MODE?.trim().toLowerCase();
+  const mode =
+    modeEnv === "sentinel" || modeEnv === "cluster" || modeEnv === "standalone"
+      ? modeEnv
+      : undefined;
+  const roleRaw = process.env.REDIS_SENTINEL_ROLE?.trim().toLowerCase();
+  return {
+    name: DEFAULT_REDIS_NAME,
+    mode,
+    sentinels: process.env.REDIS_SENTINELS,
+    masterName: process.env.REDIS_SENTINEL_MASTER?.trim() || "mymaster",
+    sentinelPassword: process.env.REDIS_SENTINEL_PASSWORD,
+    role: roleRaw === "slave" ? "slave" : "master",
+    sentinelNatMap: parseNatMap(process.env.REDIS_SENTINEL_NAT_MAP),
+    clusterNodes: process.env.REDIS_CLUSTER_NODES,
+    natMap: parseNatMap(process.env.REDIS_CLUSTER_NAT_MAP),
+    url: process.env.REDIS_URL,
+    host: process.env.REDIS_HOST,
+    port: process.env.REDIS_PORT ? Number(process.env.REDIS_PORT) : undefined,
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD,
     db: Number(process.env.REDIS_DB || 0),
-  });
+    keyPrefix: process.env.REDIS_KEY_PREFIX,
+    allowFallback: process.env.REDIS_ALLOW_FALLBACK !== "false",
+  };
+}
+
+function parseAdditionalInstancesFromEnv(): RedisInstanceConfig[] {
+  const raw = process.env.REDIS_INSTANCES?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is RedisInstanceConfig =>
+          Boolean(item) &&
+          typeof item === "object" &&
+          typeof (item as RedisInstanceConfig).name === "string" &&
+          (item as RedisInstanceConfig).name.trim().length > 0
+      )
+      .map((item) => ({
+        ...item,
+        name: item.name.trim(),
+        allowFallback: item.allowFallback !== false,
+      }));
+  } catch (err) {
+    log.warn({ err }, "Invalid REDIS_INSTANCES JSON; ignoring secondary Redis configs");
+    return [];
+  }
 }
 
 /**
- * Create a dedicated Redis connection for blocking commands (BLPOP, BullMQ Queue/Worker)
- * so the shared command connection is never blocked.
+ * Register and connect a named Redis instance (Sentinel, Cluster, or Standalone).
+ * Can be called at startup or dynamically at runtime for cross-department Redis access.
  */
-export function createBlockingRedisClient(): RedisClient | null {
-  if (!redisReady || !redisClient) return null;
-
-  const client: RedisClient =
-    activeMode === "sentinel"
-      ? buildSentinelClient(true)
-      : activeMode === "cluster"
-        ? buildClusterClient(true)
-        : buildStandaloneClient(true);
-
-  client.on("error", (err: Error) => {
-    log.warn({ err, mode: activeMode }, "Blocking Redis connection warning");
-  });
-
-  return client;
-}
-
-/**
- * Create a BullMQ-compatible Redis connection (`maxRetriesPerRequest: null`).
- */
-export function createBullMQConnection(): RedisClient | null {
-  return createBlockingRedisClient();
-}
-
-/**
- * Initialize Redis connection on startup (supports Sentinel, Cluster, and Standalone).
- */
-export async function initRedis(): Promise<boolean> {
-  if (redisReady && redisClient) return true;
-
-  if (process.env.REDIS_ENABLED === "false") {
-    activeMode = "disabled";
-    log.info("Redis disabled via REDIS_ENABLED=false");
-    return false;
+export async function registerRedisInstance(
+  config: RedisInstanceConfig
+): Promise<boolean> {
+  const name = config.name.trim();
+  if (!name) {
+    throw new Error("Redis instance `name` is required");
   }
 
-  const mode = resolveConfiguredMode();
-  const client: RedisClient =
-    mode === "sentinel"
-      ? buildSentinelClient(false)
-      : mode === "cluster"
-        ? buildClusterClient(false)
-        : buildStandaloneClient(false);
+  const existing = instances.get(name);
+  if (existing?.ready && existing.client) {
+    return true;
+  }
+
+  const mode = resolveInstanceMode(config);
+  const keyPrefix = normalizeKeyPrefix(config.keyPrefix);
+  const client = buildClientFromConfig(config, mode, false);
+
+  const entry: RedisInstanceEntry = {
+    name,
+    config,
+    mode,
+    keyPrefix,
+    client: null,
+    ready: false,
+  };
+  instances.set(name, entry);
 
   client.on("error", (err: Error) => {
-    if (redisReady) {
-      log.warn({ err, mode }, "Redis connection warning");
+    if (entry.ready) {
+      log.warn({ err, name, mode }, "Redis connection warning");
     }
   });
 
   try {
     await client.connect();
     await client.ping();
-    redisClient = client;
-    redisReady = true;
-    activeMode = mode;
-    log.info(
-      {
-        mode,
-        prefix: getRedisKeyPrefix(),
-        ...(mode === "sentinel"
-          ? {
-              master: process.env.REDIS_SENTINEL_MASTER?.trim() || "mymaster",
-              sentinels: parseSentinelNodes(),
-            }
-          : {}),
-        ...(mode === "cluster" ? { nodes: parseClusterNodes() } : {}),
-      },
-      `Redis (${mode}) connected and ready`
-    );
+    entry.client = client;
+    entry.ready = true;
+    log.info({ name, mode, keyPrefix }, `Redis instance "${name}" (${mode}) connected`);
     return true;
   } catch (err) {
     await client.quit().catch(() => client.disconnect());
-    redisClient = null;
-    redisReady = false;
-    activeMode = "disabled";
+    entry.client = null;
+    entry.ready = false;
+    entry.mode = "disabled";
     const msg = err instanceof Error ? err.message : String(err);
 
-    if (process.env.REDIS_ALLOW_FALLBACK !== "false") {
+    if (config.allowFallback !== false) {
       log.warn(
-        { mode, reason: msg },
-        "Redis unavailable; continuing with in-memory fallback"
+        { name, mode, reason: msg },
+        `Redis instance "${name}" unavailable; continuing without it`
       );
       return false;
     }
 
-    log.error({ err, mode }, "Redis connection failed");
-    throw new Error(`Redis (${mode}) connection failed: ${msg}`);
+    log.error({ err, name, mode }, `Redis instance "${name}" connection failed`);
+    throw new Error(`Redis "${name}" (${mode}) connection failed: ${msg}`);
   }
 }
 
+export function isRedisConnected(name: string = DEFAULT_REDIS_NAME): boolean {
+  const entry = instances.get(name);
+  return Boolean(entry?.ready && entry.client);
+}
+
+export function getRedisMode(name: string = DEFAULT_REDIS_NAME): RedisMode {
+  return instances.get(name)?.mode ?? "disabled";
+}
+
+export function getRedisKeyPrefix(name: string = DEFAULT_REDIS_NAME): string {
+  return (
+    instances.get(name)?.keyPrefix ??
+    normalizeKeyPrefix(process.env.REDIS_KEY_PREFIX)
+  );
+}
+
+export function getRedisClient(name: string = DEFAULT_REDIS_NAME): RedisClient {
+  const entry = instances.get(name);
+  if (!entry?.ready || !entry.client) {
+    throw new Error(`Redis client "${name}" is not initialized or unavailable`);
+  }
+  return entry.client;
+}
+
+export function listRedisInstances(): RedisInstanceStatus[] {
+  return Array.from(instances.values()).map((entry) => ({
+    name: entry.name,
+    mode: entry.mode,
+    connected: entry.ready && entry.client !== null,
+    keyPrefix: entry.keyPrefix,
+  }));
+}
+
+/**
+ * Create a dedicated Redis connection for blocking commands (BLPOP, BullMQ Queue/Worker)
+ * on the specified named Redis instance (defaults to "primary").
+ */
+export function createBlockingRedisClient(
+  name: string = DEFAULT_REDIS_NAME
+): RedisClient | null {
+  const entry = instances.get(name);
+  if (!entry?.ready || !entry.client || entry.mode === "disabled") return null;
+
+  const client = buildClientFromConfig(entry.config, entry.mode, true);
+  client.on("error", (err: Error) => {
+    log.warn({ err, name, mode: entry.mode }, "Blocking Redis connection warning");
+  });
+  return client;
+}
+
+/**
+ * Create a BullMQ-compatible Redis connection (`maxRetriesPerRequest: null`).
+ */
+export function createBullMQConnection(
+  name: string = DEFAULT_REDIS_NAME
+): RedisClient | null {
+  return createBlockingRedisClient(name);
+}
+
+/**
+ * Initialize the primary Redis instance and all secondary instances configured via `REDIS_INSTANCES`.
+ */
+export async function initRedis(): Promise<boolean> {
+  if (process.env.REDIS_ENABLED === "false") {
+    log.info("Redis disabled via REDIS_ENABLED=false");
+    return false;
+  }
+
+  const primaryOk = await registerRedisInstance(buildPrimaryConfigFromEnv());
+
+  const secondaryConfigs = parseAdditionalInstancesFromEnv();
+  if (secondaryConfigs.length > 0) {
+    await Promise.all(
+      secondaryConfigs.map((cfg) => registerRedisInstance(cfg))
+    );
+  }
+
+  return primaryOk;
+}
+
 export async function closeRedis(): Promise<void> {
-  if (!redisClient) return;
-  await redisClient.quit().catch(() => redisClient?.disconnect());
-  redisClient = null;
-  redisReady = false;
-  activeMode = "disabled";
-  log.info("Redis connection closed");
+  const closing = Array.from(instances.values()).map(async (entry) => {
+    if (entry.client) {
+      await entry.client.quit().catch(() => entry.client?.disconnect());
+      entry.client = null;
+      entry.ready = false;
+      entry.mode = "disabled";
+    }
+  });
+  await Promise.all(closing);
+  instances.clear();
+  log.info("All Redis connections closed");
 }

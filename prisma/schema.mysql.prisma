@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma-mysql"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Skill {
+  skillName       String      @id @map("skill_name") @db.VarChar(255)
+  description     String      @db.Text
+  creator         String      @default("Admin") @db.VarChar(255)
+  isBuiltin       Boolean     @default(false) @map("is_builtin")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime    @default(now()) @map("updated_at") @db.DateTime(3)
+  currentStep     Int         @default(1) @map("current_step") @db.TinyInt
+  progress        Int         @default(33) @db.SmallInt
+  status          String      @default("draft") @db.VarChar(64)
+  selectedApps    Json        @map("selected_apps")
+  selectedRepos   Json        @map("selected_repos")
+  selectedMcps    Json        @map("selected_mcps")
+  pipelineRuns    Json        @map("pipeline_runs")
+  frontmatter     Json
+  hasScripts      Boolean     @default(false) @map("has_scripts")
+  resourceSummary Json        @map("resource_summary")
+  skillMd         String      @map("skill_md") @db.LongText
+  files           SkillFile[]
+
+  @@map("skills")
+}
+
+model McpServer {
+  id          String   @id @db.VarChar(64)
+  owner       String   @db.VarChar(255)
+  name        String   @db.VarChar(255)
+  transport   String   @default("streamable-http") @db.VarChar(64)
+  url         String   @db.Text
+  headers     Json
+  description String   @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.DateTime(3)
+
+  @@unique([owner, name], map: "uq_mcp_servers_owner_name")
+  @@index([owner], map: "idx_mcp_servers_owner")
+  @@map("mcp_servers")
+}
+
+model SkillFile {
+  skillName    String   @map("skill_name") @db.VarChar(255)
+  filePath     String   @map("file_path") @db.VarChar(512)
+  content      String   @db.LongText
+  category     String   @default("other") @db.VarChar(64)
+  mimeType     String   @default("text/plain") @map("mime_type") @db.VarChar(128)
+  encoding     String   @default("utf-8") @db.VarChar(32)
+  sizeBytes    Int      @default(0) @map("size_bytes")
+  isExecutable Boolean  @default(false) @map("is_executable")
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.DateTime(3)
+  skill        Skill    @relation(fields: [skillName], references: [skillName], onDelete: Cascade)
+
+  @@id([skillName, filePath])
+  @@map("skill_files")
+}
+
+model CatalogApp {
+  id        String   @id @db.VarChar(128)
+  name      String   @db.VarChar(255)
+  env       String   @default("prod") @db.VarChar(64)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@map("catalog_apps")
+}
+
+model CatalogRepo {
+  id        String   @id @db.VarChar(128)
+  name      String   @db.VarChar(255)
+  url       String   @db.Text
+  branch    String   @default("main") @db.VarChar(128)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@map("catalog_repos")
+}
+
+model GenerationJob {
+  jobId           String   @id @map("job_id") @db.VarChar(64)
+  skillName       String?  @map("skill_name") @db.VarChar(255)
+  status          String   @db.VarChar(64)
+  startedAt       BigInt   @map("started_at")
+  endedAt         BigInt?  @map("ended_at")
+  elapsedMs       Int      @default(0) @map("elapsed_ms")
+  timeoutMs       Int      @default(120000) @map("timeout_ms")
+  payload         Json
+  streamedContent String   @map("streamed_content") @db.LongText
+  errorMessage    String?  @map("error_message") @db.Text
+  result          Json?
+  updatedAt       DateTime @default(now()) @map("updated_at") @db.DateTime(3)
+
+  @@map("generation_jobs")
+}
+
+model AiTraceSpan {
+  id           BigInt   @id @default(autoincrement())
+  traceId      String   @map("trace_id") @db.VarChar(64)
+  spanId       String   @map("span_id") @db.VarChar(64)
+  parentSpanId String?  @map("parent_span_id") @db.VarChar(64)
+  name         String   @db.VarChar(255)
+  kind         Int      @default(0)
+  startTimeMs  Float    @map("start_time_ms")
+  endTimeMs    Float    @map("end_time_ms")
+  durationMs   Float    @map("duration_ms")
+  status       Json
+  attributes   Json
+  events       Json
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([traceId], map: "idx_ai_trace_spans_trace_id")
+  @@index([createdAt], map: "idx_ai_trace_spans_created_at")
+  @@map("ai_trace_spans")
+}

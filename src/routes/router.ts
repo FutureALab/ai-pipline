@@ -62,8 +62,12 @@ import {
   stopWorkbenchBgCommandHandler,
   submitWorkbenchQuestionAnswerHandler,
 } from "../controllers/workbenchController.js";
-import { getDbDriver, isDbConnected } from "../db/database.js";
-import { getRedisMode, isRedisConnected } from "../db/redis.js";
+import { getDbDriver, isDbConnected, listDataSources } from "../db/database.js";
+import {
+  getRedisMode,
+  isRedisConnected,
+  listRedisInstances,
+} from "../db/redis.js";
 import {
   extractTokenFromRequest,
   verifyTokenFromRedis,
@@ -88,8 +92,10 @@ export async function routeRequest(
         ok: true,
         dbConnected: isDbConnected(),
         dbDriver: getDbDriver(),
+        dbDataSources: listDataSources(),
         redisConnected: isRedisConnected(),
         redisMode: getRedisMode(),
+        redisInstances: listRedisInstances(),
       });
     }
 

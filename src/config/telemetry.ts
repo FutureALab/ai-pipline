@@ -12,7 +12,8 @@ import {
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent";
-import { getDb, isDbConnected } from "../db/database.js";
+import { getDb, getPrismaOrNull, isDbConnected } from "../db/database.js";
+import type { Prisma } from "../generated/prisma/client.js";
 
 export type AgentTelemetryConfig = NonNullable<
   CreateAgentSessionOptions["telemetry"]
@@ -92,23 +93,44 @@ class LocalTraceSpanProcessor implements SpanProcessor {
     }
 
     if (isDbConnected()) {
-      void getDb()
-        .insertInto("ai_trace_spans")
-        .values({
-          trace_id: record.traceId,
-          span_id: record.spanId,
-          parent_span_id: record.parentSpanId ?? null,
-          name: record.name,
-          kind: record.kind,
-          start_time_ms: record.startTimeMs,
-          end_time_ms: record.endTimeMs,
-          duration_ms: record.durationMs,
-          status: JSON.stringify(record.status),
-          attributes: JSON.stringify(record.attributes),
-          events: JSON.stringify(record.events),
-        })
-        .execute()
-        .catch(() => {});
+      const prisma = getPrismaOrNull();
+      if (prisma) {
+        void prisma.aiTraceSpan
+          .create({
+            data: {
+              traceId: record.traceId,
+              spanId: record.spanId,
+              parentSpanId: record.parentSpanId ?? null,
+              name: record.name,
+              kind: record.kind,
+              startTimeMs: record.startTimeMs,
+              endTimeMs: record.endTimeMs,
+              durationMs: record.durationMs,
+              status: record.status as unknown as Prisma.InputJsonValue,
+              attributes: record.attributes as unknown as Prisma.InputJsonValue,
+              events: record.events as unknown as Prisma.InputJsonValue,
+            },
+          })
+          .catch(() => {});
+      } else {
+        void getDb()
+          .insertInto("ai_trace_spans")
+          .values({
+            trace_id: record.traceId,
+            span_id: record.spanId,
+            parent_span_id: record.parentSpanId ?? null,
+            name: record.name,
+            kind: record.kind,
+            start_time_ms: record.startTimeMs,
+            end_time_ms: record.endTimeMs,
+            duration_ms: record.durationMs,
+            status: JSON.stringify(record.status),
+            attributes: JSON.stringify(record.attributes),
+            events: JSON.stringify(record.events),
+          })
+          .execute()
+          .catch(() => {});
+      }
     }
   }
 
@@ -231,6 +253,29 @@ export async function getRecentSpans(
   limit: number = 100
 ): Promise<RecordedSpan[]> {
   if (isDbConnected()) {
+    const prisma = getPrismaOrNull();
+    if (prisma) {
+      const rows = await prisma.aiTraceSpan.findMany({
+        orderBy: { id: "desc" },
+        take: limit,
+      });
+      return rows.map((row) =>
+        mapDbSpanRow({
+          trace_id: row.traceId,
+          span_id: row.spanId,
+          parent_span_id: row.parentSpanId,
+          name: row.name,
+          kind: row.kind,
+          start_time_ms: row.startTimeMs,
+          end_time_ms: row.endTimeMs,
+          duration_ms: row.durationMs,
+          status: row.status,
+          attributes: row.attributes,
+          events: row.events,
+        })
+      );
+    }
+
     const rows = await getDb()
       .selectFrom("ai_trace_spans")
       .select([
@@ -277,6 +322,29 @@ export async function getSpansByTraceId(
   traceId: string
 ): Promise<RecordedSpan[]> {
   if (isDbConnected()) {
+    const prisma = getPrismaOrNull();
+    if (prisma) {
+      const rows = await prisma.aiTraceSpan.findMany({
+        where: { traceId },
+        orderBy: { startTimeMs: "asc" },
+      });
+      return rows.map((row) =>
+        mapDbSpanRow({
+          trace_id: row.traceId,
+          span_id: row.spanId,
+          parent_span_id: row.parentSpanId,
+          name: row.name,
+          kind: row.kind,
+          start_time_ms: row.startTimeMs,
+          end_time_ms: row.endTimeMs,
+          duration_ms: row.durationMs,
+          status: row.status,
+          attributes: row.attributes,
+          events: row.events,
+        })
+      );
+    }
+
     const rows = await getDb()
       .selectFrom("ai_trace_spans")
       .select([

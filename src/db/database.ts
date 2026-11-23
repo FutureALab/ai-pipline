@@ -31,12 +31,75 @@ import type {
   SkillFileEntry,
 } from "../types/skill.js";
 import { BunSqliteDialect } from "./bunSqliteDialect.js";
+import {
+  DEFAULT_DATASOURCE_NAME,
+  closeAllDataSources,
+  createPrismaMysqlClient,
+  createPrismaPgClient,
+  getDataSourceDriver,
+  getNamedDb,
+  getNamedMysqlPrisma,
+  getNamedMysqlPrismaOrNull,
+  getNamedPrisma,
+  getNamedPrismaOrNull,
+  initConfiguredSecondaryDataSources,
+  isDataSourceConnected,
+  listDataSources,
+  queryDataSource,
+  registerDataSource,
+  registerManagedDataSource,
+  type DataSourceConfig,
+  type DataSourceStatusSnapshot,
+  type DbDriver,
+} from "./dataSourceRegistry.js";
+import type { PrismaClient } from "../generated/prisma/client.js";
+import type { PrismaClient as MysqlPrismaClient } from "../generated/prisma-mysql/client.js";
+import {
+  RedisAdapter,
+  createPrismaRedisCacheExtension,
+} from "./prismaRedisCache.js";
 import type { DatabaseSchema } from "./schema.js";
+
+export {
+  DEFAULT_DATASOURCE_NAME,
+  RedisAdapter,
+  createPrismaRedisCacheExtension,
+  getDataSourceDriver,
+  isDataSourceConnected,
+  listDataSources,
+  queryDataSource,
+  registerDataSource,
+  type DataSourceConfig,
+  type DataSourceStatusSnapshot,
+  type DbDriver,
+  type MysqlPrismaClient,
+  type PrismaClient,
+};
+
+export function getPrisma(name: string = DEFAULT_DATASOURCE_NAME): PrismaClient {
+  return getNamedPrisma(name);
+}
+
+export function getPrismaOrNull(
+  name: string = DEFAULT_DATASOURCE_NAME
+): PrismaClient | null {
+  return getNamedPrismaOrNull(name);
+}
+
+export function getMysqlPrisma(
+  name: string = DEFAULT_DATASOURCE_NAME
+): MysqlPrismaClient {
+  return getNamedMysqlPrisma(name);
+}
+
+export function getMysqlPrismaOrNull(
+  name: string = DEFAULT_DATASOURCE_NAME
+): MysqlPrismaClient | null {
+  return getNamedMysqlPrismaOrNull(name);
+}
 
 const dbLog = createLogger("db");
 const execFileAsync = promisify(execFile);
-
-export type DbDriver = "postgres" | "mysql" | "gauss" | "sqlite";
 
 export const INITIAL_APPS: CatalogAppRow[] = [
   { id: "app-gateway", name: "API Gateway", env: "prod" },
@@ -69,26 +132,26 @@ let mysqlPool: MysqlPool | null = null;
 let sqliteDb: BunSqliteDatabase | null = null;
 let activeDriver: DbDriver | null = null;
 
-export function isDbConnected(): boolean {
-  return activeDriver !== null && kyselyDb !== null;
+export function isDbConnected(name: string = DEFAULT_DATASOURCE_NAME): boolean {
+  return isDataSourceConnected(name);
 }
 
-export function getDbDriver(): DbDriver | null {
-  return activeDriver;
+export function getDbDriver(name: string = DEFAULT_DATASOURCE_NAME): DbDriver | null {
+  return getDataSourceDriver(name);
 }
 
-export function isMysqlDriver(): boolean {
-  return activeDriver === "mysql";
+export function isMysqlDriver(name: string = DEFAULT_DATASOURCE_NAME): boolean {
+  return getDataSourceDriver(name) === "mysql";
 }
 
 /**
- * Returns the active Kysely query builder instance (supports PostgreSQL, MySQL, GaussDB, SQLite).
+ * Returns the active Kysely query builder instance for the given datasource name
+ * (defaults to `"primary"`, supports simultaneous PostgreSQL / MySQL / GaussDB / SQLite).
  */
-export function getDb(): Kysely<DatabaseSchema> {
-  if (!kyselyDb) {
-    throw new Error("Database is not initialized. Call initDatabase() first.");
-  }
-  return kyselyDb;
+export function getDb<TSchema = DatabaseSchema>(
+  name: string = DEFAULT_DATASOURCE_NAME
+): Kysely<TSchema> {
+  return getNamedDb<TSchema>(name);
 }
 
 /**
@@ -125,59 +188,10 @@ export function toDbTimestamp(val: Date | string): Date | string {
  */
 export async function queryDb<T extends Record<string, unknown> = Record<string, unknown>>(
   sqlText: string,
-  params: unknown[] = []
+  params: unknown[] = [],
+  dataSourceName: string = DEFAULT_DATASOURCE_NAME
 ): Promise<{ rows: T[] }> {
-  if (activeDriver === "postgres" && pgPool) {
-    const res = await pgPool.query<T>(sqlText, params);
-    return { rows: res.rows };
-  }
-
-  if (activeDriver === "gauss" && gaussPool) {
-    const res = await gaussPool.query<T>(sqlText, params);
-    return { rows: res.rows };
-  }
-
-  if (activeDriver === "mysql" && mysqlPool) {
-    const mysqlParams: unknown[] = [];
-    const convertedSql = sqlText
-      .replace(/::jsonb/gi, "")
-      .replace(/\$(\d+)/g, (_m, idxStr: string) => {
-        const idx = Number(idxStr) - 1;
-        const val = params[idx];
-        mysqlParams.push(typeof val === "boolean" ? (val ? 1 : 0) : (val ?? null));
-        return "?";
-      });
-    const [rows] = await mysqlPool.promise().query(convertedSql, mysqlParams);
-    return { rows: Array.isArray(rows) ? (rows as T[]) : [] };
-  }
-
-  if (activeDriver === "sqlite" && sqliteDb) {
-    const sqliteParams: unknown[] = [];
-    const convertedSql = sqlText
-      .replace(/::jsonb/gi, "")
-      .replace(/NOW\(\)/gi, "CURRENT_TIMESTAMP")
-      .replace(/\$(\d+)/g, (_m, idxStr: string) => {
-        const idx = Number(idxStr) - 1;
-        const val = params[idx];
-        if (typeof val === "boolean") {
-          sqliteParams.push(val ? 1 : 0);
-        } else {
-          sqliteParams.push(val ?? null);
-        }
-        return "?";
-      });
-
-    const trimmed = convertedSql.trim().toUpperCase();
-    const stmt = sqliteDb.query(convertedSql);
-    if (trimmed.startsWith("SELECT") || trimmed.includes("RETURNING")) {
-      const rows = stmt.all(...(sqliteParams as never[])) as T[];
-      return { rows };
-    }
-    stmt.run(...(sqliteParams as never[]));
-    return { rows: [] };
-  }
-
-  throw new Error("Database is not initialized. Call initDatabase() first.");
+  return await queryDataSource<T>(dataSourceName, sqlText, params);
 }
 
 // ============================================================================
@@ -793,6 +807,12 @@ async function initSqliteFallback(): Promise<void> {
     dialect: new BunSqliteDialect(sqliteDb),
   });
   activeDriver = "sqlite";
+  registerManagedDataSource({
+    name: DEFAULT_DATASOURCE_NAME,
+    driver: "sqlite",
+    sqliteDb,
+    kysely: kyselyDb,
+  });
   dbLog.warn(
     { sqlitePath },
     "Primary SQL database unavailable; initialized SQLite fallback via Kysely"
@@ -1138,7 +1158,22 @@ export async function initDatabase(): Promise<DbDriver> {
       kyselyDb = new Kysely<DatabaseSchema>({
         dialect: new MysqlDialect({ pool: mysqlPool as never }),
       });
-      dbLog.info("MySQL connected via mysql2 and Kysely schema initialized");
+      const mysqlCfg = buildMysqlConfig();
+      registerManagedDataSource({
+        name: DEFAULT_DATASOURCE_NAME,
+        driver: "mysql",
+        mysqlPool,
+        prismaMysql: createPrismaMysqlClient({
+          host: mysqlCfg.host,
+          port: mysqlCfg.port,
+          user: mysqlCfg.user,
+          password: mysqlCfg.password,
+          database: mysqlCfg.database,
+          connectionLimit: mysqlCfg.connectionLimit,
+        }),
+        kysely: kyselyDb,
+      });
+      dbLog.info("MySQL connected via mysql2 (PrismaMariaDb + Kysely initialized)");
     } else if (allowFallback) {
       await initSqliteFallback();
     } else {
@@ -1155,7 +1190,14 @@ export async function initDatabase(): Promise<DbDriver> {
       kyselyDb = new Kysely<DatabaseSchema>({
         dialect: new PostgresDialect({ pool: gaussPool as never }),
       });
-      dbLog.info("GaussDB connected via gaussdb-nodejs and Kysely schema initialized");
+      registerManagedDataSource({
+        name: DEFAULT_DATASOURCE_NAME,
+        driver: "gauss",
+        gaussPool,
+        prisma: createPrismaPgClient(gaussPool),
+        kysely: kyselyDb,
+      });
+      dbLog.info("GaussDB connected via gaussdb-nodejs (Prisma ORM + Kysely initialized)");
     } else if (allowFallback) {
       await initSqliteFallback();
     } else {
@@ -1178,13 +1220,23 @@ export async function initDatabase(): Promise<DbDriver> {
       kyselyDb = new Kysely<DatabaseSchema>({
         dialect: new PostgresDialect({ pool: pgPool }),
       });
-      dbLog.info("PostgreSQL connected via pg and Kysely schema initialized");
+      registerManagedDataSource({
+        name: DEFAULT_DATASOURCE_NAME,
+        driver: "postgres",
+        pgPool,
+        prisma: createPrismaPgClient(pgPool),
+        kysely: kyselyDb,
+      });
+      dbLog.info("PostgreSQL connected via pg (Prisma ORM + Kysely initialized)");
     } else if (allowFallback) {
       await initSqliteFallback();
     } else {
       throw new Error("PostgreSQL connection failed and SQLite fallback is disabled");
     }
   }
+
+  // Initialize any additional cross-department datasources configured via DB_DATASOURCES
+  await initConfiguredSecondaryDataSources();
 
   if (process.env.DB_INIT_SEED !== "false") {
     await seedCatalogData();
@@ -1197,29 +1249,11 @@ export async function initDatabase(): Promise<DbDriver> {
 }
 
 export async function closeDatabase(): Promise<void> {
-  if (kyselyDb) {
-    await kyselyDb.destroy().catch(() => {});
-    kyselyDb = null;
-  }
-  if (pgPool) {
-    await pgPool.end().catch(() => {});
-    pgPool = null;
-  }
-  if (gaussPool) {
-    await gaussPool.end().catch(() => {});
-    gaussPool = null;
-  }
-  if (mysqlPool) {
-    await mysqlPool.promise().end().catch(() => {});
-    mysqlPool = null;
-  }
-  if (sqliteDb) {
-    try {
-      sqliteDb.close();
-    } catch {
-      // Ignore close error
-    }
-    sqliteDb = null;
-  }
+  await closeAllDataSources();
+  kyselyDb = null;
+  pgPool = null;
+  gaussPool = null;
+  mysqlPool = null;
+  sqliteDb = null;
   activeDriver = null;
 }

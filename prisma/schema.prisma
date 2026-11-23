@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Skill {
+  skillName       String      @id @map("skill_name")
+  description     String      @default("")
+  creator         String      @default("Admin")
+  isBuiltin       Boolean     @default(false) @map("is_builtin")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime    @default(now()) @map("updated_at") @db.Timestamptz(6)
+  currentStep     Int         @default(1) @map("current_step") @db.SmallInt
+  progress        Int         @default(33) @db.SmallInt
+  status          String      @default("draft")
+  selectedApps    Json        @default("[]") @map("selected_apps")
+  selectedRepos   Json        @default("[]") @map("selected_repos")
+  selectedMcps    Json        @default("[]") @map("selected_mcps")
+  pipelineRuns    Json        @default("[]") @map("pipeline_runs")
+  frontmatter     Json        @default("{}")
+  hasScripts      Boolean     @default(false) @map("has_scripts")
+  resourceSummary Json        @default("{}") @map("resource_summary")
+  skillMd         String      @default("") @map("skill_md")
+  files           SkillFile[]
+
+  @@map("skills")
+}
+
+model McpServer {
+  id          String   @id
+  owner       String
+  name        String
+  transport   String   @default("streamable-http")
+  url         String
+  headers     Json     @default("{}")
+  description String   @default("")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([owner, name])
+  @@index([owner], map: "idx_mcp_servers_owner")
+  @@map("mcp_servers")
+}
+
+model SkillFile {
+  skillName    String   @map("skill_name")
+  filePath     String   @map("file_path")
+  content      String   @default("")
+  category     String   @default("other")
+  mimeType     String   @default("text/plain") @map("mime_type")
+  encoding     String   @default("utf-8")
+  sizeBytes    Int      @default(0) @map("size_bytes")
+  isExecutable Boolean  @default(false) @map("is_executable")
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  skill        Skill    @relation(fields: [skillName], references: [skillName], onDelete: Cascade)
+
+  @@id([skillName, filePath])
+  @@map("skill_files")
+}
+
+model CatalogApp {
+  id        String   @id
+  name      String
+  env       String   @default("prod")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("catalog_apps")
+}
+
+model CatalogRepo {
+  id        String   @id
+  name      String
+  url       String
+  branch    String   @default("main")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("catalog_repos")
+}
+
+model GenerationJob {
+  jobId           String   @id @map("job_id")
+  skillName       String?  @map("skill_name")
+  status          String
+  startedAt       BigInt   @map("started_at")
+  endedAt         BigInt?  @map("ended_at")
+  elapsedMs       Int      @default(0) @map("elapsed_ms")
+  timeoutMs       Int      @default(120000) @map("timeout_ms")
+  payload         Json     @default("{}")
+  streamedContent String   @default("") @map("streamed_content")
+  errorMessage    String?  @map("error_message")
+  result          Json?
+  updatedAt       DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("generation_jobs")
+}
+
+model AiTraceSpan {
+  id           BigInt   @id @default(autoincrement())
+  traceId      String   @map("trace_id")
+  spanId       String   @map("span_id")
+  parentSpanId String?  @map("parent_span_id")
+  name         String
+  kind         Int      @default(0)
+  startTimeMs  Float    @map("start_time_ms")
+  endTimeMs    Float    @map("end_time_ms")
+  durationMs   Float    @map("duration_ms")
+  status       Json     @default("{}")
+  attributes   Json     @default("{}")
+  events       Json     @default("[]")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([traceId], map: "idx_ai_trace_spans_trace_id")
+  @@index([createdAt(sort: Desc)], map: "idx_ai_trace_spans_created_at")
+  @@map("ai_trace_spans")
+}

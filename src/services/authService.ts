@@ -3,7 +3,11 @@ import type http from "node:http";
 import { decodeJwt, jwtVerify } from "jose";
 import { decryptIfEncrypted } from "../config/crypto.js";
 import { createLogger } from "../config/logger.js";
-import { getRedisClient, isRedisConnected } from "../db/redis.js";
+import {
+  DEFAULT_REDIS_NAME,
+  getRedisClient,
+  isRedisConnected,
+} from "../db/redis.js";
 import {
   RedisSessionUserSchema,
   type RedisSessionUser,
@@ -14,6 +18,10 @@ const authLog = createLogger("auth");
 export type AuthVerificationResult =
   | { authenticated: true; token: string; user: RedisSessionUser }
   | { authenticated: false; reason: string };
+
+function getAuthRedisInstanceName(): string {
+  return process.env.AUTH_REDIS_INSTANCE?.trim() || DEFAULT_REDIS_NAME;
+}
 
 function getAuthRedisPrefix(): string {
   return process.env.AUTH_REDIS_KEY_PREFIX ?? "auth:token:";
@@ -163,14 +171,15 @@ export async function verifyTokenFromRedis(
     return { authenticated: false, reason: "Missing authentication token" };
   }
 
-  if (!isRedisConnected()) {
+  const redisInstance = getAuthRedisInstanceName();
+  if (!isRedisConnected(redisInstance)) {
     return {
       authenticated: false,
-      reason: "Redis is unavailable; cannot verify authentication token",
+      reason: `Redis instance "${redisInstance}" is unavailable; cannot verify authentication token`,
     };
   }
 
-  const redis = getRedisClient();
+  const redis = getRedisClient(redisInstance);
   const prefixedKey = `${getAuthRedisPrefix()}${cleanToken}`;
   let rawValue: string | null = null;
 
@@ -263,8 +272,11 @@ export async function exchangeOAuthCodeAndStoreInRedis(params: {
     );
   }
 
-  if (!isRedisConnected()) {
-    throw new Error("Redis is unavailable; cannot persist OAuth session");
+  const redisInstance = getAuthRedisInstanceName();
+  if (!isRedisConnected(redisInstance)) {
+    throw new Error(
+      `Redis instance "${redisInstance}" is unavailable; cannot persist OAuth session`
+    );
   }
 
   const form = new URLSearchParams({
@@ -327,7 +339,7 @@ export async function exchangeOAuthCodeAndStoreInRedis(params: {
   });
   const validated = RedisSessionUserSchema.parse(normalized);
 
-  const redis = getRedisClient();
+  const redis = getRedisClient(redisInstance);
   const key = `${getAuthRedisPrefix()}${accessToken}`;
   await redis.set(key, JSON.stringify(validated), "EX", ttlSeconds);
 
@@ -335,9 +347,10 @@ export async function exchangeOAuthCodeAndStoreInRedis(params: {
 }
 
 export async function logoutTokenFromRedis(token: string | null): Promise<void> {
-  if (!token?.trim() || !isRedisConnected()) return;
+  const redisInstance = getAuthRedisInstanceName();
+  if (!token?.trim() || !isRedisConnected(redisInstance)) return;
   const clean = token.trim();
-  const redis = getRedisClient();
+  const redis = getRedisClient(redisInstance);
   const prefixedKey = `${getAuthRedisPrefix()}${clean}`;
   await redis.del(prefixedKey).catch(() => {});
   if (prefixedKey !== clean) {

@@ -1,7 +1,14 @@
 import crypto from "node:crypto";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
 import type { OpenAIOverrideConfig } from "../config/envModel.js";
-import { dbNow, getDb, isDbConnected, isMysqlDriver } from "../db/database.js";
+import {
+  dbNow,
+  getDb,
+  getPrismaOrNull,
+  isDbConnected,
+  isMysqlDriver,
+} from "../db/database.js";
+import { Prisma } from "../generated/prisma/client.js";
 import { getMcpServersByIdsForOwner } from "../repositories/mcpRepository.js";
 import {
   listSkillFiles,
@@ -88,6 +95,46 @@ function persistJobToDb(job: InternalJob): void {
   if (!isDbConnected()) return;
   const snap = toSnapshot(job);
   const safePayload = sanitizePayloadForDb(job.payload);
+  const prisma = getPrismaOrNull();
+
+  if (prisma) {
+    const now = new Date();
+    const skillName = snap.result?.skillName ?? job.payload.skillName ?? null;
+    const resultJson = snap.result
+      ? (snap.result as unknown as Prisma.InputJsonValue)
+      : Prisma.JsonNull;
+    void prisma.generationJob
+      .upsert({
+        where: { jobId: snap.jobId },
+        create: {
+          jobId: snap.jobId,
+          skillName,
+          status: snap.status,
+          startedAt: BigInt(snap.startedAt),
+          endedAt: snap.endedAt !== undefined ? BigInt(snap.endedAt) : null,
+          elapsedMs: snap.elapsedMs,
+          timeoutMs: snap.timeoutMs,
+          payload: safePayload as unknown as Prisma.InputJsonValue,
+          streamedContent: snap.streamedContent,
+          errorMessage: snap.errorMessage ?? null,
+          result: resultJson,
+          updatedAt: now,
+        },
+        update: {
+          skillName,
+          status: snap.status,
+          endedAt: snap.endedAt !== undefined ? BigInt(snap.endedAt) : null,
+          elapsedMs: snap.elapsedMs,
+          streamedContent: snap.streamedContent,
+          errorMessage: snap.errorMessage ?? null,
+          result: resultJson,
+          updatedAt: now,
+        },
+      })
+      .catch(() => {});
+    return;
+  }
+
   const db = getDb();
   const now = dbNow();
 

@@ -12,6 +12,8 @@
     "run-skill": "bun run src/main.ts run",
     "serve": "bun run src/main.ts serve",
     "jenkins:up": "bun run scripts/setup-jenkins.ts",
+    "prisma:generate": "./node_modules/.bin/prisma generate && ./node_modules/.bin/prisma generate --schema=prisma/schema.mysql.prisma",
+    "prisma:push": "./node_modules/.bin/prisma db push",
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build-binaries.ts darwin-arm64",
     "build:linux": "bun run scripts/build-binaries.ts linux-x64",
@@ -23,6 +25,9 @@
   },
   "dependencies": {
     "@oh-my-pi/pi-coding-agent": "18.22.1",
+    "@prisma/adapter-mariadb": "7.10.1",
+    "@prisma/adapter-pg": "^7.10.1",
+    "@prisma/client": "^7.10.1",
     "bullmq": "^6.7.8",
     "gaussdb-nodejs": "^0.2.3",
     "ioredis": "^6.0.0",
@@ -40,6 +45,7 @@
     "@types/node": "^22.0.0",
     "@types/nodemailer": "^8.0.2",
     "@types/pg": "^8.23.1",
+    "prisma": "7.10.1",
     "typescript": "^5.7.0"
   }
 }

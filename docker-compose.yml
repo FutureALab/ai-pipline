@@ -1,7 +1,47 @@
+# ==============================================================================
+# 多 Jenkins (轮询+熔断) + 多数据源 (PG/MySQL/GaussDB) + 多 Redis (Sentinel+单机) 测试编排
+#
+# 启动默认全套测试环境：
+#   docker compose up -d
+# 如需同时拉起 openGauss / GaussDB 数据源：
+#   docker compose --profile gauss up -d
+# 模拟单节点故障触发 3s 熔断：
+#   docker stop ai-pipeline-jenkins-2
+#   curl http://localhost:3000/api/jenkins/nodes
+# ==============================================================================
+
+x-jenkins-common: &jenkins-common
+  build:
+    context: ./docker/jenkins
+  image: ai-pipeline-jenkins:lts-jdk17
+  restart: unless-stopped
+  environment:
+    JENKINS_ADMIN_USER: ${JENKINS_USER:-admin}
+    JENKINS_ADMIN_PASSWORD: ${JENKINS_PASSWORD:-admin123}
+    OMP_MODEL: ${OMP_MODEL:-}
+    OPENAI_API_MODE: ${OPENAI_API_MODE:-chat}
+    OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+    OPENAI_MODEL_NAME: ${OPENAI_MODEL_NAME:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_CHAT_BASE_URL: ${OPENAI_CHAT_BASE_URL:-}
+    OPENAI_CHAT_MODEL_NAME: ${OPENAI_CHAT_MODEL_NAME:-}
+    OPENAI_CHAT_API_KEY: ${OPENAI_CHAT_API_KEY:-}
+    OPENAI_RESPONSES_BASE_URL: ${OPENAI_RESPONSES_BASE_URL:-}
+    OPENAI_RESPONSES_MODEL_NAME: ${OPENAI_RESPONSES_MODEL_NAME:-}
+    OPENAI_RESPONSES_API_KEY: ${OPENAI_RESPONSES_API_KEY:-}
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 18
+
 services:
-  postgres:
+  # ============================================================================
+  # 1. 多数据源 SQL：主库 PG + 跨部门 MySQL + 跨部门 PG + 可选 openGauss
+  # ============================================================================
+  postgres-primary:
     image: postgres:15-alpine
-    container_name: ai-pipeline-postgres
+    container_name: ai-pipeline-pg-primary
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${PGUSER:-postgres}
@@ -10,31 +50,64 @@ services:
     ports:
       - "${PGPORT:-5432}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pg_primary_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-postgres} -d ${PGDATABASE:-ai_pipeline}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  mysql:
+  mysql-dept-order:
     image: mysql:8.0
-    container_name: ai-pipeline-mysql
-    profiles: ["mysql"]
+    container_name: ai-pipeline-mysql-order
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-ai_pipeline}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root123456}
+      MYSQL_DATABASE: order_db
     ports:
-      - "${MYSQL_PORT:-3306}:3306"
+      - "3306:3306"
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mysql_order_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:-root}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:-root123456}"]
       interval: 5s
       timeout: 5s
       retries: 15
 
+  postgres-dept-hr:
+    image: postgres:15-alpine
+    container_name: ai-pipeline-pg-hr
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hr_user
+      POSTGRES_PASSWORD: hr_password
+      POSTGRES_DB: hr_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_hr_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hr_user -d hr_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  opengauss-dept-dw:
+    image: enmotech/opengauss:5.0.0
+    container_name: ai-pipeline-opengauss-dw
+    profiles: ["gauss"]
+    restart: unless-stopped
+    environment:
+      GS_PASSWORD: Gauss@123456
+      GS_DB: dw_db
+    ports:
+      - "8000:5432"
+    volumes:
+      - opengauss_dw_data:/var/lib/opengauss
+
+  # ============================================================================
+  # 2. 多实例 Redis：主 Sentinel 哨兵集群 + 跨部门独立单机 Redis (sso)
+  # ============================================================================
   redis-master:
     image: redis:7-alpine
     container_name: ai-pipeline-redis-master
@@ -161,6 +234,60 @@ services:
       timeout: 5s
       retries: 10
 
+  redis-sso-standalone:
+    image: redis:7-alpine
+    container_name: ai-pipeline-redis-sso
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_sso_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ============================================================================
+  # 3. 多节点 Jenkins 集群 (3 节点：8081 / 8082 / 8083，测试轮询 + 3s 退避熔断)
+  # ============================================================================
+  jenkins-1:
+    <<: *jenkins-common
+    container_name: ai-pipeline-jenkins-1
+    ports:
+      - "8081:8080"
+      - "50001:50000"
+    volumes:
+      - jenkins_1_home:/var/jenkins_home
+      - ./dist/bin/linux-arm64:/opt/ai-pipeline-bin/arm64:ro
+      - ./dist/bin/linux-x64:/opt/ai-pipeline-bin/x64:ro
+
+  jenkins-2:
+    <<: *jenkins-common
+    container_name: ai-pipeline-jenkins-2
+    ports:
+      - "8082:8080"
+      - "50002:50000"
+    volumes:
+      - jenkins_2_home:/var/jenkins_home
+      - ./dist/bin/linux-arm64:/opt/ai-pipeline-bin/arm64:ro
+      - ./dist/bin/linux-x64:/opt/ai-pipeline-bin/x64:ro
+
+  jenkins-3:
+    <<: *jenkins-common
+    container_name: ai-pipeline-jenkins-3
+    ports:
+      - "8083:8080"
+      - "50003:50000"
+    volumes:
+      - jenkins_3_home:/var/jenkins_home
+      - ./dist/bin/linux-arm64:/opt/ai-pipeline-bin/arm64:ro
+      - ./dist/bin/linux-x64:/opt/ai-pipeline-bin/x64:ro
+
+  # ============================================================================
+  # 4. 可观测性：Jaeger (OTel Trace) + Prometheus (抓取 /metrics)
+  # ============================================================================
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
     container_name: ai-pipeline-jaeger
@@ -168,49 +295,29 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686" # Jaeger UI
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP/Protobuf (对应 .env 中的 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
 
-  jenkins:
-    build:
-      context: ./docker/jenkins
-    image: ai-pipeline-jenkins:lts-jdk17
-    container_name: ai-pipeline-jenkins
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai-pipeline-prometheus
     restart: unless-stopped
-    ports:
-      - "${JENKINS_PORT:-8080}:8080"
-      - "50000:50000"
-    environment:
-      JENKINS_ADMIN_USER: ${JENKINS_USER:-admin}
-      JENKINS_ADMIN_PASSWORD: ${JENKINS_PASSWORD:-admin123}
-      # Pass through OpenAI / OMP runtime env so bundled ai-pipeline binary in Jenkins
-      # runs with the exact same model config as local & creative mode
-      OMP_MODEL: ${OMP_MODEL:-}
-      OPENAI_API_MODE: ${OPENAI_API_MODE:-chat}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      OPENAI_MODEL_NAME: ${OPENAI_MODEL_NAME:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_CHAT_BASE_URL: ${OPENAI_CHAT_BASE_URL:-}
-      OPENAI_CHAT_MODEL_NAME: ${OPENAI_CHAT_MODEL_NAME:-}
-      OPENAI_CHAT_API_KEY: ${OPENAI_CHAT_API_KEY:-}
-      OPENAI_RESPONSES_BASE_URL: ${OPENAI_RESPONSES_BASE_URL:-}
-      OPENAI_RESPONSES_MODEL_NAME: ${OPENAI_RESPONSES_MODEL_NAME:-}
-      OPENAI_RESPONSES_API_KEY: ${OPENAI_RESPONSES_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - jenkins_home:/var/jenkins_home
-      # Mount compiled Linux binaries (arm64 for Apple Silicon Docker, x64 for Intel/Linux)
-      - ./dist/bin/linux-arm64:/opt/ai-pipeline-bin/arm64:ro
-      - ./dist/bin/linux-x64:/opt/ai-pipeline-bin/x64:ro
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 18
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
 
 volumes:
-  postgres_data:
-  mysql_data:
+  pg_primary_data:
+  mysql_order_data:
+  pg_hr_data:
+  opengauss_dw_data:
   redis_master_data:
   redis_replica_data:
-  jenkins_home:
+  redis_sso_data:
+  jenkins_1_home:
+  jenkins_2_home:
+  jenkins_3_home:

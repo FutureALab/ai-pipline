@@ -4,11 +4,13 @@ import path from "node:path";
 import {
   dbNow,
   getDb,
+  getPrismaOrNull,
   isMysqlDriver,
   toDbBool,
   toDbTimestamp,
 } from "../db/database.js";
 import type { SkillRow } from "../db/schema.js";
+import type { Prisma, Skill as PrismaSkill } from "../generated/prisma/client.js";
 import type {
   CatalogAppRow,
   CatalogRepoRow,
@@ -45,29 +47,39 @@ function resolveSafeSkillFilePath(skillName: string, relativePath: string): stri
 
 export async function readSkillMarkdown(skillName: string): Promise<string> {
   const normalized = normalizeSkillName(skillName);
-  const db = getDb();
+  const prisma = getPrismaOrNull();
 
-  // 1. Database is the primary source of truth
-  const fileRow = await db
-    .selectFrom("skill_files")
-    .select("content")
-    .where("skill_name", "=", normalized)
-    .where("file_path", "=", "SKILL.md")
-    .executeTakeFirst();
-  if (fileRow?.content !== undefined) {
-    return fileRow.content;
+  if (prisma) {
+    const fileRow = await prisma.skillFile.findUnique({
+      where: { skillName_filePath: { skillName: normalized, filePath: "SKILL.md" } },
+      select: { content: true },
+    });
+    if (fileRow?.content !== undefined) return fileRow.content;
+
+    const skillRow = await prisma.skill.findUnique({
+      where: { skillName: normalized },
+      select: { skillMd: true },
+    });
+    if (skillRow?.skillMd) return skillRow.skillMd;
+  } else {
+    const db = getDb();
+    const fileRow = await db
+      .selectFrom("skill_files")
+      .select("content")
+      .where("skill_name", "=", normalized)
+      .where("file_path", "=", "SKILL.md")
+      .executeTakeFirst();
+    if (fileRow?.content !== undefined) return fileRow.content;
+
+    const skillRow = await db
+      .selectFrom("skills")
+      .select("skill_md")
+      .where("skill_name", "=", normalized)
+      .executeTakeFirst();
+    if (skillRow?.skill_md) return skillRow.skill_md;
   }
 
-  const skillRow = await db
-    .selectFrom("skills")
-    .select("skill_md")
-    .where("skill_name", "=", normalized)
-    .executeTakeFirst();
-  if (skillRow?.skill_md) {
-    return skillRow.skill_md;
-  }
-
-  // 2. Fallback to disk if not yet in DB
+  // Fallback to disk if not yet in DB
   const filePath = path.join(
     resolveDefaultSkillsRoot("global"),
     normalized,
@@ -82,6 +94,39 @@ export async function readSkillMarkdown(skillName: string): Promise<string> {
 
 export async function syncSkillMetadata(skillName: string): Promise<void> {
   const normalized = normalizeSkillName(skillName);
+  const prisma = getPrismaOrNull();
+
+  if (prisma) {
+    const rows = await prisma.skillFile.findMany({
+      where: { skillName: normalized },
+      select: { filePath: true, content: true, category: true },
+    });
+    const files: SkillFileEntry[] = rows.map((r) => ({
+      path: r.filePath,
+      content: r.content,
+      category: r.category as SkillFileCategory,
+    }));
+    const { summary, hasScripts } = buildResourceSummary(files);
+    const skillMd = files.find((f) => f.path === "SKILL.md");
+    const frontmatter = skillMd ? parseSkillFrontmatter(skillMd.content) : null;
+
+    await prisma.skill.update({
+      where: { skillName: normalized },
+      data: {
+        hasScripts,
+        resourceSummary: summary as unknown as Prisma.InputJsonValue,
+        updatedAt: new Date(),
+        ...(skillMd && frontmatter
+          ? {
+              frontmatter: frontmatter as unknown as Prisma.InputJsonValue,
+              skillMd: skillMd.content,
+            }
+          : {}),
+      },
+    });
+    return;
+  }
+
   const db = getDb();
   const rows = await db
     .selectFrom("skill_files")
@@ -125,6 +170,16 @@ export async function syncSkillMetadata(skillName: string): Promise<void> {
 }
 
 async function ensureSkillRowExists(normalizedSkillName: string): Promise<void> {
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    await prisma.skill.upsert({
+      where: { skillName: normalizedSkillName },
+      create: { skillName: normalizedSkillName },
+      update: {},
+    });
+    return;
+  }
+
   const db = getDb();
   const now = dbNow();
   const stub = {
@@ -162,6 +217,39 @@ async function upsertSkillFileRow(
   normalizedSkillName: string,
   entry: Required<SkillFileEntry>
 ): Promise<void> {
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    await prisma.skillFile.upsert({
+      where: {
+        skillName_filePath: {
+          skillName: normalizedSkillName,
+          filePath: entry.path,
+        },
+      },
+      create: {
+        skillName: normalizedSkillName,
+        filePath: entry.path,
+        content: entry.content,
+        category: entry.category,
+        mimeType: entry.mimeType,
+        encoding: entry.encoding,
+        sizeBytes: entry.sizeBytes,
+        isExecutable: entry.isExecutable,
+        updatedAt: new Date(),
+      },
+      update: {
+        content: entry.content,
+        category: entry.category,
+        mimeType: entry.mimeType,
+        encoding: entry.encoding,
+        sizeBytes: entry.sizeBytes,
+        isExecutable: entry.isExecutable,
+        updatedAt: new Date(),
+      },
+    });
+    return;
+  }
+
   const db = getDb();
   const now = dbNow();
   const values = {
@@ -234,11 +322,18 @@ export async function deleteSkillFile(
   const filePath = resolveSafeSkillFilePath(normalized, relPath);
 
   await fs.rm(filePath, { force: true }).catch(() => {});
-  await getDb()
-    .deleteFrom("skill_files")
-    .where("skill_name", "=", normalized)
-    .where("file_path", "=", relPath)
-    .execute();
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    await prisma.skillFile.deleteMany({
+      where: { skillName: normalized, filePath: relPath },
+    });
+  } else {
+    await getDb()
+      .deleteFrom("skill_files")
+      .where("skill_name", "=", normalized)
+      .where("file_path", "=", relPath)
+      .execute();
+  }
   await syncSkillMetadata(normalized);
 }
 
@@ -249,25 +344,40 @@ export async function replaceSkillFiles(
   const normalized = normalizeSkillName(skillName);
   const enrichedFiles = files.map((f) => enrichSkillFileEntry(f));
   const nextPaths = new Set(enrichedFiles.map((f) => f.path));
-  const db = getDb();
 
   await ensureSkillRowExists(normalized);
 
-  // Remove stale files from disk and DB
-  const existingDb = await db
-    .selectFrom("skill_files")
-    .select("file_path")
-    .where("skill_name", "=", normalized)
-    .execute();
-  for (const row of existingDb) {
-    if (!nextPaths.has(row.file_path)) {
-      const target = resolveSafeSkillFilePath(normalized, row.file_path);
+  const prisma = getPrismaOrNull();
+  const existingPaths: string[] = prisma
+    ? (
+        await prisma.skillFile.findMany({
+          where: { skillName: normalized },
+          select: { filePath: true },
+        })
+      ).map((r) => r.filePath)
+    : (
+        await getDb()
+          .selectFrom("skill_files")
+          .select("file_path")
+          .where("skill_name", "=", normalized)
+          .execute()
+      ).map((r) => r.file_path);
+
+  for (const oldPath of existingPaths) {
+    if (!nextPaths.has(oldPath)) {
+      const target = resolveSafeSkillFilePath(normalized, oldPath);
       await fs.rm(target, { force: true }).catch(() => {});
-      await db
-        .deleteFrom("skill_files")
-        .where("skill_name", "=", normalized)
-        .where("file_path", "=", row.file_path)
-        .execute();
+      if (prisma) {
+        await prisma.skillFile.deleteMany({
+          where: { skillName: normalized, filePath: oldPath },
+        });
+      } else {
+        await getDb()
+          .deleteFrom("skill_files")
+          .where("skill_name", "=", normalized)
+          .where("file_path", "=", oldPath)
+          .execute();
+      }
     }
   }
 
@@ -286,52 +396,81 @@ export async function replaceSkillFiles(
 
 export async function listSkillFiles(skillName: string): Promise<SkillFileEntry[]> {
   const normalized = normalizeSkillName(skillName);
-  const db = getDb();
+  const prisma = getPrismaOrNull();
 
-  // 1. Database is the primary source of truth
-  const dbFiles = await db
-    .selectFrom("skill_files")
-    .select([
-      "file_path",
-      "content",
-      "category",
-      "mime_type",
-      "encoding",
-      "size_bytes",
-      "is_executable",
-    ])
-    .where("skill_name", "=", normalized)
-    .execute();
-
-  if (dbFiles.length > 0) {
-    const results: SkillFileEntry[] = dbFiles.map((row) => ({
-      path: row.file_path,
-      content: row.content,
-      category: (row.category as SkillFileCategory) || undefined,
-      mimeType: row.mime_type || undefined,
-      encoding: (row.encoding as SkillFileEncoding) || "utf-8",
-      sizeBytes: row.size_bytes ?? undefined,
-      isExecutable: Boolean(row.is_executable),
-    }));
-    results.sort((a, b) => {
-      if (a.path === "SKILL.md") return -1;
-      if (b.path === "SKILL.md") return 1;
-      return a.path.localeCompare(b.path);
+  if (prisma) {
+    const dbFiles = await prisma.skillFile.findMany({
+      where: { skillName: normalized },
     });
-    return results;
+    if (dbFiles.length > 0) {
+      const results: SkillFileEntry[] = dbFiles.map((row) => ({
+        path: row.filePath,
+        content: row.content,
+        category: (row.category as SkillFileCategory) || undefined,
+        mimeType: row.mimeType || undefined,
+        encoding: (row.encoding as SkillFileEncoding) || "utf-8",
+        sizeBytes: row.sizeBytes ?? undefined,
+        isExecutable: Boolean(row.isExecutable),
+      }));
+      results.sort((a, b) => {
+        if (a.path === "SKILL.md") return -1;
+        if (b.path === "SKILL.md") return 1;
+        return a.path.localeCompare(b.path);
+      });
+      return results;
+    }
+
+    const skillRow = await prisma.skill.findUnique({
+      where: { skillName: normalized },
+      select: { skillMd: true },
+    });
+    if (skillRow?.skillMd) {
+      return [enrichSkillFileEntry({ path: "SKILL.md", content: skillRow.skillMd })];
+    }
+  } else {
+    const db = getDb();
+    const dbFiles = await db
+      .selectFrom("skill_files")
+      .select([
+        "file_path",
+        "content",
+        "category",
+        "mime_type",
+        "encoding",
+        "size_bytes",
+        "is_executable",
+      ])
+      .where("skill_name", "=", normalized)
+      .execute();
+
+    if (dbFiles.length > 0) {
+      const results: SkillFileEntry[] = dbFiles.map((row) => ({
+        path: row.file_path,
+        content: row.content,
+        category: (row.category as SkillFileCategory) || undefined,
+        mimeType: row.mime_type || undefined,
+        encoding: (row.encoding as SkillFileEncoding) || "utf-8",
+        sizeBytes: row.size_bytes ?? undefined,
+        isExecutable: Boolean(row.is_executable),
+      }));
+      results.sort((a, b) => {
+        if (a.path === "SKILL.md") return -1;
+        if (b.path === "SKILL.md") return 1;
+        return a.path.localeCompare(b.path);
+      });
+      return results;
+    }
+
+    const skillRow = await db
+      .selectFrom("skills")
+      .select("skill_md")
+      .where("skill_name", "=", normalized)
+      .executeTakeFirst();
+    if (skillRow?.skill_md) {
+      return [enrichSkillFileEntry({ path: "SKILL.md", content: skillRow.skill_md })];
+    }
   }
 
-  // 2. Fallback to skills.skill_md if skill_files has no rows yet
-  const skillRow = await db
-    .selectFrom("skills")
-    .select("skill_md")
-    .where("skill_name", "=", normalized)
-    .executeTakeFirst();
-  if (skillRow?.skill_md) {
-    return [enrichSkillFileEntry({ path: "SKILL.md", content: skillRow.skill_md })];
-  }
-
-  // 3. Fallback to disk
   const skillDir = path.resolve(resolveDefaultSkillsRoot("global"), normalized);
   return await readSkillDirectoryFiles(skillDir);
 }
@@ -450,6 +589,29 @@ const DEFAULT_RESOURCE_SUMMARY: SkillResourceSummary = {
 
 type SelectedSkillRow = Omit<SkillRow, "skill_md">;
 
+function mapPrismaSkillToCard(row: Omit<PrismaSkill, "skillMd">): SkillCardRecord {
+  return {
+    skillName: row.skillName,
+    description: row.description,
+    creator: row.creator,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    currentStep: (row.currentStep as 1 | 2 | 3) || 1,
+    progress: row.progress ?? 33,
+    status: (row.status as SkillLifecycleStatus) ?? "draft",
+    selectedApps: parseJsonArray<string>(row.selectedApps),
+    selectedRepos: parseJsonArray<string>(row.selectedRepos),
+    selectedMcps: parseJsonArray<string>(row.selectedMcps),
+    pipelineRuns: parseJsonArray<RepoPipelineRun>(row.pipelineRuns),
+    frontmatter: parseJsonObject<Record<string, unknown>>(row.frontmatter, {}),
+    hasScripts: Boolean(row.hasScripts),
+    resourceSummary: parseJsonObject<SkillResourceSummary>(
+      row.resourceSummary,
+      { ...DEFAULT_RESOURCE_SUMMARY }
+    ),
+  };
+}
+
 function mapDbRowToCard(row: SelectedSkillRow): SkillCardRecord {
   const resourceSummary = parseJsonObject<SkillResourceSummary>(
     row.resource_summary,
@@ -502,12 +664,16 @@ export async function deleteSkillCompletely(skillName: string): Promise<{
     throw new Error("Invalid skill name");
   }
 
-  const db = getDb();
-  // 1. Delete from database tables
-  await db.deleteFrom("skill_files").where("skill_name", "=", normalized).execute();
-  await db.deleteFrom("skills").where("skill_name", "=", normalized).execute();
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    await prisma.skillFile.deleteMany({ where: { skillName: normalized } });
+    await prisma.skill.deleteMany({ where: { skillName: normalized } });
+  } else {
+    const db = getDb();
+    await db.deleteFrom("skill_files").where("skill_name", "=", normalized).execute();
+    await db.deleteFrom("skills").where("skill_name", "=", normalized).execute();
+  }
 
-  // 2. Remove from all disk locations
   const cwd = process.cwd();
   const home = os.homedir();
   const candidateRoots = new Set<string>([
@@ -553,6 +719,13 @@ export async function deleteSkillCompletely(skillName: string): Promise<{
 }
 
 export async function listCatalogApps(): Promise<CatalogAppRow[]> {
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    return await prisma.catalogApp.findMany({
+      select: { id: true, name: true, env: true },
+      orderBy: { id: "asc" },
+    });
+  }
   return await getDb()
     .selectFrom("catalog_apps")
     .select(["id", "name", "env"])
@@ -561,6 +734,13 @@ export async function listCatalogApps(): Promise<CatalogAppRow[]> {
 }
 
 export async function listCatalogRepos(): Promise<CatalogRepoRow[]> {
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    return await prisma.catalogRepo.findMany({
+      select: { id: true, name: true, url: true, branch: true },
+      orderBy: { id: "asc" },
+    });
+  }
   return await getDb()
     .selectFrom("catalog_repos")
     .select(["id", "name", "url", "branch"])
@@ -568,10 +748,15 @@ export async function listCatalogRepos(): Promise<CatalogRepoRow[]> {
     .execute();
 }
 
-/**
- * List user-created skills (built-in skills with `is_builtin = true` are hidden from UI).
- */
 export async function listSkillCards(): Promise<SkillCardRecord[]> {
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    const rows = await prisma.skill.findMany({
+      where: { isBuiltin: false },
+      orderBy: { updatedAt: "desc" },
+    });
+    return rows.map(mapPrismaSkillToCard);
+  }
   const rows = await getDb()
     .selectFrom("skills")
     .select(SKILL_SELECT_COLUMNS)
@@ -585,6 +770,17 @@ export async function getSkillCard(
   skillName: string
 ): Promise<{ card: SkillCardRecord; content: string } | null> {
   const normalized = normalizeSkillName(skillName);
+  const prisma = getPrismaOrNull();
+  if (prisma) {
+    const row = await prisma.skill.findUnique({
+      where: { skillName: normalized },
+    });
+    if (!row) return null;
+    const card = mapPrismaSkillToCard(row);
+    const content = await readSkillMarkdown(normalized).catch(() => "");
+    return { card, content };
+  }
+
   const row = await getDb()
     .selectFrom("skills")
     .select(SKILL_SELECT_COLUMNS)
@@ -602,8 +798,68 @@ export async function upsertSkillCard(
   patch: Partial<SkillCardRecord> & { isBuiltin?: boolean }
 ): Promise<SkillCardRecord> {
   const normalized = normalizeSkillName(skillName);
-  const db = getDb();
+  const prisma = getPrismaOrNull();
 
+  if (prisma) {
+    const existingRow = await prisma.skill.findUnique({
+      where: { skillName: normalized },
+    });
+    const existing = existingRow ? mapPrismaSkillToCard(existingRow) : undefined;
+    const existingBuiltin = existingRow ? existingRow.isBuiltin : false;
+    const nowDate = new Date();
+    const nowIso = nowDate.toISOString();
+
+    const next: SkillCardRecord = {
+      skillName: normalized,
+      description: patch.description ?? existing?.description ?? "自定义 AI Skill",
+      creator: patch.creator ?? existing?.creator ?? "Admin",
+      createdAt: existing?.createdAt ?? nowIso,
+      updatedAt: nowIso,
+      currentStep: patch.currentStep ?? existing?.currentStep ?? 1,
+      progress: patch.progress ?? existing?.progress ?? 33,
+      status: patch.status ?? existing?.status ?? "draft",
+      selectedApps: patch.selectedApps ?? existing?.selectedApps ?? [],
+      selectedRepos: patch.selectedRepos ?? existing?.selectedRepos ?? [],
+      selectedMcps: patch.selectedMcps ?? existing?.selectedMcps ?? [],
+      pipelineRuns: patch.pipelineRuns ?? existing?.pipelineRuns ?? [],
+      frontmatter: patch.frontmatter ?? existing?.frontmatter ?? {},
+      hasScripts: patch.hasScripts ?? existing?.hasScripts ?? false,
+      resourceSummary:
+        patch.resourceSummary ?? existing?.resourceSummary ?? { ...DEFAULT_RESOURCE_SUMMARY },
+    };
+
+    const isBuiltinVal = patch.isBuiltin ?? existingBuiltin;
+    const commonData = {
+      description: next.description,
+      creator: next.creator,
+      isBuiltin: isBuiltinVal,
+      updatedAt: nowDate,
+      currentStep: next.currentStep,
+      progress: next.progress,
+      status: next.status,
+      selectedApps: next.selectedApps as unknown as Prisma.InputJsonValue,
+      selectedRepos: next.selectedRepos as unknown as Prisma.InputJsonValue,
+      selectedMcps: (next.selectedMcps ?? []) as unknown as Prisma.InputJsonValue,
+      pipelineRuns: next.pipelineRuns as unknown as Prisma.InputJsonValue,
+      frontmatter: (next.frontmatter ?? {}) as unknown as Prisma.InputJsonValue,
+      hasScripts: next.hasScripts ?? false,
+      resourceSummary: (next.resourceSummary ?? DEFAULT_RESOURCE_SUMMARY) as unknown as Prisma.InputJsonValue,
+    };
+
+    await prisma.skill.upsert({
+      where: { skillName: normalized },
+      create: {
+        skillName: normalized,
+        createdAt: new Date(next.createdAt),
+        ...commonData,
+      },
+      update: commonData,
+    });
+
+    return next;
+  }
+
+  const db = getDb();
   const existingRow = await db
     .selectFrom("skills")
     .select(SKILL_SELECT_COLUMNS)
